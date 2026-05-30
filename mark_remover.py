@@ -303,17 +303,17 @@ ROUTE_BY_CLASS = {
 }
 
 CANDIDATE_METHODS_BY_CLASS = {
-    "plain_white":    ["alpha_attenuate", "white_fill_stroke_only", "local_background_fill", "white_fill", "local_color_plane", "gradient_plane"],
-    "plain_color":    ["alpha_attenuate", "local_color_plane", "gradient_plane", "poisson", "surface_fit"],
-    "gradient":       ["alpha_attenuate", "gradient_plane", "surface_fit", "poisson", "telea_small"],
-    "low_texture":    ["alpha_attenuate", "telea_small", "telea", "gradient_plane", "lama_small"],
-    "transparent":    ["alpha_attenuate", "telea_small", "telea", "poisson"],
-    "glossy":         ["alpha_attenuate", "telea_small", "telea", "poisson"],
-    "metallic":       ["alpha_attenuate", "telea_small", "telea", "poisson"],
-    "black_product":  ["alpha_attenuate", "dark_surface_local_plane", "telea_small", "telea"],
-    "high_texture":   ["alpha_attenuate", "telea_small", "telea", "lama_small"],
-    "product_detail": ["alpha_attenuate", "telea_small", "telea", "poisson"],
-    "text_or_qr":     ["telea_small"],
+    "plain_white":    ["clone_offset", "alpha_attenuate", "white_fill_stroke_only", "local_background_fill", "white_fill", "local_color_plane", "gradient_plane"],
+    "plain_color":    ["clone_offset", "alpha_attenuate", "local_color_plane", "gradient_plane", "poisson", "surface_fit"],
+    "gradient":       ["clone_offset", "alpha_attenuate", "gradient_plane", "surface_fit", "poisson", "telea_small"],
+    "low_texture":    ["clone_offset", "alpha_attenuate", "telea_small", "telea", "gradient_plane", "lama_small"],
+    "transparent":    ["clone_offset", "alpha_attenuate", "telea_small", "telea", "poisson"],
+    "glossy":         ["clone_offset", "alpha_attenuate", "telea_small", "telea", "poisson"],
+    "metallic":       ["clone_offset", "alpha_attenuate", "telea_small", "telea", "poisson"],
+    "black_product":  ["clone_offset", "alpha_attenuate", "dark_surface_local_plane", "telea_small", "telea"],
+    "high_texture":   ["clone_offset", "alpha_attenuate", "telea_small", "telea", "lama_small"],
+    "product_detail": ["clone_offset", "alpha_attenuate", "telea_small", "telea", "poisson"],
+    "text_or_qr":     ["clone_offset", "telea_small"],
     "poster_or_marketing": [],
 }
 
@@ -2124,6 +2124,88 @@ def inpaint_local_background_fill(img, mask, mark_box):
     return _feather_blend(img, out, mask, feather_px=4)
 
 
+def inpaint_clone_offset(img, mask, mark_box):
+    H, W = img.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    if bw < 4 or bh < 4:
+        return None
+
+    pad_y = max(4, bh // 2)
+    candidates = []
+
+    # Try cloning from above the watermark
+    src_y1 = by - bh - pad_y
+    src_y2 = src_y1 + bh
+    if src_y1 >= 0:
+        candidates.append(("above", bx, src_y1, bw, bh))
+
+    # Try cloning from below the watermark
+    src_y1_b = by + bh + pad_y
+    src_y2_b = src_y1_b + bh
+    if src_y2_b <= H:
+        candidates.append(("below", bx, src_y1_b, bw, bh))
+
+    # Try cloning from further above (2x offset)
+    src_y1_fa = by - 2 * bh - pad_y
+    if src_y1_fa >= 0:
+        candidates.append(("far_above", bx, src_y1_fa, bw, bh))
+
+    # Try cloning from further below
+    src_y1_fb = by + 2 * bh + pad_y
+    if src_y1_fb + bh <= H:
+        candidates.append(("far_below", bx, src_y1_fb, bw, bh))
+
+    if not candidates:
+        return None
+
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    mark_ring_pad = max(6, bh // 2)
+    ring_y1 = max(0, by - mark_ring_pad)
+    ring_y2 = min(H, by + bh + mark_ring_pad)
+    ring_x1 = max(0, bx - 4)
+    ring_x2 = min(W, bx + bw + 4)
+    ring_mask = np.zeros((H, W), np.uint8)
+    ring_mask[ring_y1:ring_y2, ring_x1:ring_x2] = 255
+    ring_mask[by:by + bh, bx:bx + bw] = 0
+    ring_pixels = lab[ring_mask > 0]
+    if ring_pixels.size < 30:
+        return None
+    ring_mean = ring_pixels.mean(axis=0)
+
+    best = None
+    best_diff = float("inf")
+    for label, sx, sy, sw, sh in candidates:
+        sx2 = min(W, sx + sw)
+        sy2 = min(H, sy + sh)
+        src_patch = lab[sy:sy2, sx:sx2]
+        if src_patch.size == 0:
+            continue
+        src_mean = src_patch.reshape(-1, 3).mean(axis=0)
+        diff = float(np.linalg.norm(src_mean - ring_mean))
+        if diff < best_diff:
+            best_diff = diff
+            best = (label, sx, sy, sx2 - sx, sy2 - sy)
+
+    if best is None or best_diff > 15.0:
+        return None
+
+    _, sx, sy, sw, sh = best
+    out = img.copy()
+    src_patch = img[sy:sy + sh, sx:sx + sw].copy()
+
+    # Resize source patch to exact mark_box size if needed
+    if sw != bw or sh != bh:
+        src_patch = cv2.resize(src_patch, (bw, bh), interpolation=cv2.INTER_LINEAR)
+
+    out[by:by + bh, bx:bx + bw] = src_patch
+
+    # Feather blend at boundaries for seamless transition
+    clone_mask = np.zeros((H, W), np.uint8)
+    clone_mask[by:by + bh, bx:bx + bw] = 255
+    out = _feather_blend(img, out, clone_mask, feather_px=6)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # V6 — Adaptive cover system.
 # ---------------------------------------------------------------------------
@@ -2630,6 +2712,8 @@ def run_inpaint(rwm, method: str, img: np.ndarray, mask: np.ndarray,
         out = inpaint_white_fill_stroke_only(img, mask, mark_box)
     elif method == "local_background_fill":
         out = inpaint_local_background_fill(img, mask, mark_box)
+    elif method == "clone_offset":
+        out = inpaint_clone_offset(img, mask, mark_box)
     elif method == "white_fill":
         out = inpaint_white_fill(img, mask)
     elif method == "local_median":
@@ -3701,9 +3785,11 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     masks_info["mask_rectangularity"] = round(mask_rectangularity, 4)
 
     # V5: mask quality issues no longer block — they route to cover fallback.
+    # V7: logo-shaped masks are intentionally dense — skip density/rect checks.
+    logo_active = masks.get("logo_mask") is not None and masks["logo_mask"].any()
     skip_repair = (masks["used"] == "soft_fallback" or
-                   mask_density_in_roi > V4_MASK_DENSITY_IN_ROI_MAX or
-                   mask_rectangularity > V4_MASK_RECTANGULARITY_MAX or
+                   (not logo_active and mask_density_in_roi > V4_MASK_DENSITY_IN_ROI_MAX) or
+                   (not logo_active and mask_rectangularity > V4_MASK_RECTANGULARITY_MAX) or
                    ROUTE_BY_CLASS.get(roi_class) == "reject" or
                    orig_md > MARK_BOX_DENSITY_REJECT)
 
