@@ -113,8 +113,9 @@ Image Pool
             |
             v  no tool passed QA
 +-----------+-------------+
-|  Final Adaptive Cover   |  Median-color soft patch with noise +
-|  (tool #100)            |  feather blending. Never gray rectangle.
+|  Final Adaptive Cover   |  V10: full-footprint Telea inpaint, routed by
+|  (tool #100)            |  in-bbox structure. Reconstructs surface, never
+|                         |  a gray band. auto_cover_retry if still readable.
 +-----------+-------------+
             |
             v
@@ -266,9 +267,30 @@ Standard inpainting algorithms (OpenCV) and neural network methods. Cost 4-5, Ri
 | 98 | `mat_inpaint` | MAT (Mask-Aware Transformer) inpaint |
 | 99 | `sd_inpaint_low_strength` | Stable Diffusion inpaint at low denoising |
 
-### Tool 100: Final Adaptive Cover
+### Tool 100: Final Adaptive Cover (rewritten in V10)
 
-**`final_adaptive_cover`** — The absolute last resort. Draws a soft-blended patch using the median color from the context ring, adds matched noise texture, and feather-blends at the edges. Produces `clean_covered` status. Never a gray rectangle.
+**`final_adaptive_cover`** — the absolute last resort, producing `clean_covered`.
+In V10 it no longer dims the watermark with a translucent gray patch (which
+left it readable). It now **reconstructs the surface**:
+
+- **Routing by actual in-bbox content**, not ROI class (the classifier is
+  sometimes wrong). Low-structure surround (in-bbox edge density < 0.10 and
+  product overlap < 0.45) → `opaque_footprint`; structured surround →
+  light-touch `stroke_level` band / `segmented`, then `opaque_footprint`.
+- **`opaque_footprint`** — Telea inpaint over the full watermark bbox,
+  extended horizontally (~12%) past the detected box to catch glyphs the
+  detector clipped (e.g. a trailing `.com`). Reconstructs the real
+  surrounding surface; no synthetic fill, no noise.
+- **`stroke_level`** — Telea over the text band (bounding rect of the
+  horizontally-dilated strokes), a lighter touch that disturbs less product
+  detail. No RGB-noise fill.
+- **`segmented`** — splits the bbox into background vs. product surface using
+  the product mask and repairs each separately.
+
+Each candidate is checked for **hiding** (mask-aware residual) and
+**rectangularity**; the first that both hides and passes the rect gate wins,
+else the best-effort (hides first, then lowest rectangularity). Result: a
+"covered" image looks like a natural removal, never a gray/white band.
 
 ## ROI Classification (11 Classes)
 
@@ -311,18 +333,24 @@ The watermark region's background determines which tools are selected and in wha
 
 Each ROI class maps to an ordered list of tools. The progressive repair loop tries them in order and stops at the first QA-passing candidate.
 
+**V10 reorder (P5):** on plain / near-white / low-texture / metallic classes,
+real-pixel clones and statistical/gradient fills now run **before**
+stroke-only logo repair — "try real pixels first, synthesize second, cover
+last." The QA gate (not the order alone) is what stops a weak stroke output
+from being accepted when a cleaner clone/fill is available.
+
 ```
-plain_white:             clone_8dir -> hard_paste -> white_noise -> ring_median ->
-                         noise_transfer -> micro_tile -> stroke_mask -> logo+clone ->
-                         telea -> adaptive_cover
+plain_white:             clone_8dir -> white_median -> ring_median -> hard_paste ->
+                         seam_scored -> direct_neighbor -> alpha_template ->
+                         logo+clone -> stroke_mask -> telea -> adaptive_cover
 
-near_white:              clone_8dir -> seam_scored -> white_noise -> ring_median ->
-                         surface_gradient -> stroke_mask -> logo+clone -> telea ->
-                         adaptive_cover
+near_white:              clone_8dir -> white_median -> ring_median -> seam_scored ->
+                         surface_gradient -> alpha_template -> logo+clone ->
+                         stroke_mask -> telea -> adaptive_cover
 
-low_texture_background:  clone_8dir -> ring_median -> lowpass_match ->
-                         surface_gradient -> logo+clone -> telea -> lama_stroke ->
-                         adaptive_cover
+low_texture_background:  clone_8dir -> ring_median -> surface_plane ->
+                         surface_gradient -> logo+surface -> stroke_mask -> telea ->
+                         lama_stroke -> adaptive_cover
 
 simple_product_surface:  same_surface -> same_color -> color_match ->
                          surface_gradient -> noise_preserved -> logo+surface ->
@@ -336,11 +364,12 @@ glass_or_gradient:       linear_gradient -> bilinear_gradient -> glass_clone ->
                          frosted_noise -> low_freq_gradient -> high_freq_noise ->
                          poisson -> logo+surface -> lama_stroke -> adaptive_cover
 
-metallic_or_reflective:  same_surface -> color_match -> linear_gradient ->
-                         stroke_mask -> telea -> adaptive_cover
+metallic_or_reflective:  linear_gradient -> bilinear_gradient -> surface_plane ->
+                         same_luminance -> high_freq_noise -> logo+surface ->
+                         stroke_mask -> telea -> lama_stroke -> adaptive_cover
 
-thin_flex_cable:         stroke_mask -> template_logo -> logo+clone ->
-                         edge_aware -> cable_repair -> black_flex -> telea ->
+thin_flex_cable:         stroke_mask -> cable_repair -> black_flex -> edge_aware ->
+                         logo+clone -> segmented -> line_preserving -> telea ->
                          lama_stroke -> adaptive_cover
 
 text_or_label_area:      stroke_mask -> logo+clone -> telea -> adaptive_cover
@@ -354,32 +383,71 @@ unknown:                 clone_8dir -> stroke_mask -> surface_gradient ->
                          telea -> adaptive_cover
 ```
 
-## Local QA Gate
+## Local QA Gate (V10 — truthful, residual-aware)
 
-Every repair candidate is evaluated by 7 metrics. All must pass for the candidate to be accepted.
+A repair candidate is accepted as `clean_repaired` only when **all** of the
+following hold (P1/P2/P7):
+
+1. **Metrics are valid** — `metrics_valid` is false if every core metric is
+   exactly zero (degenerate/empty ROI), which fails closed as
+   `qa_metrics_probably_not_computed`. Missing/`NaN` metrics raise
+   `MissingQAMetric`. No more `pass=True` on uncomputed scores.
+2. **Residual watermark gate passes** — the watermark must be unreadable
+   (see below).
+3. **Geometry gate passes** — the seam / cover-visibility / product-damage /
+   color metrics below.
+
+### Geometry metrics
 
 | Metric | What It Measures | Threshold | Strict | Loose |
 |--------|-----------------|-----------|--------|-------|
-| `watermark_residual` | High-pass residual activity in repair zone | <= 0.12 | 0.096 | 0.12 |
 | `cover_visibility` | Visible rectangle (luma delta + HF drop) | <= 0.20 | 0.16 | 0.26 |
 | `seam_delta` | Boundary discontinuity at repair edges | <= 0.18 | 0.144 | 0.216 |
 | `product_damage` | Edge retention loss outside repair zone | <= 0.15 | 0.15 | 0.15 |
-| `texture_consistency` | Laplacian texture variance ratio | >= 0.30 | 0.30 | 0.30 |
-| `color_delta` | CIE Lab color distance (repair vs ring) | <= 12.0 | 12.0 | 12.0 |
-| `edge_damage` | Edge density loss inside repair zone | <= 0.15 | 0.15 | 0.15 |
+| `color_delta` | CIE Lab color distance (repair vs ring) | <= 12.0 | 12.0 | 19.2 |
+| `watermark_residual`* | High-pass activity in repair zone | <= 0.12 | 0.096 | (gate off) |
+| `rectangular_patch_visibility`* | Human-visible rectangular patch | per-class | tightened | (gate off) |
 
-**Threshold classes:**
-- **Strict** (`complex_product_detail`, `thin_flex_cable`, `text_or_label_area`): Thresholds tightened by 20% — these ROIs are high-risk for visible artifacts
-- **Loose** (`plain_white`, `near_white`, `low_texture_background`): Thresholds relaxed by 20-30% — these ROIs are forgiving
+\* `watermark_residual` and `rpv` are **noisy on textured/dark surfaces** —
+they fire on successful inpainting because removing the watermark *is* an
+edge-density change. In V10 they hard-gate only on strict/detail classes
+(where in-ROI structure is genuinely at risk) and otherwise drive scoring
+only. The authoritative "is the watermark gone" check is the residual gate;
+the authoritative "is there a band" checks are `cover_visibility` and the
+cover-rectangularity gate. `texture_drop`/`rpv` are also suppressed on flat
+surrounds (no texture to "drop").
 
-**Composite score** (lower = better):
+### Residual watermark gate (P2)
+
+Measured **at the known glyph locations** — the stroke/logo mask dilated with
+a horizontal-biased kernel (21×9, so it spans inter-letter gaps and trailing
+glyphs) — relative to the surrounding surface's own texture baseline. This is
+robust on metallic/dark/textured surfaces (honest texture is in the baseline
+too) yet still catches a leftover halo or a broken-but-readable `.com`.
+
+| Field | Meaning | Pass when |
+|-------|---------|-----------|
+| `residual_template_corr` | best normalized correlation of the canonical `sunsky-online.com` template vs. cleaned high-pass | <= 0.18 |
+| `residual_text_component` | fraction of mask pixels still carrying stroke-level high-pass above baseline | <= 0.16 |
+| `residual_improvement` | stroke-energy reduction at the watermark region | >= 0.75 (waived only when the original had no watermark structure) |
+
+### Cover gate (P4)
+
+Adaptive covers additionally pass a rectangularity gate so they never read as
+a band: `cover_rectangularity <= 0.25`, `cover_luma_delta <= 8`,
+`cover_texture_drop <= 0.55`, `cover_edge_box_score <= 0.20`.
+
+**Composite score** (lower = better), used to rank failed candidates:
 ```
-final = 2.0 * watermark_residual + 2.0 * cover_visibility + 2.5 * seam_delta
-      + 1.5 * product_damage + 0.5 * (1 - texture_consistency)
-      + 1.0 * color_delta/12 + 1.0 * edge_damage
+final = 2.0*wm_residual + 2.0*cover_vis + 2.5*seam + 1.5*product_damage
+      + 0.5*(1-texture_consistency) + 1.0*color_delta/12 + 1.0*edge_damage
+      + 1.5*rpv + 2.0*residual_template_corr + 1.5*residual_text_component
+      + 1.0*(1-residual_improvement)
 ```
 
-When no tool passes QA, the best-failed candidate (lowest composite score) competes against the final adaptive cover. The better one wins.
+When no tool passes, the pipeline falls through to `final_adaptive_cover`. If
+even the cover still shows a readable watermark, `auto_cover_retry` escalates
+to a stronger stroke/segmented cover — manual review stays at **0**.
 
 ## Shared Helpers
 
@@ -526,7 +594,8 @@ output/
 | File | Lines | Purpose |
 |------|-------|---------|
 | `mark_remover.py` | ~4,900 | Main pipeline: detection, masks, QA, orchestration |
-| `progressive_repair.py` | ~2,930 | V8 strategy bank: 100 tools, ROI classifier, QA gate |
+| `progressive_repair.py` | ~3,600 | Strategy bank: 100 tools, ROI classifier, V10 truthful QA + residual gate + honest covers |
+| `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -552,7 +621,9 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | V5 | No-manual auto-cover | Eliminated manual review; soft cover fallback |
 | V6 | Adaptive cover quality | 7 cover methods, local recognizability scoring |
 | V7 | Logo mask bank | Multi-scale logo template masks, stroke-level repair |
-| **V8** | **Progressive repair strategy bank** | **100 tools, 11 ROI classes, per-class strategy ordering, local QA gate** |
+| V8 | Progressive repair strategy bank | 100 tools, 11 ROI classes, per-class strategy ordering, local QA gate |
+| V9 | Method families + RPV gate | Truthful status via method family, product-overlap guard, rectangular-patch-visibility gate |
+| **V10** | **Quality patch: truthful QA + honest covers** | **Fail-closed QA, mask-aware residual watermark gate, 3-layer mask, inpaint-based covers (no gray bands), strategy reorder, diversity telemetry, regression lock** |
 
 ## License
 
