@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-SUNSKY watermark removal — V5 No-Manual Auto-Cover pipeline.
+SUNSKY watermark removal — V8 Progressive Repair Strategy Bank.
 
-V5 converts the precision-first pipeline into a no-manual-review production
-pipeline. The new rule: never route an image to manual review. If clean
-inpainting cannot fully remove the watermark, automatically hide the
-remaining watermark with a soft shadow / cover patch.
+V8 replaces the fixed candidate loop with a 100-tool progressive repair
+pipeline. Each watermark ROI is classified, tools are selected from the
+strategy bank, candidates are run with local QA gates, and the first
+passing candidate is accepted. Final adaptive cover is the last resort.
 
 Terminal states:
   clean_repaired  — watermark removed invisibly via inpainting
@@ -34,6 +34,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from progressive_repair import (
+    analyze_roi as pr_analyze_roi,
+    repair_image_progressively,
+    save_debug_trace,
+    RepairContext,
+)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
 DEFAULT_ASSETS = Path("assets")
@@ -43,8 +50,8 @@ DEFAULT_OUT = Path("output")
 # ---------------------------------------------------------------------------
 # V5 — Version constant and assertion.
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V7_LOGO_MASK"
-assert PIPELINE_VERSION == "V7_LOGO_MASK"
+PIPELINE_VERSION = "V8_PROGRESSIVE_REPAIR"
+assert PIPELINE_VERSION == "V8_PROGRESSIVE_REPAIR"
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -3798,354 +3805,58 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     if gate in ("reject", "manual"):
         skip_repair = True
 
-    # --- Stage 1: Try clean inpainting repair ---
-    attempts = []
-    best_candidate = None
-    best_score = -1.0
-    best_attempt = None
-    repair_qa_pass = False
+    # --- V8: Progressive Repair Strategy Bank ---
+    bbox_tuple = (mark_box["x"], mark_box["y"],
+                  mark_box["w"], mark_box["h"])
+    pr_roi = pr_analyze_roi(img, bbox_tuple)
 
-    if not skip_repair:
-        candidate_methods = CANDIDATE_METHODS_BY_CLASS.get(roi_class, [])
-        if not candidate_methods:
-            primary = ROUTE_BY_CLASS[roi_class]
-            if primary == "telea_then_lama":
-                candidate_methods = ["telea", "ns", "lama"]
-            else:
-                candidate_methods = [primary]
-
-        allow_full_box = (
-            roi_class in ("plain_white", "plain_color", "low_texture") and
-            features.get("edge_density", 1.0) < 0.03 and
-            overlap.get("edge_overlap", 1.0) == 0.0 and
-            overlap.get("dark_overlap", 1.0) == 0.0)
-        if allow_full_box and "full_box_attenuate" not in candidate_methods:
-            candidate_methods = candidate_methods + ["full_box_attenuate"]
-
-        mask_area_frac = float((masks["final"] > 0).sum()) / (H * W + 1e-6)
-        protect_overlap_frac = 0.0
-        soft_area = float((masks["soft"] > 0).sum())
-        if soft_area > 0:
-            protect_overlap_frac = float(
-                (cv2.bitwise_and(masks["final"], protect_combined) > 0).sum()
-            ) / soft_area
-
-        for i, method in enumerate(candidate_methods):
-            if i == 0:
-                use_mask = masks["final"]
-                label = f"candidate_{method}_final_mask"
-            elif i == 1 and masks["used"] == "stroke":
-                use_mask = masks.get("repair_safe", masks["final"])
-                label = f"candidate_{method}_repair_mask"
-            else:
-                use_mask = masks["final"]
-                label = f"candidate_{method}"
-
-            a = _attempt(rwm, img, use_mask, method, label, mark_box,
-                         roi_class)
-            attempts.append(a)
-
-            if not a.get("ok") or a["output"] is None:
-                continue
-
-            a["output"] = remove_watermark_haze(a["output"], mark_box,
-                                                 roi_class, strength=0.85)
-            a["output"] = boundary_harmonize(img, a["output"], use_mask)
-
-            qa_w = qa_watermark(rwm, a["output"], mark_box, roi_class)
-            qa_l = qa_local_roi(img, a["output"], mark_box)
-            a["qa_water"] = qa_w
-            a["qa_local"] = qa_l
-
-            residual = detect_residual_multichannel(rwm, img, a["output"],
-                                                    mark_box)
-            a["residual"] = residual
-            cleanup_passes = 0
-            while (residual.get("has_residual") and a["output"] is not None
-                   and cleanup_passes < 2):
-                stroke_check = generate_stroke_level_mask(a["output"],
-                                                           mark_box,
-                                                           edge_pad=2)
-                if (stroke_check["confidence"] < 0.15 or
-                        stroke_check["stroke_pixels"] < 10):
-                    break
-                stroke_area = int((stroke_check["stroke"] > 0).sum())
-                original_mask_area = int((use_mask > 0).sum())
-                if stroke_area > original_mask_area * 0.5:
-                    break
-                fixed = residual_stroke_cleanup(rwm, img, a["output"],
-                                                mark_box, protect_combined)
-                if fixed is None:
-                    break
-                a["output"] = fixed
-                cleanup_passes += 1
-                residual = detect_residual_multichannel(rwm, img, fixed,
-                                                        mark_box)
-            if cleanup_passes > 0:
-                qa_w = qa_watermark(rwm, a["output"], mark_box, roi_class)
-                qa_l = qa_local_roi(img, a["output"], mark_box)
-                a["qa_water"] = qa_w
-                a["qa_local"] = qa_l
-                a["residual_cleaned"] = True
-                a["residual_passes"] = cleanup_passes
-            a["residual_final"] = residual
-
-            qa_pi = qa_product_integrity(img, a["output"], use_mask,
-                                          mark_box)
-            a["qa_product"] = qa_pi
-
-            post_gate_r = run_post_clean_integrity_gate(img, a["output"],
-                                                         use_mask, mark_box)
-            a["qa_post_integrity"] = post_gate_r
-
-            artifacts = detect_repair_artifacts(img, a["output"], use_mask)
-            a["qa_artifacts"] = artifacts
-
-            pv_gate = patch_visibility_gate(img, a["output"], mark_box,
-                                             roi_class)
-            a["qa_patch_visibility"] = pv_gate
-
-            if roi_class == "black_product" and a["output"] is not None:
-                bx_d, by_d = mark_box["x"], mark_box["y"]
-                bw_d, bh_d = mark_box["w"], mark_box["h"]
-                pad_d = max(10, max(bw_d, bh_d) // 3)
-                ry1_d = max(0, by_d - pad_d)
-                ry2_d = min(H, by_d + bh_d + pad_d)
-                rx1_d = max(0, bx_d - pad_d)
-                rx2_d = min(W, bx_d + bw_d + pad_d)
-                ring_d = np.zeros((H, W), dtype=bool)
-                ring_d[ry1_d:ry2_d, rx1_d:rx2_d] = True
-                ring_d[by_d:by_d + bh_d, bx_d:bx_d + bw_d] = False
-                gc_d = cv2.cvtColor(a["output"], cv2.COLOR_BGR2GRAY)
-                patch_luma = float(
-                    gc_d[by_d:by_d + bh_d, bx_d:bx_d + bw_d].mean())
-                ring_luma = (float(gc_d[ring_d].mean()) if ring_d.any()
-                             else patch_luma)
-                a["dark_luma_overshoot"] = round(patch_luma - ring_luma, 2)
-                if patch_luma - ring_luma > V4_DARK_LUMA_OVERSHOOT_MAX:
-                    a["dark_brightness_fail"] = True
-
-            if qa_pi.get("reject"):
-                a["score"] = 0.0
-                continue
-
-            post_ok = post_gate_r.get("pass", False)
-            art_reasons = set(artifacts.get("reasons", []))
-            art_ok = (artifacts["artifact_score"] <
-                      ARTIFACT_RECT_SCORE_THRESHOLD or
-                      "rectangular_repair_artifact" not in art_reasons)
-            pv_ok = pv_gate.get("pass", False)
-            dark_ok = not a.get("dark_brightness_fail", False)
-
-            if not post_ok or not art_ok or not pv_ok or not dark_ok:
-                a["score"] = 0.0
-                continue
-
-            cand_score = score_candidate(qa_w, qa_l, qa_pi, overlap,
-                                         mask_area_frac,
-                                         protect_overlap_frac)
-            art_penalty = artifacts["artifact_score"] * 0.15
-            pv_metrics = pv_gate.get("metrics", {})
-            pv_penalty = (
-                pv_metrics.get("low_frequency_patch_score", 0) * 0.10 +
-                pv_metrics.get("rectangular_boundary_score", 0) * 0.10)
-            cand_score = round(
-                _clamp(cand_score - art_penalty - pv_penalty), 4)
-            a["score"] = cand_score
-
-            water_ok = qa_w.get("pass") or _residual_grade(qa_w) >= 0.70
-            residual_final_conf = a.get("residual_final", {}).get(
-                "confidence", 0.0)
-            tmpl_tier = qa_w.get("template", {}).get("tier", "none")
-            if residual_final_conf >= 0.50 and tmpl_tier != "none":
-                water_ok = False
-            passes_all = (water_ok and
-                          not qa_pi.get("risky") and
-                          not qa_pi.get("reject"))
-
-            if passes_all and cand_score >= CLEAN_SCORE_THRESHOLD:
-                if cand_score > best_score:
-                    best_score = cand_score
-                    best_candidate = a["output"]
-                    best_attempt = a
-
-        # Fallback progressive cleanup.
-        if best_candidate is None and attempts:
-            fallback_cands = []
-            for a in attempts:
-                if not a.get("ok") or a.get("output") is None:
-                    continue
-                if a.get("qa_product", {}).get("reject"):
-                    continue
-                pi_g = a.get("qa_post_integrity", {})
-                if pi_g and not pi_g.get("pass", True):
-                    continue
-                tmpl = a.get("qa_water", {}).get("template", {})
-                edge = tmpl.get("edge", 1.0)
-                fallback_cands.append((edge, a))
-            if fallback_cands:
-                fallback_cands.sort(key=lambda x: x[0])
-                _, best_fb = fallback_cands[0]
-                fb_out = best_fb["output"].copy()
-                for hs, es in [(0.90, 0.5), (0.93, 0.6),
-                               (0.96, 0.7), (0.98, 0.8)]:
-                    fb_out = remove_watermark_haze(fb_out, mark_box,
-                                                    roi_class, strength=hs)
-                    fb_out = suppress_watermark_edges(fb_out, mark_box,
-                                                       roi_class,
-                                                       strength=es)
-                    fb_out = boundary_harmonize(img, fb_out, masks["final"])
-                    t_fb = qa_template(rwm, fb_out)
-                    if t_fb.get("tier", "none") == "none":
-                        best_candidate = fb_out
-                        best_attempt = best_fb
-                        break
-                    if (t_fb.get("tier") == "manual" and
-                            t_fb.get("edge", 1.0) <
-                            QA_TEMPLATE_MANUAL_EDGE_MAX):
-                        best_candidate = fb_out
-                        best_attempt = best_fb
-                        break
-
-        # Progressive cleanup on best candidate.
-        if best_candidate is not None:
-            for haze_strength in (0.88, 0.93, 0.97):
-                t_check = qa_template(rwm, best_candidate)
-                if t_check.get("tier", "none") == "none":
-                    break
-                best_candidate = remove_watermark_haze(
-                    best_candidate, mark_box, roi_class,
-                    strength=haze_strength)
-
-            t_post_haze = qa_template(rwm, best_candidate)
-            if t_post_haze.get("tier", "none") != "none":
-                best_candidate = suppress_watermark_edges(
-                    best_candidate, mark_box, roi_class, strength=0.7)
-
-            t_post_edge = qa_template(rwm, best_candidate)
-            if t_post_edge.get("tier", "none") != "none":
-                for _cleanup_round in range(2):
-                    stroke_check = generate_stroke_level_mask(
-                        best_candidate, mark_box, edge_pad=2)
-                    stroke_area = int((stroke_check["stroke"] > 0).sum())
-                    original_mask_area = int((masks["final"] > 0).sum())
-                    if stroke_area > original_mask_area * 0.5:
-                        break
-                    fixed = residual_stroke_cleanup(rwm, img, best_candidate,
-                                                    mark_box,
-                                                    protect_combined)
-                    if fixed is None:
-                        break
-                    best_candidate = fixed
-                    best_candidate = remove_watermark_haze(
-                        best_candidate, mark_box, roi_class, strength=0.95)
-                    best_candidate = suppress_watermark_edges(
-                        best_candidate, mark_box, roi_class, strength=0.6)
-                    t_recheck = qa_template(rwm, best_candidate)
-                    if t_recheck.get("tier", "none") == "none":
-                        break
-
-            # JPEG-aware quality check.
-            if best_candidate is not None:
-                def _jpeg_roundtrip(img_bgr):
-                    _, buf = cv2.imencode(".jpg", img_bgr,
-                                          [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
-
-                def _jpeg_passes(img_bgr):
-                    jd = _jpeg_roundtrip(img_bgr)
-                    t = qa_template(rwm, jd)
-                    tier = t.get("tier", "none")
-                    edge = t.get("edge", 0)
-                    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-                    cs = _clahe_mark_box_residual_score(g, mark_box)
-                    if tier == "auto":
-                        return False, t, cs
-                    if tier == "manual" and edge > QA_TEMPLATE_MANUAL_EDGE_MAX:
-                        return False, t, cs
-                    if cs > 0.70:
-                        return False, t, cs
-                    if tier == "manual" and cs > 0.50:
-                        return False, t, cs
-                    return True, t, cs
-
-                ok, t_jpeg, clahe_score = _jpeg_passes(best_candidate)
-
-                if not ok:
-                    for haze_s, edge_s in [(0.90, 0.5), (0.95, 0.7),
-                                           (0.98, 0.85)]:
-                        best_candidate = remove_watermark_haze(
-                            best_candidate, mark_box, roi_class,
-                            strength=haze_s)
-                        best_candidate = suppress_watermark_edges(
-                            best_candidate, mark_box, roi_class,
-                            strength=edge_s)
-                        best_candidate = boundary_harmonize(
-                            img, best_candidate, masks["final"])
-                        ok, t_jpeg, clahe_score = _jpeg_passes(
-                            best_candidate)
-                        if ok:
-                            break
-
-                if not ok:
-                    jpeg_cand = _jpeg_roundtrip(best_candidate)
-                    for haze_s in (0.92, 0.97):
-                        jpeg_cand = remove_watermark_haze(
-                            jpeg_cand, mark_box, roi_class, strength=haze_s)
-                        jpeg_cand = suppress_watermark_edges(
-                            jpeg_cand, mark_box, roi_class, strength=0.7)
-                    t_final = qa_template(rwm, jpeg_cand)
-                    if t_final.get("tier", "none") == "none":
-                        best_candidate = jpeg_cand
-                        ok = True
-
-                if not ok:
-                    best_candidate = None
-
-    # --- V5: If repair passed all QA, output CLEAN_REPAIRED ---
-    if best_candidate is not None:
-        repair_qa_pass = True
-        rec = _mk_record(path, det, status=ST_CLEAN_REPAIRED, reason=None,
-                         roi_class=roi_class, features=features,
-                         mark_box_density=orig_md, attempts=attempts,
-                         qa_water=best_attempt.get("qa_water"),
-                         qa_product=best_attempt.get("qa_product"),
-                         qa_local=best_attempt.get("qa_local"),
-                         qa_post_integrity=best_attempt.get(
-                             "qa_post_integrity"),
-                         qa_artifacts=best_attempt.get("qa_artifacts"),
-                         masks_info=masks_info, overlap=overlap)
-        rec["repair_qa_pass"] = True
-        _write_terminal(out_root, debug_root, rec, img, masks,
-                        best_candidate, best_attempt, protect, overlap)
-        return rec
-
-    # --- V6 Stage 2: Apply adaptive cover fallback → CLEAN_COVERED ---
-    failure_reasons = _collect_failure_reasons(attempts)
-    cover_result = apply_shadow_cover_fallback(
+    pr_ctx = RepairContext(
         image=img,
-        watermark_box=mark_box,
-        roi_class=roi_class,
-        mask_info=masks_info,
-        qa_failure_reasons=failure_reasons,
+        watermark_bbox=bbox_tuple,
         stroke_mask=masks.get("stroke"),
+        bbox_mask=masks["final"],
+        roi_analysis=pr_roi,
+        product_mask=protect_combined,
+        logo_mask=masks.get("logo_mask"),
+        debug_dir=str(debug_root) if debug_root else None,
     )
-    covered_img = cover_result["image"]
 
-    last_attempt = attempts[-1] if attempts else None
-    reason = failure_reasons[0] if failure_reasons else "cover_fallback"
+    candidate, trace = repair_image_progressively(pr_ctx)
+    final_method = candidate.metadata.get("final_method", "unknown")
+    qa_info = candidate.metadata.get("qa", {})
 
-    rec = _mk_record(path, det, status=ST_CLEAN_COVERED, reason=reason,
+    if debug_root:
+        save_debug_trace(debug_root, path.name, pr_roi.roi_class,
+                         bbox_tuple, trace, final_method)
+
+    is_cover = final_method == "final_adaptive_cover"
+    status = ST_CLEAN_COVERED if is_cover else ST_CLEAN_REPAIRED
+
+    attempts = [{
+        "label": t.get("tool", "unknown"),
+        "method": t.get("tool", "unknown"),
+        "ok": t.get("passed", False),
+        "runtime_s": t.get("runtime_s", 0.0),
+        "over_budget": False,
+        "error": None if t.get("reason") != "error" else t.get("reason"),
+        "qa_water": {"pass": t.get("passed", False)},
+        "qa_local": {"pass": t.get("passed", False)},
+    } for t in trace]
+
+    rec = _mk_record(path, det, status=status, reason=None,
                      roi_class=roi_class, features=features,
                      mark_box_density=orig_md, attempts=attempts,
-                     qa_water=(last_attempt or {}).get("qa_water"),
-                     qa_local=(last_attempt or {}).get("qa_local"),
-                     masks_info=masks_info, overlap=overlap,
-                     cover_info=cover_result)
-    rec["repair_qa_pass"] = False
-    rec["repair_failure_reasons"] = failure_reasons
+                     masks_info=masks_info, overlap=overlap)
+    rec["repair_qa_pass"] = not is_cover
+    rec["v8_final_method"] = final_method
+    rec["v8_roi_class"] = pr_roi.roi_class
+    rec["v8_tools_tried"] = len(trace)
+    rec["v8_qa_final_score"] = qa_info.get("final_score")
+
+    best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
-                    covered_img, last_attempt, protect, overlap)
+                    candidate.repaired_image, best_attempt_stub,
+                    protect, overlap)
     return rec
 
 
