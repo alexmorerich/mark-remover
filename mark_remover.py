@@ -43,8 +43,8 @@ DEFAULT_OUT = Path("output")
 # ---------------------------------------------------------------------------
 # V5 — Version constant and assertion.
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V5_NO_MANUAL_AUTO_COVER"
-assert PIPELINE_VERSION == "V5_NO_MANUAL_AUTO_COVER"
+PIPELINE_VERSION = "V6_ADAPTIVE_COVER"
+assert PIPELINE_VERSION == "V6_ADAPTIVE_COVER"
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -111,22 +111,7 @@ COVER_ESCALATION_LEVELS = [
     {"opacity": 0.80, "feather": 12, "expand": 16},
 ]
 
-COVER_METHOD_BY_ROI = {
-    "plain_white":    ["cover_plain_white_soft_band", "cover_local_background_soft_patch"],
-    "plain_color":    ["cover_local_background_soft_patch", "cover_plain_white_soft_band"],
-    "low_texture":    ["cover_local_background_soft_patch", "cover_plain_white_soft_band"],
-    "gradient":       ["cover_gradient_blur_shadow"],
-    "transparent":    ["cover_gradient_blur_shadow", "cover_complex_product_shadow_strip"],
-    "glossy":         ["cover_gradient_blur_shadow", "cover_complex_product_shadow_strip"],
-    "metallic":       ["cover_gradient_blur_shadow", "cover_complex_product_shadow_strip"],
-    "black_product":  ["cover_dark_surface_smoke_band"],
-    "high_texture":   ["cover_complex_product_shadow_strip"],
-    "product_detail": ["cover_complex_product_shadow_strip"],
-    "text_or_qr":     ["cover_complex_product_shadow_strip"],
-    "poster_or_marketing": ["cover_complex_product_shadow_strip"],
-}
-
-DEFAULT_COVER_METHOD = "cover_complex_product_shadow_strip"
+# V6: cover routing moved to V6_FILL_MODE_BY_ROI (defined after cover functions)
 
 
 # ---------------------------------------------------------------------------
@@ -2013,10 +1998,121 @@ def inpaint_local_background_fill(img, mask, mark_box):
 
 
 # ---------------------------------------------------------------------------
-# V5 — Shadow cover methods.
+# V6 — Adaptive cover system.
 # ---------------------------------------------------------------------------
 
-def _cover_mask(img_shape, mark_box, expand_px, feather_px):
+def _sample_ring(img, mark_box, pad_factor=0.33):
+    H, W = img.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    pad = max(10, int(max(bw, bh) * pad_factor))
+    ry1, ry2 = max(0, by - pad), min(H, by + bh + pad)
+    rx1, rx2 = max(0, bx - pad), min(W, bx + bw + pad)
+    ring = np.zeros((H, W), dtype=bool)
+    ring[ry1:ry2, rx1:rx2] = True
+    ring[by:by + bh, bx:bx + bw] = False
+    return ring, (ry1, ry2, rx1, rx2)
+
+
+def estimate_local_cover_style(image, bbox, roi_class):
+    H, W = image.shape[:2]
+    ring, (ry1, ry2, rx1, rx2) = _sample_ring(image, bbox)
+    ring_pixels = image[ring]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    bx, by, bw, bh = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
+    roi_gray = gray[by:by + bh, bx:bx + bw]
+
+    if ring_pixels.size > 0:
+        median_color = np.median(ring_pixels, axis=0).astype(np.uint8)
+        local_luma = float(cv2.cvtColor(
+            median_color.reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
+    else:
+        median_color = np.array([180, 180, 180], dtype=np.uint8)
+        local_luma = 180.0
+
+    ring_gray = gray[ring]
+    noise_sigma = float(np.std(ring_gray)) if ring_gray.size > 0 else 2.0
+    noise_sigma = min(noise_sigma, 15.0)
+
+    edges = cv2.Canny(roi_gray, 60, 140) if roi_gray.size > 0 else np.zeros(1)
+    edge_density = float(edges.mean()) / 255.0
+
+    grad_dir = 0.0
+    if roi_gray.size > 100:
+        gx = cv2.Sobel(roi_gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(roi_gray, cv2.CV_64F, 0, 1, ksize=3)
+        grad_dir = float(np.arctan2(gy.mean(), gx.mean()))
+
+    fill_mode_map = {
+        "plain_white": "near_white_soft",
+        "plain_color": "median_color_soft",
+        "low_texture": "median_color_soft",
+        "gradient": "local_gradient_fit",
+        "metallic": "gradient_plane_soft",
+        "glossy": "blurred_background_soft",
+        "transparent": "blurred_background_soft",
+        "black_product": "dark_translucent_soft",
+    }
+    fill_mode = fill_mode_map.get(roi_class, "adaptive_soft")
+
+    base_feather = max(8, int(min(bw, bh) * 0.20))
+    if roi_class in ("plain_white", "plain_color", "low_texture"):
+        base_feather = max(12, int(min(bw, bh) * 0.30))
+    elif edge_density >= 0.08:
+        base_feather = max(6, int(min(bw, bh) * 0.12))
+
+    base_alpha = 0.45
+    if roi_class in ("plain_white", "plain_color"):
+        base_alpha = 0.55
+    elif roi_class in ("glossy", "transparent"):
+        base_alpha = 0.35
+    elif roi_class == "black_product":
+        base_alpha = 0.40
+    if edge_density >= 0.08:
+        base_alpha = min(base_alpha, 0.35)
+    elif 0.03 <= edge_density < 0.08:
+        base_alpha = min(base_alpha, 0.40)
+
+    sharpen = 0.0
+    if roi_class in ("metallic", "glossy"):
+        sharpen = 0.2
+
+    return {
+        "median_color": median_color,
+        "local_luma": local_luma,
+        "noise_sigma": noise_sigma,
+        "edge_density": edge_density,
+        "gradient_direction": grad_dir,
+        "fill_mode": fill_mode,
+        "cover_color": median_color,
+        "alpha": base_alpha,
+        "feather_px": base_feather,
+        "noise_amount": min(noise_sigma * 0.3, 3.0),
+        "sharpen_amount": sharpen,
+        "roi_class": roi_class,
+    }
+
+
+def make_soft_rounded_rect_mask(w, h, radius=None, feather_px=None):
+    if radius is None:
+        radius = int(min(w, h) * 0.18)
+    if feather_px is None:
+        feather_px = max(8, int(min(w, h) * 0.20))
+    radius = max(1, min(radius, min(w, h) // 2))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(mask, (radius, 0), (w - radius - 1, h - 1), 255, -1)
+    cv2.rectangle(mask, (0, radius), (w - 1, h - radius - 1), 255, -1)
+    cv2.circle(mask, (radius, radius), radius, 255, -1)
+    cv2.circle(mask, (w - radius - 1, radius), radius, 255, -1)
+    cv2.circle(mask, (radius, h - radius - 1), radius, 255, -1)
+    cv2.circle(mask, (w - radius - 1, h - radius - 1), radius, 255, -1)
+    mask_f = mask.astype(np.float64) / 255.0
+    if feather_px > 1:
+        ksize = feather_px * 2 + 1
+        mask_f = cv2.GaussianBlur(mask_f, (ksize, ksize), 0)
+    return mask_f
+
+
+def _embed_rounded_mask(img_shape, mark_box, expand_px, feather_px):
     H, W = img_shape[:2]
     cx = mark_box["x"] + mark_box["w"] // 2
     cy = mark_box["y"] + mark_box["h"] // 2
@@ -2024,207 +2120,364 @@ def _cover_mask(img_shape, mark_box, expand_px, feather_px):
     hh = mark_box["h"] // 2 + expand_px
     x1, y1 = max(0, cx - hw), max(0, cy - hh)
     x2, y2 = min(W, cx + hw), min(H, cy + hh)
-    mask = np.zeros((H, W), dtype=np.float64)
-    mask[y1:y2, x1:x2] = 1.0
-    if feather_px > 1:
-        ksize = feather_px * 2 + 1
-        mask = cv2.GaussianBlur(mask, (ksize, ksize), 0)
-    return mask
+    rw, rh = x2 - x1, y2 - y1
+    if rw < 4 or rh < 4:
+        mask = np.zeros((H, W), dtype=np.float64)
+        mask[y1:y2, x1:x2] = 1.0
+        return mask
+    local_mask = make_soft_rounded_rect_mask(rw, rh, feather_px=feather_px)
+    full = np.zeros((H, W), dtype=np.float64)
+    full[y1:y2, x1:x2] = local_mask
+    return full
 
 
-def cover_plain_white_soft_band(img, mark_box, opacity, feather_px, expand_px):
-    H, W = img.shape[:2]
-    bx, by = mark_box["x"], mark_box["y"]
-    bw, bh = mark_box["w"], mark_box["h"]
-    pad = max(10, max(bw, bh) // 3)
-    ry1, ry2 = max(0, by - pad), min(H, by + bh + pad)
-    rx1, rx2 = max(0, bx - pad), min(W, bx + bw + pad)
-    ring = np.zeros((H, W), dtype=bool)
-    ring[ry1:ry2, rx1:rx2] = True
-    ring[by:by + bh, bx:bx + bw] = False
+def _add_noise_match(patch, noise_sigma, noise_amount):
+    if noise_amount < 0.1 or noise_sigma < 0.3:
+        return patch
+    noise = np.random.normal(0, noise_sigma * noise_amount / noise_sigma
+                             if noise_sigma > 0 else 0,
+                             patch.shape).astype(np.float64)
+    return np.clip(patch.astype(np.float64) + noise, 0, 255).astype(np.uint8)
+
+
+def _unsharp_mask(img, amount=0.3, radius=1.5):
+    blurred = cv2.GaussianBlur(img.astype(np.float64), (0, 0), radius)
+    return np.clip(img.astype(np.float64) + amount * (img.astype(np.float64)
+                   - blurred), 0, 255).astype(np.uint8)
+
+
+def _apply_cover_blend(img, cover_img, alpha_mask, style):
+    out = img.astype(np.float64) * (1.0 - alpha_mask[:, :, None]) + \
+          cover_img.astype(np.float64) * alpha_mask[:, :, None]
+    result = np.clip(out, 0, 255).astype(np.uint8)
+    if style.get("sharpen_amount", 0) > 0:
+        bx, by = style.get("_bx", 0), style.get("_by", 0)
+        bw, bh = style.get("_bw", 0), style.get("_bh", 0)
+        if bw > 0 and bh > 0:
+            roi = result[by:by + bh, bx:bx + bw]
+            result[by:by + bh, bx:bx + bw] = _unsharp_mask(
+                roi, amount=style["sharpen_amount"])
+    return result
+
+
+def cover_near_white_soft(img, mark_box, style, expand_px):
+    ring, _ = _sample_ring(img, mark_box)
     ring_pixels = img[ring]
     if ring_pixels.size > 0:
-        bg_color = ring_pixels.mean(axis=0).astype(np.uint8)
+        bg_color = np.median(ring_pixels, axis=0).astype(np.uint8)
     else:
         bg_color = np.array([245, 245, 245], dtype=np.uint8)
     cover = np.full_like(img, bg_color)
-    noise = np.random.normal(0, 1.5, cover.shape).astype(np.float64)
-    cover = np.clip(cover.astype(np.float64) + noise, 0, 255).astype(np.uint8)
-    alpha = _cover_mask(img.shape, mark_box, expand_px, feather_px)
-    alpha = alpha * opacity
-    out = img.astype(np.float64) * (1 - alpha[:, :, None]) + \
-          cover.astype(np.float64) * alpha[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    cover = _add_noise_match(cover, style["noise_sigma"],
+                             style["noise_amount"])
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=mark_box["x"], _by=mark_box["y"],
+              _bw=mark_box["w"], _bh=mark_box["h"])
+    return _apply_cover_blend(img, cover, alpha, st)
 
 
-def cover_dark_surface_smoke_band(img, mark_box, opacity, feather_px, expand_px):
+def cover_median_color_soft(img, mark_box, style, expand_px):
+    cover = np.full_like(img, style["cover_color"])
+    cover = _add_noise_match(cover, style["noise_sigma"],
+                             style["noise_amount"])
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=mark_box["x"], _by=mark_box["y"],
+              _bw=mark_box["w"], _bh=mark_box["h"])
+    return _apply_cover_blend(img, cover, alpha, st)
+
+
+def cover_dark_translucent_soft(img, mark_box, style, expand_px):
+    luma = style["local_luma"]
+    scale = max(0, luma - 3) / max(luma, 1)
+    dark_color = (style["median_color"].astype(np.float64) * scale)
+    dark_color = np.clip(dark_color, 0, 255).astype(np.uint8)
+    cover = np.full_like(img, dark_color)
+    cover = _add_noise_match(cover, style["noise_sigma"],
+                             max(style["noise_amount"], 0.5))
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=mark_box["x"], _by=mark_box["y"],
+              _bw=mark_box["w"], _bh=mark_box["h"])
+    return _apply_cover_blend(img, cover, alpha, st)
+
+
+def cover_gradient_plane_soft(img, mark_box, style, expand_px):
     H, W = img.shape[:2]
-    bx, by = mark_box["x"], mark_box["y"]
-    bw, bh = mark_box["w"], mark_box["h"]
-    pad = max(10, max(bw, bh) // 3)
-    ry1, ry2 = max(0, by - pad), min(H, by + bh + pad)
-    rx1, rx2 = max(0, bx - pad), min(W, bx + bw + pad)
-    ring = np.zeros((H, W), dtype=bool)
-    ring[ry1:ry2, rx1:rx2] = True
-    ring[by:by + bh, bx:bx + bw] = False
-    ring_pixels = img[ring]
-    if ring_pixels.size > 0:
-        bg_color = ring_pixels.mean(axis=0).astype(np.uint8)
-        bg_luma = float(cv2.cvtColor(
-            bg_color.reshape(1, 1, 3), cv2.COLOR_BGR2GRAY)[0, 0])
-    else:
-        bg_color = np.array([30, 30, 30], dtype=np.uint8)
-        bg_luma = 30.0
-    cover_luma = max(0, bg_luma - 3)
-    scale = cover_luma / max(bg_luma, 1)
-    cover = (bg_color.astype(np.float64) * scale).astype(np.uint8)
-    cover = np.full_like(img, cover)
-    noise = np.random.normal(0, 0.8, cover.shape).astype(np.float64)
-    cover = np.clip(cover.astype(np.float64) + noise, 0, 255).astype(np.uint8)
-    alpha = _cover_mask(img.shape, mark_box, expand_px, feather_px)
-    alpha = alpha * opacity
-    out = img.astype(np.float64) * (1 - alpha[:, :, None]) + \
-          cover.astype(np.float64) * alpha[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    ring, _ = _sample_ring(img, mark_box, pad_factor=0.5)
+    ys_r, xs_r = np.where(ring)
+    if ys_r.size < 20:
+        return cover_median_color_soft(img, mark_box, style, expand_px)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float64)
+    ring_ny = ys_r.astype(np.float64) / H
+    ring_nx = xs_r.astype(np.float64) / W
+    A_ring = np.column_stack([np.ones_like(ring_nx), ring_nx, ring_ny])
+    ex = expand_px
+    y1, y2 = max(0, by - ex), min(H, by + bh + ex)
+    x1, x2 = max(0, bx - ex), min(W, bx + bw + ex)
+    ys_m, xs_m = np.mgrid[y1:y2, x1:x2]
+    ys_m, xs_m = ys_m.ravel(), xs_m.ravel()
+    mark_ny = ys_m.astype(np.float64) / H
+    mark_nx = xs_m.astype(np.float64) / W
+    A_mark = np.column_stack([np.ones_like(mark_nx), mark_nx, mark_ny])
+    cover_lab = lab.copy()
+    for c in range(3):
+        ring_vals = lab[ys_r, xs_r, c]
+        coeffs, *_ = np.linalg.lstsq(A_ring, ring_vals, rcond=None)
+        cover_lab[ys_m, xs_m, c] = A_mark @ coeffs
+    cover = cv2.cvtColor(np.clip(cover_lab, 0, 255).astype(np.uint8),
+                         cv2.COLOR_LAB2BGR)
+    cover = _add_noise_match(cover, style["noise_sigma"],
+                             style["noise_amount"])
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=bx, _by=by, _bw=bw, _bh=bh)
+    return _apply_cover_blend(img, cover, alpha, st)
 
 
-def cover_gradient_blur_shadow(img, mark_box, opacity, feather_px, expand_px):
+def cover_local_gradient_fit(img, mark_box, style, expand_px):
+    return cover_gradient_plane_soft(img, mark_box, style, expand_px)
+
+
+def cover_blurred_background_soft(img, mark_box, style, expand_px):
     H, W = img.shape[:2]
-    bx, by = mark_box["x"], mark_box["y"]
-    bw, bh = mark_box["w"], mark_box["h"]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
     ex = expand_px
     y1, y2 = max(0, by - ex), min(H, by + bh + ex)
     x1, x2 = max(0, bx - ex), min(W, bx + bw + ex)
     roi = img[y1:y2, x1:x2].copy()
+    if roi.size == 0:
+        return cover_median_color_soft(img, mark_box, style, expand_px)
     k = max(15, min(roi.shape[0], roi.shape[1]) // 2)
     k = k if k % 2 == 1 else k + 1
     blurred_roi = cv2.GaussianBlur(roi, (k, k), 0)
-    shadow = np.full_like(roi, 0)
-    shadow_blend = cv2.addWeighted(blurred_roi, 0.85, shadow, 0.15, 0)
+    blurred_roi = _add_noise_match(blurred_roi, style["noise_sigma"],
+                                   style["noise_amount"])
     cover = img.copy()
-    cover[y1:y2, x1:x2] = shadow_blend
-    alpha = _cover_mask(img.shape, mark_box, expand_px, feather_px)
-    alpha = alpha * opacity
-    out = img.astype(np.float64) * (1 - alpha[:, :, None]) + \
-          cover.astype(np.float64) * alpha[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    cover[y1:y2, x1:x2] = blurred_roi
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=bx, _by=by, _bw=bw, _bh=bh)
+    return _apply_cover_blend(img, cover, alpha, st)
 
 
-def cover_complex_product_shadow_strip(img, mark_box, opacity, feather_px,
-                                       expand_px):
+def cover_adaptive_soft(img, mark_box, style, expand_px):
     H, W = img.shape[:2]
-    bx, by = mark_box["x"], mark_box["y"]
-    bw, bh = mark_box["w"], mark_box["h"]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    ex = expand_px
+    y1, y2 = max(0, by - ex), min(H, by + bh + ex)
+    x1, x2 = max(0, bx - ex), min(W, bx + bw + ex)
+    roi = img[y1:y2, x1:x2].copy()
+    if roi.size == 0:
+        return cover_median_color_soft(img, mark_box, style, expand_px)
+    k = max(7, min(roi.shape[0], roi.shape[1]) // 3)
+    k = k if k % 2 == 1 else k + 1
+    blurred_roi = cv2.GaussianBlur(roi, (k, k), 0)
+    blurred_roi = _add_noise_match(blurred_roi, style["noise_sigma"],
+                                   style["noise_amount"])
+    cover = img.copy()
+    cover[y1:y2, x1:x2] = blurred_roi
+    alpha = _embed_rounded_mask(img.shape, mark_box, expand_px,
+                                style["feather_px"])
+    alpha = alpha * style["alpha"]
+    st = dict(style, _bx=bx, _by=by, _bw=bw, _bh=bh)
+    return _apply_cover_blend(img, cover, alpha, st)
+
+
+_V6_COVER_DISPATCH = {
+    "near_white_soft": cover_near_white_soft,
+    "median_color_soft": cover_median_color_soft,
+    "dark_translucent_soft": cover_dark_translucent_soft,
+    "gradient_plane_soft": cover_gradient_plane_soft,
+    "local_gradient_fit": cover_local_gradient_fit,
+    "blurred_background_soft": cover_blurred_background_soft,
+    "adaptive_soft": cover_adaptive_soft,
+}
+
+V6_FILL_MODE_BY_ROI = {
+    "plain_white": ["near_white_soft", "median_color_soft"],
+    "plain_color": ["median_color_soft", "near_white_soft"],
+    "low_texture": ["median_color_soft", "adaptive_soft"],
+    "gradient": ["local_gradient_fit", "gradient_plane_soft"],
+    "metallic": ["gradient_plane_soft", "blurred_background_soft"],
+    "glossy": ["blurred_background_soft", "gradient_plane_soft"],
+    "transparent": ["blurred_background_soft", "adaptive_soft"],
+    "black_product": ["dark_translucent_soft", "adaptive_soft"],
+    "high_texture": ["adaptive_soft", "blurred_background_soft"],
+    "product_detail": ["adaptive_soft", "blurred_background_soft"],
+    "text_or_qr": ["adaptive_soft"],
+    "poster_or_marketing": ["adaptive_soft"],
+}
+
+
+def _cover_residual_check(covered, mark_box):
+    gray = cv2.cvtColor(covered, cv2.COLOR_BGR2GRAY)
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    roi = gray[by:by + bh, bx:bx + bw]
+    if roi.size == 0:
+        return 0.0
+    laplacian = cv2.Laplacian(roi, cv2.CV_64F)
+    return float((np.abs(laplacian) > 15).mean())
+
+
+def _score_cover_candidate(img, covered, mark_box, style):
+    H, W = img.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    wm_residual = _cover_residual_check(covered, mark_box)
+    gray_o = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    gray_c = cv2.cvtColor(covered, cv2.COLOR_BGR2GRAY).astype(np.float64)
     pad = max(10, max(bw, bh) // 3)
     ry1, ry2 = max(0, by - pad), min(H, by + bh + pad)
     rx1, rx2 = max(0, bx - pad), min(W, bx + bw + pad)
     ring = np.zeros((H, W), dtype=bool)
     ring[ry1:ry2, rx1:rx2] = True
     ring[by:by + bh, bx:bx + bw] = False
-    ring_pixels = img[ring]
-    if ring_pixels.size > 0:
-        bg_luma = float(cv2.cvtColor(
-            ring_pixels.mean(axis=0).reshape(1, 1, 3).astype(np.uint8),
-            cv2.COLOR_BGR2GRAY)[0, 0])
-    else:
-        bg_luma = 128.0
-    if bg_luma > 160:
-        neutral = np.array([200, 200, 200], dtype=np.uint8)
-    elif bg_luma > 80:
-        neutral = np.array([100, 100, 100], dtype=np.uint8)
-    else:
-        neutral = np.array([40, 40, 40], dtype=np.uint8)
-    cover = np.full_like(img, neutral)
-    alpha = _cover_mask(img.shape, mark_box, expand_px, feather_px)
-    alpha = alpha * opacity
-    out = img.astype(np.float64) * (1 - alpha[:, :, None]) + \
-          cover.astype(np.float64) * alpha[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def cover_local_background_soft_patch(img, mark_box, opacity, feather_px,
-                                      expand_px):
-    H, W = img.shape[:2]
-    bx, by = mark_box["x"], mark_box["y"]
-    bw, bh = mark_box["w"], mark_box["h"]
-    ex = expand_px
-    y1, y2 = max(0, by - ex), min(H, by + bh + ex)
-    x1, x2 = max(0, bx - ex), min(W, bx + bw + ex)
-    roi = img[y1:y2, x1:x2].copy()
-    k = max(7, min(roi.shape[0], roi.shape[1]) // 3)
-    k = k if k % 2 == 1 else k + 1
-    blurred_roi = cv2.GaussianBlur(roi, (k, k), 0)
-    noise = np.random.normal(0, 1.2, blurred_roi.shape).astype(np.float64)
-    blurred_roi = np.clip(blurred_roi.astype(np.float64) + noise,
-                          0, 255).astype(np.uint8)
-    cover = img.copy()
-    cover[y1:y2, x1:x2] = blurred_roi
-    alpha = _cover_mask(img.shape, mark_box, expand_px, feather_px)
-    alpha = alpha * opacity
-    out = img.astype(np.float64) * (1 - alpha[:, :, None]) + \
-          cover.astype(np.float64) * alpha[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-_COVER_DISPATCH = {
-    "cover_plain_white_soft_band": cover_plain_white_soft_band,
-    "cover_dark_surface_smoke_band": cover_dark_surface_smoke_band,
-    "cover_gradient_blur_shadow": cover_gradient_blur_shadow,
-    "cover_complex_product_shadow_strip": cover_complex_product_shadow_strip,
-    "cover_local_background_soft_patch": cover_local_background_soft_patch,
-}
+    ring_mean = float(gray_c[ring].mean()) if ring.any() else 128.0
+    patch_mean = float(gray_c[by:by + bh, bx:bx + bw].mean())
+    patch_vis = abs(patch_mean - ring_mean) / 255.0
+    edge_o = cv2.Canny(gray_o[by:by + bh, bx:bx + bw].astype(np.uint8),
+                        60, 140)
+    edge_c = cv2.Canny(gray_c[by:by + bh, bx:bx + bw].astype(np.uint8),
+                        60, 140)
+    edge_o_d = float(edge_o.mean()) / 255.0
+    edge_c_d = float(edge_c.mean()) / 255.0
+    edge_loss = max(0, edge_o_d - edge_c_d)
+    strip_h = max(2, bh // 6)
+    top_s = gray_c[max(0, by - strip_h):by, bx:bx + bw]
+    bot_s = gray_c[by + bh:min(H, by + bh + strip_h), bx:bx + bw]
+    inner_top = gray_c[by:by + strip_h, bx:bx + bw]
+    inner_bot = gray_c[by + bh - strip_h:by + bh, bx:bx + bw]
+    bj = 0.0
+    if top_s.size > 0 and inner_top.size > 0:
+        bj = max(bj, abs(float(top_s.mean()) - float(inner_top.mean())))
+    if bot_s.size > 0 and inner_bot.size > 0:
+        bj = max(bj, abs(float(bot_s.mean()) - float(inner_bot.mean())))
+    bj_score = bj / 255.0
+    score = (3.0 * wm_residual + 2.0 * patch_vis +
+             4.0 * edge_loss + 1.5 * bj_score)
+    return {
+        "score": round(score, 4),
+        "watermark_residual_score": round(wm_residual, 4),
+        "patch_visibility_score": round(patch_vis, 4),
+        "product_edge_loss_score": round(edge_loss, 4),
+        "boundary_jump_score": round(bj_score, 4),
+    }
 
 
 def apply_shadow_cover_fallback(image, watermark_box, roi_class, mask_info,
-                                qa_failure_reasons):
-    methods = COVER_METHOD_BY_ROI.get(roi_class,
-                                      [DEFAULT_COVER_METHOD])
-    best_result = None
-    for method_name in methods:
-        fn = _COVER_DISPATCH.get(method_name)
+                                qa_failure_reasons, stroke_mask=None):
+    style = estimate_local_cover_style(image, watermark_box, roi_class)
+
+    fill_modes = V6_FILL_MODE_BY_ROI.get(roi_class, ["adaptive_soft"])
+
+    candidates = []
+
+    for fill_mode in fill_modes:
+        fn = _V6_COVER_DISPATCH.get(fill_mode)
         if fn is None:
             continue
         for level in COVER_ESCALATION_LEVELS:
-            covered = fn(image, watermark_box,
-                         opacity=level["opacity"],
-                         feather_px=level["feather"],
-                         expand_px=level["expand"])
-            best_result = {
+            s = dict(style)
+            s["alpha"] = max(style["alpha"], level["opacity"])
+            s["feather_px"] = max(style["feather_px"], level["feather"])
+            covered = fn(image, watermark_box, s, level["expand"])
+            residual = _cover_residual_check(covered, watermark_box)
+            cand_info = _score_cover_candidate(image, covered, watermark_box,
+                                               s)
+            cand = {
                 "image": covered,
-                "method": method_name,
-                "opacity": level["opacity"],
-                "feather_px": level["feather"],
+                "method": f"v6_{fill_mode}",
+                "opacity": s["alpha"],
+                "feather_px": s["feather_px"],
                 "expand_px": level["expand"],
                 "escalation_level": COVER_ESCALATION_LEVELS.index(level),
+                "fill_mode": fill_mode,
+                "edge_density": style["edge_density"],
+                "noise_sigma": style["noise_sigma"],
+                "cover_scores": cand_info,
             }
-            wm_gray = cv2.cvtColor(covered, cv2.COLOR_BGR2GRAY)
-            bx, by = watermark_box["x"], watermark_box["y"]
-            bw, bh = watermark_box["w"], watermark_box["h"]
-            roi = wm_gray[by:by + bh, bx:bx + bw]
-            if roi.size == 0:
+            candidates.append(cand)
+            if residual < 0.03:
                 break
-            laplacian = cv2.Laplacian(roi, cv2.CV_64F)
-            edge_density = float((np.abs(laplacian) > 15).mean())
-            if edge_density < 0.03:
-                break
-        if best_result is not None:
-            break
-    if best_result is None:
-        fn = _COVER_DISPATCH[DEFAULT_COVER_METHOD]
+
+    if stroke_mask is not None and np.any(stroke_mask > 0):
+        for fill_mode in fill_modes[:1]:
+            fn = _V6_COVER_DISPATCH.get(fill_mode)
+            if fn is None:
+                continue
+            s = dict(style)
+            s["alpha"] = min(style["alpha"] + 0.10, 0.70)
+            text_mask = cv2.dilate(stroke_mask,
+                                   cv2.getStructuringElement(
+                                       cv2.MORPH_RECT, (5, 3)),
+                                   iterations=2)
+            k = max(5, int(min(watermark_box["w"], watermark_box["h"]) * 0.08))
+            k = k if k % 2 == 1 else k + 1
+            text_mask_f = cv2.GaussianBlur(
+                text_mask.astype(np.float64) / 255.0, (k, k), 0)
+            text_mask_f = text_mask_f * s["alpha"]
+            cover_layer = fn(image, watermark_box, s, 2)
+            out = image.astype(np.float64) * (1.0 - text_mask_f[:, :, None]) \
+                + cover_layer.astype(np.float64) * text_mask_f[:, :, None]
+            text_covered = np.clip(out, 0, 255).astype(np.uint8)
+            cand_info = _score_cover_candidate(image, text_covered,
+                                               watermark_box, s)
+            candidates.append({
+                "image": text_covered,
+                "method": f"v6_text_shaped_{fill_mode}",
+                "opacity": s["alpha"],
+                "feather_px": k,
+                "expand_px": 2,
+                "escalation_level": 0,
+                "fill_mode": f"text_shaped_{fill_mode}",
+                "edge_density": style["edge_density"],
+                "noise_sigma": style["noise_sigma"],
+                "cover_scores": cand_info,
+            })
+
+    if not candidates:
+        fn = _V6_COVER_DISPATCH["adaptive_soft"]
+        s = dict(style)
         strongest = COVER_ESCALATION_LEVELS[-1]
-        covered = fn(image, watermark_box,
-                     opacity=strongest["opacity"],
-                     feather_px=strongest["feather"],
-                     expand_px=strongest["expand"])
-        best_result = {
+        s["alpha"] = max(s["alpha"], strongest["opacity"])
+        covered = fn(image, watermark_box, s, strongest["expand"])
+        cand_info = _score_cover_candidate(image, covered, watermark_box, s)
+        candidates.append({
             "image": covered,
-            "method": DEFAULT_COVER_METHOD,
-            "opacity": strongest["opacity"],
-            "feather_px": strongest["feather"],
+            "method": "v6_adaptive_soft_final",
+            "opacity": s["alpha"],
+            "feather_px": s["feather_px"],
             "expand_px": strongest["expand"],
             "escalation_level": len(COVER_ESCALATION_LEVELS) - 1,
-        }
-    return best_result
+            "fill_mode": "adaptive_soft",
+            "edge_density": style["edge_density"],
+            "noise_sigma": style["noise_sigma"],
+            "cover_scores": cand_info,
+        })
+
+    best = min(candidates, key=lambda c: c["cover_scores"]["score"])
+
+    residual = best["cover_scores"]["watermark_residual_score"]
+    if residual > 0.08:
+        bx, by = watermark_box["x"], watermark_box["y"]
+        bw, bh = watermark_box["w"], watermark_box["h"]
+        roi = best["image"][by:by + bh, bx:bx + bw]
+        k_b = max(3, min(bh, bw) // 6)
+        k_b = k_b if k_b % 2 == 1 else k_b + 1
+        blurred_roi = cv2.GaussianBlur(roi, (k_b, k_b), 0)
+        blend = 0.3
+        roi_fixed = cv2.addWeighted(roi, 1.0 - blend, blurred_roi, blend, 0)
+        best["image"][by:by + bh, bx:bx + bw] = roi_fixed
+        best["cover_scores"]["post_blur_applied"] = True
+
+    return best
 
 
 def inpaint_lama_small(rwm, img, mask):
@@ -3185,6 +3438,16 @@ def _mk_record(path, det, *, status, reason=None, roi_class=None,
         rec["cover_opacity"] = cover_info.get("opacity")
         rec["cover_expand_px"] = cover_info.get("expand_px")
         rec["cover_feather_px"] = cover_info.get("feather_px")
+        rec["cover_fill_mode"] = cover_info.get("fill_mode")
+        rec["cover_edge_density"] = cover_info.get("edge_density")
+        rec["cover_noise_sigma"] = cover_info.get("noise_sigma")
+        scores = cover_info.get("cover_scores") or {}
+        rec["cover_score"] = scores.get("score")
+        rec["watermark_residual_score"] = scores.get("watermark_residual_score")
+        rec["patch_visibility_score"] = scores.get("patch_visibility_score")
+        rec["product_edge_loss_score"] = scores.get("product_edge_loss_score")
+        rec["boundary_jump_score"] = scores.get("boundary_jump_score")
+        rec["post_blur_applied"] = scores.get("post_blur_applied", False)
     if presence:
         rec["presence_status"] = presence.get("status")
         rec["presence_confidence"] = presence.get("confidence")
@@ -3641,7 +3904,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                         best_candidate, best_attempt, protect, overlap)
         return rec
 
-    # --- V5 Stage 2: Apply shadow cover fallback → CLEAN_COVERED ---
+    # --- V6 Stage 2: Apply adaptive cover fallback → CLEAN_COVERED ---
     failure_reasons = _collect_failure_reasons(attempts)
     cover_result = apply_shadow_cover_fallback(
         image=img,
@@ -3649,6 +3912,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
         roi_class=roi_class,
         mask_info=masks_info,
         qa_failure_reasons=failure_reasons,
+        stroke_mask=masks.get("stroke"),
     )
     covered_img = cover_result["image"]
 
@@ -3865,6 +4129,16 @@ def write_summary_jsonl(out_root, records):
             row["presence_status"] = r.get("presence_status")
             row["presence_confidence"] = r.get("presence_confidence")
             row["presence_reason"] = r.get("presence_reason")
+            row["cover_applied"] = r.get("cover_applied", False)
+            row["cover_method"] = r.get("cover_method")
+            row["cover_fill_mode"] = r.get("cover_fill_mode")
+            row["cover_opacity"] = r.get("cover_opacity")
+            row["cover_score"] = r.get("cover_score")
+            row["watermark_residual_score"] = r.get("watermark_residual_score")
+            row["patch_visibility_score"] = r.get("patch_visibility_score")
+            row["product_edge_loss_score"] = r.get("product_edge_loss_score")
+            row["boundary_jump_score"] = r.get("boundary_jump_score")
+            row["post_blur_applied"] = r.get("post_blur_applied", False)
             f.write(json.dumps(row, default=str) + "\n")
 
 
@@ -3880,7 +4154,12 @@ def write_summary_csv(out_root, records):
             "pi_outside_diff",
             "post_integrity_score", "artifact_score",
             "n_attempts", "last_method", "publish_ok",
-            "presence_status", "presence_confidence", "presence_reason"])
+            "presence_status", "presence_confidence", "presence_reason",
+            "cover_applied", "cover_method", "cover_fill_mode",
+            "cover_opacity", "cover_score",
+            "watermark_residual_score", "patch_visibility_score",
+            "product_edge_loss_score", "boundary_jump_score",
+            "post_blur_applied"])
         for r in records:
             ov = r.get("product_overlap") or {}
             mi = r.get("masks_info") or {}
@@ -3910,6 +4189,16 @@ def write_summary_csv(out_root, records):
                 r.get("presence_status") or "",
                 f"{r.get('presence_confidence', 0) or 0:.3f}",
                 r.get("presence_reason") or "",
+                "yes" if r.get("cover_applied") else "no",
+                r.get("cover_method") or "",
+                r.get("cover_fill_mode") or "",
+                f"{r.get('cover_opacity', 0) or 0:.2f}",
+                f"{r.get('cover_score', 0) or 0:.4f}",
+                f"{r.get('watermark_residual_score', 0) or 0:.4f}",
+                f"{r.get('patch_visibility_score', 0) or 0:.4f}",
+                f"{r.get('product_edge_loss_score', 0) or 0:.4f}",
+                f"{r.get('boundary_jump_score', 0) or 0:.4f}",
+                "yes" if r.get("post_blur_applied") else "no",
             ])
 
 
@@ -3995,9 +4284,17 @@ def write_compare_html(out_root, records):
         if r.get("cover_applied"):
             cover_html = (
                 f"method={r.get('cover_method','?')}<br>"
+                f"fill={r.get('cover_fill_mode','?')}<br>"
                 f"opacity={r.get('cover_opacity',0):.2f}<br>"
                 f"feather={r.get('cover_feather_px',0)}px<br>"
-                f"expand={r.get('cover_expand_px',0)}px")
+                f"expand={r.get('cover_expand_px',0)}px<br>"
+                f"edge_d={r.get('cover_edge_density',0):.3f}<br>"
+                f"score={r.get('cover_score',0):.4f}<br>"
+                f"wm_res={r.get('watermark_residual_score',0):.4f}<br>"
+                f"patch_v={r.get('patch_visibility_score',0):.4f}<br>"
+                f"edge_l={r.get('product_edge_loss_score',0):.4f}<br>"
+                f"bnd_j={r.get('boundary_jump_score',0):.4f}"
+                + ("<br><b>blur_fix</b>" if r.get("post_blur_applied") else ""))
 
         rows.append(f"""
 <tr class='{r['status']}'>
@@ -4058,19 +4355,38 @@ def write_compare_html(out_root, records):
     cover_rate = f"{n_covered / max(n_wm_total, 1) * 100:.0f}%"
     cover_methods_used = {}
     avg_opacity = []
+    avg_cover_score = []
+    avg_wm_residual = []
+    fill_modes_used = {}
+    n_blur_fix = 0
     for r in records:
         if r.get("cover_applied"):
             cm = r.get("cover_method", "?")
             cover_methods_used[cm] = cover_methods_used.get(cm, 0) + 1
             avg_opacity.append(r.get("cover_opacity", 0))
+            if r.get("cover_score") is not None:
+                avg_cover_score.append(r["cover_score"])
+            if r.get("watermark_residual_score") is not None:
+                avg_wm_residual.append(r["watermark_residual_score"])
+            fm = r.get("cover_fill_mode", "?")
+            fill_modes_used[fm] = fill_modes_used.get(fm, 0) + 1
+            if r.get("post_blur_applied"):
+                n_blur_fix += 1
     avg_op_str = f"{sum(avg_opacity)/max(len(avg_opacity),1):.2f}" if avg_opacity else "n/a"
+    avg_cs_str = f"{sum(avg_cover_score)/max(len(avg_cover_score),1):.4f}" if avg_cover_score else "n/a"
+    avg_wr_str = f"{sum(avg_wm_residual)/max(len(avg_wm_residual),1):.4f}" if avg_wm_residual else "n/a"
     most_common_cover = max(cover_methods_used, key=cover_methods_used.get) if cover_methods_used else "n/a"
+    most_common_fill = max(fill_modes_used, key=fill_modes_used.get) if fill_modes_used else "n/a"
 
     summary_table = f"""<table style='margin:12px 0;border:1px solid #333'>
 <tr><td>Repair success rate</td><td>{repair_rate}</td></tr>
 <tr><td>Cover fallback rate</td><td>{cover_rate}</td></tr>
 <tr><td>Average cover opacity</td><td>{avg_op_str}</td></tr>
+<tr><td>Average cover score</td><td>{avg_cs_str}</td></tr>
+<tr><td>Average watermark residual</td><td>{avg_wr_str}</td></tr>
 <tr><td>Most common cover method</td><td>{most_common_cover}</td></tr>
+<tr><td>Most common fill mode</td><td>{most_common_fill}</td></tr>
+<tr><td>Post-cover blur fixes</td><td>{n_blur_fix}</td></tr>
 </table>"""
 
     cls_line = " ".join(f"{k}={v}" for k, v in sorted(by_class.items()))
