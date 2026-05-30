@@ -1,45 +1,45 @@
 #!/usr/bin/env python3
 """
-SUNSKY watermark removal — Zero Dirty Release pipeline V3.
+SUNSKY watermark removal — Zero Dirty Release pipeline V4.
 
-V3 patches V2 along the "safer auto-clean + clearer manual + earlier reject"
-axis. Architecture is unchanged; we ADD precision components rather than
-rewriting:
+V4 focuses on REDUCING VISIBLE PATCH ARTIFACTS produced by the inpainter.
+Detection is already reliable (V3); the remaining defect is gray rectangular
+patches left by overly aggressive box-level replacement.
 
-  Patch P1 — generate_stroke_level_mask()      (the big quality win)
-       Replaces the box-expanded soft mask with an actual stroke segmentation
-       of the watermark text. Eliminates the rectangular-patch artifacts that
-       were the dominant visible defect on V2 outputs.
+  V4-1 — Stroke-level mask enforcement
+       Auto-clean now REQUIRES a stroke-level mask. soft_fallback masks,
+       high mask density (>0.18), and high rectangularity (>0.55) force
+       manual-review instead of risking visible patches.
 
-  Patch P2 — analyze_product_overlap() + product_integrity_gate()
-       Computes the inpaint mask's overlap with edge density, dark-component
-       pixels, and circular features BEFORE inpainting. Severe overlap →
-       reject; moderate → manual.
+  V4-2 — full_box_attenuate restricted
+       Removed from normal auto-clean candidates. Allowed only for plain
+       backgrounds with very low edge density and zero product overlap.
 
-  Patch P3 — extended ROI classifier
-       New classes: metallic, black_product, poster_or_marketing.
-       Routes posters/marketing layouts to REJECTED early — those can't be
-       safely cleaned regardless of the inpainter.
+  V4-3 — Patch Visibility Gate
+       Five metrics measure patch artifact visibility after inpainting:
+       roi_vs_ring_delta_luma, low_frequency_patch_score,
+       rectangular_boundary_score, texture_energy_drop,
+       center_band_uniformity_spike. Fail thresholds block visible patches.
 
-  Patch P4 — improved method routing
-       white_fill / local_median / surface_fit for plain backgrounds;
-       Telea/LaMA only for textured ones; LaMA only when the stroke mask is
-       inside the product-safe region.
+  V4-4 — Black-product routing
+       dark_surface_local_plane replaces LaMA as primary. Ensures repaired
+       patch is never brighter than surrounding pixels.
 
-  Patch P5 — run_local_roi_qa()
-       SSIM in the repaired area vs surround sampling, local color delta,
-       mask-boundary visibility. Catches visible local artifacts that
-       global metrics miss.
+  V4-5 — Plain-white routing
+       white_fill_stroke_only and local_background_fill replace full-box
+       methods. Stroke mask only, no LaMA/Poisson/full-box.
 
-  Patch P6 — finer reason codes
-       product_integrity_risk, mask_touches_product_edge,
-       mask_touches_dark_component, mask_touches_lens_or_circle,
-       visible_patch_artifact, residual_watermark, local_qa_failed,
-       low_confidence_mask, unsuitable_source_image, …
+  V4-6 — Multi-method best-of selection
+       All candidates are generated and QA'd. The candidate with the lowest
+       combined artifact score wins. No early acceptance of first pass.
 
-  Patch P7 — extended debug artifacts + risk-sorted HTML
-       edge_map, product_overlap_map, qa_overlay; PDF & HTML expose every
-       QA metric so future tuning is a glance.
+  V4-7 — Conservative progressive cleanup
+       Cleanup cannot expand the repair area. Only residual stroke pixels
+       are cleaned. Large-area smoothing forces manual-review.
+
+  V4-8 — Enhanced debug output
+       Exports patch visibility heatmap, all candidate scores, and QA
+       failure reasons per image.
 
 State model unchanged: clean / manual-review / rejected.
 
@@ -106,6 +106,12 @@ M_GLOSSY_METALLIC = "glossy_or_metallic_background"
 M_POST_INTEGRITY = "post_clean_integrity_failed"
 M_REPAIR_ARTIFACT = "repair_artifact_detected"
 M_PRODUCT_TEXT_RISK = "product_text_at_risk"
+M_SOFT_FALLBACK_MASK = "soft_fallback_mask_not_stroke"
+M_HIGH_MASK_DENSITY = "high_mask_density_in_roi"
+M_HIGH_MASK_RECTANGULARITY = "high_mask_rectangularity"
+M_PATCH_VISIBILITY = "patch_visibility_gate_failed"
+M_DARK_BRIGHTNESS_OVERSHOOT = "dark_surface_brightness_overshoot"
+M_CLEANUP_EXPANSION = "cleanup_requires_area_expansion"
 
 # Explicit skip states (Problem E — split MANUAL-REVIEW).
 ST_SKIPPED_UNSAFE = "skipped-unsafe"
@@ -133,6 +139,19 @@ ARTIFACT_RECT_SCORE_THRESHOLD = 0.80
 ARTIFACT_SMOOTH_RATIO_THRESHOLD = 5.0
 ARTIFACT_BOUNDARY_DELTA_E_MAX = 18.0
 ARTIFACT_LAPLACIAN_DROP_MAX = 0.82
+
+# V4 — Mask quality gates (requirement 1).
+V4_MASK_DENSITY_IN_ROI_MAX = 0.18
+V4_MASK_RECTANGULARITY_MAX = 0.55
+
+# V4 — Patch visibility gate thresholds (requirement 3).
+V4_PV_DELTA_LUMA_MAX = 8.0
+V4_PV_RECT_BOUNDARY_MAX = 0.35
+V4_PV_LOW_FREQ_PATCH_MAX = 0.4
+V4_PV_TEXTURE_DROP_MAX = 0.45
+
+# V4 — Dark surface brightness constraint (requirement 4).
+V4_DARK_LUMA_OVERSHOOT_MAX = 6.0
 
 
 # ---------------------------------------------------------------------------
@@ -171,14 +190,14 @@ EXPAND_BY_CLASS = {
 # classes are reserved for ones whose risk is inherent (product_detail /
 # high_texture). "reject" classes are unsuitable inputs (text/QR/posters).
 ROUTE_BY_CLASS = {
-    "plain_white":    "white_fill",
+    "plain_white":    "white_fill_stroke_only",
     "plain_color":    "local_color_plane",
     "gradient":       "gradient_plane",
     "low_texture":    "telea_then_lama",
     "transparent":    "telea_then_lama",
     "glossy":         "telea_then_lama",
     "metallic":       "telea_then_lama",
-    "black_product":  "telea_then_lama",
+    "black_product":  "dark_surface_local_plane",
     "high_texture":   "lama",
     "product_detail": "telea_small",
     "text_or_qr":     "telea_small",
@@ -186,14 +205,14 @@ ROUTE_BY_CLASS = {
 }
 
 CANDIDATE_METHODS_BY_CLASS = {
-    "plain_white":    ["alpha_attenuate", "full_box_attenuate", "white_fill", "local_color_plane", "gradient_plane", "surface_fit"],
-    "plain_color":    ["alpha_attenuate", "full_box_attenuate", "local_color_plane", "gradient_plane", "poisson", "surface_fit"],
+    "plain_white":    ["alpha_attenuate", "white_fill_stroke_only", "local_background_fill", "white_fill", "local_color_plane", "gradient_plane"],
+    "plain_color":    ["alpha_attenuate", "local_color_plane", "gradient_plane", "poisson", "surface_fit"],
     "gradient":       ["alpha_attenuate", "gradient_plane", "surface_fit", "poisson", "telea_small"],
-    "low_texture":    ["alpha_attenuate", "full_box_attenuate", "telea_small", "telea", "gradient_plane", "lama_small"],
+    "low_texture":    ["alpha_attenuate", "telea_small", "telea", "gradient_plane", "lama_small"],
     "transparent":    ["alpha_attenuate", "telea_small", "telea", "poisson"],
     "glossy":         ["alpha_attenuate", "telea_small", "telea", "poisson"],
     "metallic":       ["alpha_attenuate", "telea_small", "telea", "poisson"],
-    "black_product":  ["alpha_attenuate", "telea_small", "telea", "lama_small"],
+    "black_product":  ["alpha_attenuate", "dark_surface_local_plane", "telea_small", "telea"],
     "high_texture":   ["alpha_attenuate", "telea_small", "telea", "lama_small"],
     "product_detail": ["alpha_attenuate", "telea_small", "telea", "poisson"],
     "text_or_qr":     ["telea_small"],
@@ -1873,6 +1892,116 @@ def inpaint_full_box_attenuate(img, mask, mark_box, strength=0.97):
     return out
 
 
+def inpaint_dark_surface_local_plane(img, mask, mark_box):
+    """V4: Dark surface repair via gradient plane from surrounding dark pixels.
+    Ensures the repaired patch is never brighter than the surrounding ring."""
+    H, W = img.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    ys_m, xs_m = np.where(mask > 0)
+    if xs_m.size == 0:
+        return img.copy()
+    ring_pad = max(15, max(bw, bh) // 3)
+    ring_y1 = max(0, by - ring_pad); ring_y2 = min(H, by + bh + ring_pad)
+    ring_x1 = max(0, bx - ring_pad); ring_x2 = min(W, bx + bw + ring_pad)
+    ring_mask = np.zeros((H, W), dtype=np.uint8)
+    ring_mask[ring_y1:ring_y2, ring_x1:ring_x2] = 255
+    ring_mask[by:by + bh, bx:bx + bw] = 0
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float64)
+    ring_ys, ring_xs = np.where(ring_mask > 0)
+    if ring_ys.size < 30:
+        return inpaint_local_color_plane(img, mask)
+    ring_ny = ring_ys.astype(np.float64) / H
+    ring_nx = ring_xs.astype(np.float64) / W
+    A_ring = np.column_stack([np.ones_like(ring_nx), ring_nx, ring_ny])
+    mark_ny = ys_m.astype(np.float64) / H
+    mark_nx = xs_m.astype(np.float64) / W
+    A_mark = np.column_stack([np.ones_like(mark_nx), mark_nx, mark_ny])
+    out_lab = lab.copy()
+    ring_mean_L = float(lab[ring_ys, ring_xs, 0].mean())
+    for c in range(3):
+        ring_vals = lab[ring_ys, ring_xs, c]
+        coeffs, *_ = np.linalg.lstsq(A_ring, ring_vals, rcond=None)
+        ring_pred = A_ring @ coeffs
+        residual_std = max(float(np.std(ring_vals - ring_pred)), 0.3)
+        bg_vals = (A_mark @ coeffs +
+                   np.random.normal(0, residual_std * 0.3, A_mark.shape[0]))
+        if c == 0:
+            bg_vals = np.minimum(bg_vals, ring_mean_L + 2.0)
+        out_lab[ys_m, xs_m, c] = bg_vals
+    feather = max(3, min(bw, bh) // 6)
+    mask_f = mask.astype(np.float64) / 255.0
+    alpha = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=feather)
+    alpha3 = np.stack([alpha] * 3, axis=-1)
+    result_lab = lab * (1.0 - alpha3) + out_lab * alpha3
+    return cv2.cvtColor(np.clip(result_lab, 0, 255).astype(np.uint8),
+                        cv2.COLOR_LAB2BGR)
+
+
+def inpaint_white_fill_stroke_only(img, mask, mark_box):
+    """V4: White background fill using stroke mask only — no full-box
+    replacement. Samples local background from the immediate ring."""
+    H, W = img.shape[:2]
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return img.copy()
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    ring = cv2.bitwise_and(ring, cv2.bitwise_not(mask))
+    if (ring > 0).sum() > 50:
+        ring_pixels = img[ring > 0].reshape(-1, 3)
+    else:
+        ring_pad = max(10, bh)
+        ry1 = max(0, by - ring_pad); ry2 = min(H, by + bh + ring_pad)
+        rx1 = max(0, bx - ring_pad); rx2 = min(W, bx + bw + ring_pad)
+        rmask = np.zeros((H, W), dtype=np.uint8)
+        rmask[ry1:ry2, rx1:rx2] = 255
+        rmask[by:by + bh, bx:bx + bw] = 0
+        ring_pixels = img[rmask > 0].reshape(-1, 3)
+    if ring_pixels.size == 0:
+        return img.copy()
+    median_bg = np.median(ring_pixels, axis=0).astype(np.uint8)
+    out = img.copy()
+    fill = np.zeros_like(out); fill[:] = median_bg
+    noise = np.random.normal(0, 1.0, fill.shape).astype(np.int16)
+    fill = np.clip(fill.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    out[mask > 0] = fill[mask > 0]
+    return _feather_blend(img, out, mask, feather_px=3)
+
+
+def inpaint_local_background_fill(img, mask, mark_box):
+    """V4: Per-pixel gradient-plane interpolation from surrounding ring.
+    More precise than white_fill for non-uniform white backgrounds."""
+    H, W = img.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    ys_m, xs_m = np.where(mask > 0)
+    if xs_m.size == 0:
+        return img.copy()
+    ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21)))
+    ring = cv2.bitwise_and(ring, cv2.bitwise_not(mask))
+    ys_r, xs_r = np.where(ring > 0)
+    if ys_r.size < 30:
+        return inpaint_white_fill_stroke_only(img, mask, mark_box)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float64)
+    out_lab = lab.copy()
+    ring_ny = ys_r.astype(np.float64) / H
+    ring_nx = xs_r.astype(np.float64) / W
+    A_ring = np.column_stack([np.ones_like(ring_nx), ring_nx, ring_ny])
+    mark_ny = ys_m.astype(np.float64) / H
+    mark_nx = xs_m.astype(np.float64) / W
+    A_mark = np.column_stack([np.ones_like(mark_nx), mark_nx, mark_ny])
+    for c in range(3):
+        ring_vals = lab[ys_r, xs_r, c]
+        coeffs, *_ = np.linalg.lstsq(A_ring, ring_vals, rcond=None)
+        ring_pred = A_ring @ coeffs
+        residual_std = max(float(np.std(ring_vals - ring_pred)), 0.3)
+        bg_vals = (A_mark @ coeffs +
+                   np.random.normal(0, residual_std * 0.4, A_mark.shape[0]))
+        out_lab[ys_m, xs_m, c] = bg_vals
+    out = cv2.cvtColor(np.clip(out_lab, 0, 255).astype(np.uint8),
+                       cv2.COLOR_LAB2BGR)
+    return _feather_blend(img, out, mask, feather_px=4)
+
+
 def inpaint_lama_small(rwm, img, mask):
     eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
     if not (eroded > 0).any():
@@ -1890,6 +2019,12 @@ def run_inpaint(rwm, method: str, img: np.ndarray, mask: np.ndarray,
         out = inpaint_alpha_attenuate(img, mask)
     elif method == "full_box_attenuate":
         out = inpaint_full_box_attenuate(img, mask, mark_box)
+    elif method == "dark_surface_local_plane":
+        out = inpaint_dark_surface_local_plane(img, mask, mark_box)
+    elif method == "white_fill_stroke_only":
+        out = inpaint_white_fill_stroke_only(img, mask, mark_box)
+    elif method == "local_background_fill":
+        out = inpaint_local_background_fill(img, mask, mark_box)
     elif method == "white_fill":
         out = inpaint_white_fill(img, mask)
     elif method == "local_median":
@@ -2455,6 +2590,113 @@ def detect_repair_artifacts(original, cleaned, repair_mask):
 
 
 # ---------------------------------------------------------------------------
+# V4-3 — Patch Visibility Gate.
+# Five metrics detect visible rectangular patch artifacts after inpainting.
+# ---------------------------------------------------------------------------
+
+def patch_visibility_gate(original, cleaned, mark_box, roi_class):
+    H, W = original.shape[:2]
+    bx, by, bw, bh = mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"]
+    gray_c = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    roi_c = gray_c[by:by + bh, bx:bx + bw]
+    if roi_c.size == 0:
+        return {"pass": True, "fail_reasons": [], "metrics": {}}
+
+    ring_pad = max(10, max(bw, bh) // 3)
+    ry1 = max(0, by - ring_pad); ry2 = min(H, by + bh + ring_pad)
+    rx1 = max(0, bx - ring_pad); rx2 = min(W, bx + bw + ring_pad)
+    ring_mask = np.zeros((H, W), dtype=bool)
+    ring_mask[ry1:ry2, rx1:rx2] = True
+    ring_mask[by:by + bh, bx:bx + bw] = False
+    ring_vals = gray_c[ring_mask]
+
+    roi_mean_luma = float(roi_c.mean())
+    ring_mean_luma = float(ring_vals.mean()) if ring_vals.size else roi_mean_luma
+    roi_vs_ring_delta_luma = abs(roi_mean_luma - ring_mean_luma)
+
+    blur_k = max(15, min(bw, bh) // 3) | 1
+    roi_blur = cv2.GaussianBlur(roi_c, (blur_k, blur_k), 0)
+    hf_energy_roi = float(np.abs(roi_c - roi_blur).mean())
+    ring_region = gray_c[ry1:ry2, rx1:rx2]
+    ring_blur = cv2.GaussianBlur(ring_region, (blur_k, blur_k), 0)
+    ring_hf = np.abs(ring_region - ring_blur)
+    local_by = by - ry1; local_bx = bx - rx1
+    ring_hf_mask = np.ones(ring_region.shape, dtype=bool)
+    ring_hf_mask[max(0, local_by):min(ring_region.shape[0], local_by + bh),
+                 max(0, local_bx):min(ring_region.shape[1], local_bx + bw)] = False
+    hf_energy_ring = (float(ring_hf[ring_hf_mask].mean())
+                      if ring_hf_mask.any() else 1.0)
+    low_frequency_patch_score = max(0.0, 1.0 - hf_energy_roi /
+                                    max(hf_energy_ring, 0.01))
+
+    boundary_diffs = []
+    if by > 0:
+        boundary_diffs.append(np.abs(gray_c[by - 1, bx:bx + bw] -
+                                     gray_c[by, bx:bx + bw]))
+    if by + bh < H:
+        boundary_diffs.append(np.abs(gray_c[by + bh, bx:bx + bw] -
+                                     gray_c[by + bh - 1, bx:bx + bw]))
+    if bx > 0:
+        boundary_diffs.append(np.abs(gray_c[by:by + bh, bx - 1] -
+                                     gray_c[by:by + bh, bx]))
+    if bx + bw < W:
+        boundary_diffs.append(np.abs(gray_c[by:by + bh, bx + bw] -
+                                     gray_c[by:by + bh, bx + bw - 1]))
+    boundary_jump = (float(np.concatenate(boundary_diffs).mean())
+                     if boundary_diffs else 0.0)
+    rectangular_boundary_score = min(1.0, boundary_jump / 25.0)
+
+    lap_roi = cv2.Laplacian(roi_c.astype(np.uint8), cv2.CV_64F)
+    tex_roi = float(lap_roi.var()) if lap_roi.size else 0.0
+    lap_ring_full = cv2.Laplacian(
+        gray_c[ry1:ry2, rx1:rx2].astype(np.uint8), cv2.CV_64F)
+    if ring_hf_mask.shape == lap_ring_full.shape:
+        tex_ring = float(lap_ring_full[ring_hf_mask].var())
+    else:
+        tex_ring = float(lap_ring_full.var())
+    tex_ring = max(tex_ring, 0.01)
+    texture_energy_drop = max(0.0, (tex_ring - tex_roi) / tex_ring)
+
+    if roi_c.shape[0] >= 6:
+        h_third = max(2, roi_c.shape[0] // 3)
+        center_band = roi_c[h_third:2 * h_third, :]
+        edge_bands = np.concatenate([roi_c[:h_third, :].ravel(),
+                                     roi_c[2 * h_third:, :].ravel()])
+        center_std = max(float(center_band.std()), 0.01)
+        surround_std = max(float(np.std(edge_bands)), 0.01)
+        center_band_uniformity_spike = max(
+            0.0, 1.0 - center_std / surround_std)
+    else:
+        center_band_uniformity_spike = 0.0
+
+    is_plain = roi_class in ("plain_white", "plain_color", "gradient")
+    fail_reasons = []
+    if roi_vs_ring_delta_luma > V4_PV_DELTA_LUMA_MAX:
+        fail_reasons.append("roi_vs_ring_delta_luma")
+    if rectangular_boundary_score > V4_PV_RECT_BOUNDARY_MAX:
+        fail_reasons.append("rectangular_boundary_score")
+    if low_frequency_patch_score > V4_PV_LOW_FREQ_PATCH_MAX:
+        fail_reasons.append("low_frequency_patch_score")
+    if texture_energy_drop > V4_PV_TEXTURE_DROP_MAX and not is_plain:
+        fail_reasons.append("texture_energy_drop")
+
+    return {
+        "pass": len(fail_reasons) == 0,
+        "fail_reasons": fail_reasons,
+        "metrics": {
+            "roi_vs_ring_delta_luma": round(roi_vs_ring_delta_luma, 2),
+            "low_frequency_patch_score": round(low_frequency_patch_score, 4),
+            "rectangular_boundary_score": round(rectangular_boundary_score, 4),
+            "texture_energy_drop": round(texture_energy_drop, 4),
+            "center_band_uniformity_spike": round(
+                center_band_uniformity_spike, 4),
+            "roi_mean_luma": round(roi_mean_luma, 2),
+            "ring_mean_luma": round(ring_mean_luma, 2),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
 # P0.3 — Product text protection (Problem C).
 # Only remove confirmed watermark text. Protect non-watermark text on
 # product surfaces from the inpaint mask.
@@ -2728,7 +2970,9 @@ def _att_sum(a):
             "qa_product": a.get("qa_product"),
             "qa_post_integrity": a.get("qa_post_integrity"),
             "qa_artifacts": a.get("qa_artifacts"),
+            "qa_patch_visibility": a.get("qa_patch_visibility"),
             "score": a.get("score"),
+            "dark_luma_overshoot": a.get("dark_luma_overshoot"),
             "residual": {k: v for k, v in (a.get("residual") or {}).items()
                          if k != "channels"} if a.get("residual") else None,
             "residual_cleaned": a.get("residual_cleaned", False)}
@@ -2810,6 +3054,53 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                                (H * W + 1e-6), 4),
     }
 
+    # V4-1: Mask quality gates — auto-clean requires stroke-level masks.
+    mark_area = max(1, mark_box["w"] * mark_box["h"])
+    mask_pixels_in_roi = int((masks["final"][
+        mark_box["y"]:mark_box["y"] + mark_box["h"],
+        mark_box["x"]:mark_box["x"] + mark_box["w"]] > 0).sum())
+    mask_density_in_roi = mask_pixels_in_roi / mark_area
+    masks_info["mask_density_in_roi"] = round(mask_density_in_roi, 4)
+
+    final_ys, final_xs = np.where(masks["final"] > 0)
+    if final_ys.size > 0:
+        bbox_area = max(1, (int(final_ys.max()) - int(final_ys.min()) + 1) *
+                        (int(final_xs.max()) - int(final_xs.min()) + 1))
+        mask_rectangularity = final_ys.size / bbox_area
+    else:
+        mask_rectangularity = 0.0
+    masks_info["mask_rectangularity"] = round(mask_rectangularity, 4)
+
+    if masks["used"] == "soft_fallback":
+        rec = _mk_record(path, det, status=ST_MANUAL,
+                         reason=M_SOFT_FALLBACK_MASK,
+                         roi_class=roi_class, features=features,
+                         mark_box_density=orig_md,
+                         masks_info=masks_info, overlap=None)
+        _write_terminal(out_root, debug_root, rec, img, masks, None, None,
+                        None, None)
+        return rec
+
+    if mask_density_in_roi > V4_MASK_DENSITY_IN_ROI_MAX:
+        rec = _mk_record(path, det, status=ST_MANUAL,
+                         reason=M_HIGH_MASK_DENSITY,
+                         roi_class=roi_class, features=features,
+                         mark_box_density=orig_md,
+                         masks_info=masks_info, overlap=None)
+        _write_terminal(out_root, debug_root, rec, img, masks, None, None,
+                        None, None)
+        return rec
+
+    if mask_rectangularity > V4_MASK_RECTANGULARITY_MAX:
+        rec = _mk_record(path, det, status=ST_MANUAL,
+                         reason=M_HIGH_MASK_RECTANGULARITY,
+                         roi_class=roi_class, features=features,
+                         mark_box_density=orig_md,
+                         masks_info=masks_info, overlap=None)
+        _write_terminal(out_root, debug_root, rec, img, masks, None, None,
+                        None, None)
+        return rec
+
     # Product overlap pre-gate.
     overlap = analyze_product_overlap(img, masks["soft"], mark_box)
     gate, gate_reason = product_integrity_gate(overlap)
@@ -2856,7 +3147,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                         None, overlap)
         return rec
 
-    # --- Closed-loop candidate retry ---
+    # --- V4: Generate ALL candidates, QA all, select lowest artifact score ---
     candidate_methods = CANDIDATE_METHODS_BY_CLASS.get(roi_class, [])
     if not candidate_methods:
         primary = ROUTE_BY_CLASS[roi_class]
@@ -2864,6 +3155,16 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             candidate_methods = ["telea", "ns", "lama"]
         else:
             candidate_methods = [primary]
+
+    # V4-2: full_box_attenuate restriction — only allow for plain classes
+    # with very low edge density and zero product overlap.
+    allow_full_box = (
+        roi_class in ("plain_white", "plain_color", "low_texture") and
+        features.get("edge_density", 1.0) < 0.03 and
+        overlap.get("edge_overlap", 1.0) == 0.0 and
+        overlap.get("dark_overlap", 1.0) == 0.0)
+    if allow_full_box and "full_box_attenuate" not in candidate_methods:
+        candidate_methods = candidate_methods + ["full_box_attenuate"]
 
     mask_area_frac = float((masks["final"] > 0).sum()) / (H * W + 1e-6)
     protect_overlap_frac = 0.0
@@ -2878,9 +3179,8 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     best_score = -1.0
     best_attempt = None
 
+    # V4-6: Run ALL candidate methods, collect scores, pick best.
     for i, method in enumerate(candidate_methods):
-        if len(attempts) >= MAX_ATTEMPTS + 2:
-            break
 
         if i == 0:
             use_mask = masks["final"]
@@ -2898,25 +3198,34 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
         if not a.get("ok") or a["output"] is None:
             continue
 
-        # Apply haze removal EARLY (before QA) so the watermark
-        # residual check sees the cleaned output, not the raw inpaint.
         a["output"] = remove_watermark_haze(a["output"], mark_box, roi_class,
                                              strength=0.85)
-
-        # Boundary harmonization for all candidates.
         a["output"] = boundary_harmonize(img, a["output"], use_mask)
 
-        # Re-run QA on haze-removed output
         qa_w = qa_watermark(rwm, a["output"], mark_box, roi_class)
         qa_l = qa_local_roi(img, a["output"], mark_box)
         a["qa_water"] = qa_w
         a["qa_local"] = qa_l
 
-        # Residual check + mandatory multi-pass cleanup.
+        # V4-7: Conservative residual cleanup — only stroke pixels, no
+        # area expansion. If cleanup would need center-band haze removal
+        # or large-area smoothing, skip and let the candidate stand.
         residual = detect_residual_multichannel(rwm, img, a["output"], mark_box)
         a["residual"] = residual
         cleanup_passes = 0
-        while residual.get("has_residual") and a["output"] is not None and cleanup_passes < 3:
+        while (residual.get("has_residual") and a["output"] is not None
+               and cleanup_passes < 2):
+            stroke_check = generate_stroke_level_mask(a["output"], mark_box,
+                                                       edge_pad=2)
+            if (stroke_check["confidence"] < 0.15 or
+                    stroke_check["stroke_pixels"] < 10):
+                break
+            # V4-7: reject cleanup if it would expand beyond stroke pixels
+            stroke_area = int((stroke_check["stroke"] > 0).sum())
+            original_mask_area = int((use_mask > 0).sum())
+            if stroke_area > original_mask_area * 0.5:
+                a["cleanup_blocked"] = M_CLEANUP_EXPANSION
+                break
             fixed = residual_stroke_cleanup(rwm, img, a["output"], mark_box,
                                             protect_combined)
             if fixed is None:
@@ -2936,45 +3245,70 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
         qa_pi = qa_product_integrity(img, a["output"], use_mask, mark_box)
         a["qa_product"] = qa_pi
 
-        if qa_pi.get("reject"):
-            continue
-
-        # P0.1 — Post-clean product integrity gate.
         post_gate = run_post_clean_integrity_gate(img, a["output"],
                                                    use_mask, mark_box)
         a["qa_post_integrity"] = post_gate
 
-        # P0.2 — Rectangular artifact detector.
         artifacts = detect_repair_artifacts(img, a["output"], use_mask)
         a["qa_artifacts"] = artifacts
 
-        # Post-integrity: focused on OUTSIDE-watermark damage.
-        # Artifact: only block truly gross rectangular patches.
-        # Note: minor boundary discontinuity and color shift are EXPECTED
-        # after watermark removal -- only block when the artifact score
-        # is high AND it's a rectangular patch (not just edge effects).
+        # V4-3: Patch visibility gate.
+        pv_gate = patch_visibility_gate(img, a["output"], mark_box, roi_class)
+        a["qa_patch_visibility"] = pv_gate
+
+        # V4-4: Dark surface brightness check.
+        if roi_class == "black_product" and a["output"] is not None:
+            bx_d, by_d = mark_box["x"], mark_box["y"]
+            bw_d, bh_d = mark_box["w"], mark_box["h"]
+            pad_d = max(10, max(bw_d, bh_d) // 3)
+            ry1_d = max(0, by_d - pad_d)
+            ry2_d = min(H, by_d + bh_d + pad_d)
+            rx1_d = max(0, bx_d - pad_d)
+            rx2_d = min(W, bx_d + bw_d + pad_d)
+            ring_d = np.zeros((H, W), dtype=bool)
+            ring_d[ry1_d:ry2_d, rx1_d:rx2_d] = True
+            ring_d[by_d:by_d + bh_d, bx_d:bx_d + bw_d] = False
+            gc_d = cv2.cvtColor(a["output"], cv2.COLOR_BGR2GRAY)
+            patch_luma = float(gc_d[by_d:by_d + bh_d, bx_d:bx_d + bw_d].mean())
+            ring_luma = float(gc_d[ring_d].mean()) if ring_d.any() else patch_luma
+            a["dark_luma_overshoot"] = round(patch_luma - ring_luma, 2)
+            if patch_luma - ring_luma > V4_DARK_LUMA_OVERSHOOT_MAX:
+                a["dark_brightness_fail"] = True
+
+        if qa_pi.get("reject"):
+            a["score"] = 0.0
+            continue
+
         post_ok = post_gate.get("pass", False)
         art_reasons = set(artifacts.get("reasons", []))
         art_ok = (artifacts["artifact_score"] < ARTIFACT_RECT_SCORE_THRESHOLD or
                   "rectangular_repair_artifact" not in art_reasons)
+        pv_ok = pv_gate.get("pass", False)
+        dark_ok = not a.get("dark_brightness_fail", False)
 
-        if not post_ok or not art_ok:
+        if not post_ok or not art_ok or not pv_ok or not dark_ok:
             a["score"] = 0.0
             continue
 
         cand_score = score_candidate(qa_w, qa_l, qa_pi, overlap,
                                      mask_area_frac, protect_overlap_frac)
+        # V4-6: factor in artifact score — prefer lowest artifact visibility.
+        art_penalty = artifacts["artifact_score"] * 0.15
+        pv_metrics = pv_gate.get("metrics", {})
+        pv_penalty = (pv_metrics.get("low_frequency_patch_score", 0) * 0.10 +
+                      pv_metrics.get("rectangular_boundary_score", 0) * 0.10)
+        cand_score = round(_clamp(cand_score - art_penalty - pv_penalty), 4)
         a["score"] = cand_score
 
         water_ok = qa_w.get("pass") or _residual_grade(qa_w) >= 0.70
         residual_final_conf = a.get("residual_final", {}).get("confidence", 0.0)
         tmpl_tier = qa_w.get("template", {}).get("tier", "none")
-        tmpl_edge = qa_w.get("template", {}).get("edge", 0.0)
         if residual_final_conf >= 0.50 and tmpl_tier != "none":
             water_ok = False
         passes_all = (water_ok and
                       not qa_pi.get("risky") and not qa_pi.get("reject"))
 
+        # V4-6: Don't accept first passing — collect all, pick best.
         if passes_all and cand_score >= CLEAN_SCORE_THRESHOLD:
             if cand_score > best_score:
                 best_score = cand_score
@@ -2983,8 +3317,8 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
 
     last_attempt = attempts[-1] if attempts else None
 
-    # Fallback: if no candidate passed water_ok, pick the one with the
-    # lowest template edge score and try aggressive progressive cleanup.
+    # Fallback: if no candidate passed, try progressive cleanup on the
+    # best non-passing candidate with the lowest template edge score.
     if best_candidate is None and attempts:
         fallback_cands = []
         for a in attempts:
@@ -3019,9 +3353,11 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                     best_attempt = best_fb
                     break
 
-    # Progressive cleanup: haze removal, edge suppression, residual stroke.
+    # V4-7: Conservative progressive cleanup — no area expansion.
+    # Only apply haze removal and edge suppression (these operate within
+    # the existing mark_box, not expanding it). Do NOT add new inpaint
+    # passes that expand the repair area.
     if best_candidate is not None:
-        # Phase 1: Progressive haze removal with increasing strength
         for haze_strength in (0.88, 0.93, 0.97):
             t_check = qa_template(rwm, best_candidate)
             if t_check.get("tier", "none") == "none":
@@ -3029,18 +3365,22 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             best_candidate = remove_watermark_haze(
                 best_candidate, mark_box, roi_class, strength=haze_strength)
 
-        # Phase 1b: Edge suppression — smooth out residual text edges
-        # that haze removal missed (the high-frequency text stroke pattern).
         t_post_haze = qa_template(rwm, best_candidate)
         if t_post_haze.get("tier", "none") != "none":
             best_candidate = suppress_watermark_edges(
                 best_candidate, mark_box, roi_class, strength=0.7)
 
-        # Phase 2: Residual stroke cleanup — re-detect strokes on the
-        # current cleaned image and inpaint them, then haze again.
+        # V4-7: Limited residual stroke cleanup — only if stroke pixels
+        # are small relative to original mask. No large-area smoothing.
         t_post_edge = qa_template(rwm, best_candidate)
         if t_post_edge.get("tier", "none") != "none":
-            for _cleanup_round in range(3):
+            for _cleanup_round in range(2):
+                stroke_check = generate_stroke_level_mask(
+                    best_candidate, mark_box, edge_pad=2)
+                stroke_area = int((stroke_check["stroke"] > 0).sum())
+                original_mask_area = int((masks["final"] > 0).sum())
+                if stroke_area > original_mask_area * 0.5:
+                    break
                 fixed = residual_stroke_cleanup(rwm, img, best_candidate,
                                                 mark_box, protect_combined)
                 if fixed is None:
@@ -3054,10 +3394,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                 if t_recheck.get("tier", "none") == "none":
                     break
 
-        # Phase 3: JPEG-aware quality check with cleanup retry.
-        # JPEG compression can re-introduce detectable patterns from
-        # subtle residual watermark traces. Instead of just rejecting,
-        # apply cleanup on the JPEG-decoded version and re-check.
+        # JPEG-aware quality check with cleanup retry.
         if best_candidate is not None:
             def _jpeg_roundtrip(img_bgr):
                 _, buf = cv2.imencode(".jpg", img_bgr,
@@ -3084,8 +3421,6 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             ok, t_jpeg, clahe_score = _jpeg_passes(best_candidate)
 
             if not ok:
-                # Try progressive cleanup on the raw candidate, then
-                # re-check JPEG. Each round applies stronger cleanup.
                 for haze_s, edge_s in [(0.90, 0.5), (0.95, 0.7), (0.98, 0.85)]:
                     best_candidate = remove_watermark_haze(
                         best_candidate, mark_box, roi_class, strength=haze_s)
@@ -3098,7 +3433,6 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                         break
 
             if not ok:
-                # Final attempt: work directly on the JPEG-decoded version
                 jpeg_cand = _jpeg_roundtrip(best_candidate)
                 for haze_s in (0.92, 0.97):
                     jpeg_cand = remove_watermark_haze(
@@ -3275,6 +3609,48 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
             cv2.imwrite(str(base / "diff.png"), diff)
             paths["diff"] = _rel(out_root, base / "diff.png")
 
+    # V4-8: Patch visibility heatmap — shows per-pixel luma deviation
+    # between cleaned ROI and its surrounding ring.
+    if img is not None and cleaned is not None and rec.get("mark_box"):
+        mb = rec["mark_box"]
+        bx_h, by_h = mb["x"], mb["y"]
+        bw_h, bh_h = mb["w"], mb["h"]
+        ring_pad_h = max(10, max(bw_h, bh_h) // 3)
+        ry1_h = max(0, by_h - ring_pad_h)
+        ry2_h = min(cleaned.shape[0], by_h + bh_h + ring_pad_h)
+        rx1_h = max(0, bx_h - ring_pad_h)
+        rx2_h = min(cleaned.shape[1], bx_h + bw_h + ring_pad_h)
+        gc_h = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY).astype(np.float64)
+        ring_h = np.zeros(gc_h.shape, dtype=bool)
+        ring_h[ry1_h:ry2_h, rx1_h:rx2_h] = True
+        ring_h[by_h:by_h + bh_h, bx_h:bx_h + bw_h] = False
+        ring_mean_h = float(gc_h[ring_h].mean()) if ring_h.any() else 128.0
+        roi_region = gc_h[ry1_h:ry2_h, rx1_h:rx2_h]
+        dev = np.abs(roi_region - ring_mean_h)
+        dev_u8 = np.clip(dev * 4, 0, 255).astype(np.uint8)
+        pv_heatmap = cv2.applyColorMap(dev_u8, cv2.COLORMAP_INFERNO)
+        cv2.imwrite(str(base / "patch_visibility_heatmap.png"), pv_heatmap)
+        paths["patch_visibility_heatmap"] = _rel(
+            out_root, base / "patch_visibility_heatmap.png")
+
+    # V4-8: Write all candidate scores to debug JSON.
+    if rec.get("attempts"):
+        cand_scores = []
+        for att in rec["attempts"]:
+            cs_entry = {
+                "method": att.get("method"),
+                "score": att.get("score"),
+                "ok": att.get("ok"),
+            }
+            pv = att.get("qa_patch_visibility")
+            if pv:
+                cs_entry["pv_pass"] = pv.get("pass")
+                cs_entry["pv_metrics"] = pv.get("metrics")
+                cs_entry["pv_fail_reasons"] = pv.get("fail_reasons")
+            cs_entry["dark_luma_overshoot"] = att.get("dark_luma_overshoot")
+            cand_scores.append(cs_entry)
+        rec["v4_candidate_scores"] = cand_scores
+
     # Strip cv2 image data from overlap before serializing
     overlap_to_save = ({k: v for k, v in overlap.items() if not k.startswith("_")}
                       if overlap else None)
@@ -3430,6 +3806,24 @@ def write_compare_html(out_root, records):
         piq_color = "#0a4" if piq.get("pass") else "#f88"
         art_color = "#0a4" if not qart.get("has_artifact") else "#f88"
 
+        # V4-8: patch visibility info from attempts
+        pv_html = "—"
+        v4_cs = r.get("v4_candidate_scores") or []
+        if v4_cs:
+            pv_lines = []
+            for cs_e in v4_cs:
+                pv_m = cs_e.get("pv_metrics") or {}
+                pv_pass = cs_e.get("pv_pass")
+                pc = "#0a4" if pv_pass else "#f88"
+                pv_lines.append(
+                    f"<span style='color:{pc}'>{cs_e.get('method','?')}"
+                    f" s={cs_e.get('score',0)}</span><br>"
+                    f"Δluma={pv_m.get('roi_vs_ring_delta_luma',0):.1f} "
+                    f"lf={pv_m.get('low_frequency_patch_score',0):.2f} "
+                    f"rect={pv_m.get('rectangular_boundary_score',0):.2f} "
+                    f"tex={pv_m.get('texture_energy_drop',0):.2f}")
+            pv_html = "<br>".join(pv_lines)
+
         rows.append(f"""
 <tr class='{r['status']}'>
   <td>{r['product_id']}<br><small>{r.get('roi_class','')}</small></td>
@@ -3438,7 +3832,10 @@ def write_compare_html(out_root, records):
   <td>{im('original',300)}</td>
   <td>{im('cleaned',300)}</td>
   <td>{im('mask_final',150)}<br>{im('diff_heatmap',150)}<br>
-      <small>mask={mi.get('final_mask','?')}</small></td>
+      {im('patch_visibility_heatmap',150)}<br>
+      <small>mask={mi.get('final_mask','?')}<br>
+      density={mi.get('mask_density_in_roi',0):.3f}<br>
+      rect={mi.get('mask_rectangularity',0):.3f}</small></td>
   <td>{im('diff',150)}</td>
   <td><small>{pg_html or '—'}</small></td>
   <td><small>
@@ -3464,6 +3861,7 @@ def write_compare_html(out_root, records):
     <span style='color:{art_color}'>artifact={qart.get('artifact_score',0):.3f}</span><br>
     last={last_att.get('method','—')}
   </small></td>
+  <td><small>{pv_html}</small></td>
 </tr>""")
 
     n_skipped = (counts.get(ST_SKIPPED_UNSAFE, 0) +
@@ -3484,7 +3882,7 @@ def write_compare_html(out_root, records):
 
     html = f"""<!doctype html>
 <meta charset=utf-8>
-<title>Zero-Dirty V3 — review</title>
+<title>Zero-Dirty V4 — review</title>
 <style>
   body {{ font: 13px/1.4 -apple-system, sans-serif; background:#111; color:#ddd; padding:16px; }}
   table {{ border-collapse: collapse; margin-top:16px; }}
@@ -3506,16 +3904,16 @@ def write_compare_html(out_root, records):
   .clean {{ color:#9f9 }} .manual {{ color:#fc8 }} .rejected {{ color:#f88 }}
   small {{ color:#aaa }}
 </style>
-<h1>Zero-Dirty Release V3 — risk-sorted review</h1>
+<h1>Zero-Dirty Release V4 — risk-sorted review</h1>
 <p>{summary_kv}</p>
 <p><small>by ROI class: {cls_line}<br>by last method: {rts_line}<br>by mask used: {mask_line}<br>by presence gate: {pg_line}</small></p>
 <table>
 <tr><th>product_id<br>(roi_class)</th><th>status<br>reason</th>
     <th>original</th><th>cleaned</th>
-    <th>final_mask</th><th>diff</th>
+    <th>masks + heatmap</th><th>diff</th>
     <th>presence gate</th>
     <th>product overlap</th><th>watermark + local QA</th>
-    <th>integrity QA</th></tr>
+    <th>integrity QA</th><th>V4 patch visibility</th></tr>
 {''.join(rows)}
 </table>
 """
@@ -3988,7 +4386,7 @@ def main():
                           for r in records if r["status"] == ST_NO_WATERMARK)
 
     print()
-    print("=== zero-dirty pipeline v3 complete ===")
+    print("=== zero-dirty pipeline v4 complete ===")
     print(f"total:            {len(records)}")
     print(f"clean:            {counts.get(ST_CLEAN, 0)}")
     print(f"manual-review:    {counts.get(ST_MANUAL, 0)}")
