@@ -43,8 +43,8 @@ DEFAULT_OUT = Path("output")
 # ---------------------------------------------------------------------------
 # V5 — Version constant and assertion.
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V6_ADAPTIVE_COVER"
-assert PIPELINE_VERSION == "V6_ADAPTIVE_COVER"
+PIPELINE_VERSION = "V7_LOGO_MASK"
+assert PIPELINE_VERSION == "V7_LOGO_MASK"
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -112,6 +112,109 @@ COVER_ESCALATION_LEVELS = [
 ]
 
 # V6: cover routing moved to V6_FILL_MODE_BY_ROI (defined after cover functions)
+
+
+# ---------------------------------------------------------------------------
+# V7 — Multi-scale logo mask bank.
+# ---------------------------------------------------------------------------
+LOGO_TEMPLATE_PATH = SCRIPT_DIR / "watermark-template.png"
+LOGO_TEXT_THRESH = 180
+LOGO_SHADOW_THRESH = 240
+LOGO_SCALE_WIDTHS = list(range(60, 500, 20))
+_LOGO_MASK_BANK: dict | None = None
+
+
+def _build_canonical_logo_masks():
+    tpl = cv2.imread(str(LOGO_TEMPLATE_PATH), cv2.IMREAD_GRAYSCALE)
+    if tpl is None:
+        return None
+    text_mask = (tpl < LOGO_TEXT_THRESH).astype(np.uint8) * 255
+    shadow_raw = (tpl < LOGO_SHADOW_THRESH).astype(np.uint8) * 255
+    shadow_mask = cv2.subtract(shadow_raw, text_mask)
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, k_close)
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    text_mask = cv2.dilate(text_mask, k_dilate, iterations=1)
+    shadow_mask = cv2.dilate(shadow_mask, k_dilate, iterations=1)
+    return {"text": text_mask, "shadow": shadow_mask,
+            "combined": cv2.bitwise_or(text_mask, shadow_mask),
+            "shape": tpl.shape}
+
+
+def _build_logo_mask_bank():
+    canonical = _build_canonical_logo_masks()
+    if canonical is None:
+        return None
+    src_h, src_w = canonical["shape"]
+    aspect = src_w / max(src_h, 1)
+    bank = {}
+    for target_w in LOGO_SCALE_WIDTHS:
+        target_h = max(4, int(round(target_w / aspect)))
+        text_s = cv2.resize(canonical["text"], (target_w, target_h),
+                            interpolation=cv2.INTER_LINEAR)
+        text_s = (text_s > 127).astype(np.uint8) * 255
+        shadow_s = cv2.resize(canonical["shadow"], (target_w, target_h),
+                              interpolation=cv2.INTER_LINEAR)
+        shadow_s = (shadow_s > 64).astype(np.uint8) * 255
+        combined_s = cv2.bitwise_or(text_s, shadow_s)
+        bank[target_w] = {"text": text_s, "shadow": shadow_s,
+                          "combined": combined_s,
+                          "w": target_w, "h": target_h}
+    return bank
+
+
+def get_logo_mask_bank():
+    global _LOGO_MASK_BANK
+    if _LOGO_MASK_BANK is None:
+        _LOGO_MASK_BANK = _build_logo_mask_bank()
+    return _LOGO_MASK_BANK
+
+
+def align_logo_mask(mark_box: dict, img_shape: tuple,
+                    use_shadow: bool = True) -> np.ndarray | None:
+    bank = get_logo_mask_bank()
+    if bank is None:
+        return None
+    bw, bh = mark_box["w"], mark_box["h"]
+    bx, by = mark_box["x"], mark_box["y"]
+    H, W = img_shape[:2]
+
+    widths = sorted(bank.keys())
+    best_w = min(widths, key=lambda w: abs(w - bw))
+    entry = bank[best_w]
+
+    src_w, src_h = entry["w"], entry["h"]
+    key = "combined" if use_shadow else "text"
+    logo = entry[key]
+
+    scale_x = bw / max(src_w, 1)
+    scale_y = bh / max(src_h, 1)
+
+    if abs(scale_x - 1.0) > 0.02 or abs(scale_y - 1.0) > 0.02:
+        logo = cv2.resize(logo, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        logo = (logo > 127).astype(np.uint8) * 255
+    elif logo.shape[1] != bw or logo.shape[0] != bh:
+        logo = cv2.resize(logo, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        logo = (logo > 127).astype(np.uint8) * 255
+
+    full = np.zeros((H, W), np.uint8)
+    y1 = max(0, by)
+    x1 = max(0, bx)
+    y2 = min(H, by + bh)
+    x2 = min(W, bx + bw)
+    logo_y1 = y1 - by
+    logo_x1 = x1 - bx
+    logo_y2 = logo_y1 + (y2 - y1)
+    logo_x2 = logo_x1 + (x2 - x1)
+    if logo_y2 > logo.shape[0]:
+        logo_y2 = logo.shape[0]
+        y2 = y1 + (logo_y2 - logo_y1)
+    if logo_x2 > logo.shape[1]:
+        logo_x2 = logo.shape[1]
+        x2 = x1 + (logo_x2 - logo_x1)
+    if y2 > y1 and x2 > x1:
+        full[y1:y2, x1:x2] = logo[logo_y1:logo_y2, logo_x1:logo_x2]
+    return full
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1498,12 @@ def build_mask_layers(img_bgr: np.ndarray, mark_box: dict, roi_class: str,
                      expand_extra: float = 0.0,
                      protect_mask: np.ndarray | None = None) -> dict:
     H, W = img_bgr.shape[:2]
+
+    # V7: logo-shaped mask replaces rectangular core/soft fallback.
+    logo_mask = align_logo_mask(mark_box, img_bgr.shape, use_shadow=True)
+    logo_text_only = align_logo_mask(mark_box, img_bgr.shape, use_shadow=False)
+    has_logo = logo_mask is not None and logo_mask.any()
+
     core = np.zeros((H, W), np.uint8)
     core[mark_box["y"]:mark_box["y"] + mark_box["h"],
          mark_box["x"]:mark_box["x"] + mark_box["w"]] = 255
@@ -1410,14 +1519,19 @@ def build_mask_layers(img_bgr: np.ndarray, mark_box: dict, roi_class: str,
     repair = edge_stopped_dilation(stroke_capped, barrier, iterations=dilate_px)
     repair = cv2.bitwise_and(repair, soft)
 
+    # V7: constrain repair to logo shape — never spill into non-logo pixels.
+    if has_logo:
+        k_logo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        logo_dilated = cv2.dilate(logo_mask, k_logo, iterations=1)
+        repair = cv2.bitwise_and(repair, logo_dilated)
+        stroke_capped = cv2.bitwise_and(stroke_capped, logo_dilated)
+
     # Subtract product protection from repair mask.
     if protect_mask is not None:
         repair_safe = cv2.bitwise_and(repair, cv2.bitwise_not(protect_mask))
     else:
         repair_safe = repair
 
-    # V4: Use soft_fallback more broadly — the enhanced stroke mask captures
-    # more text body, so even lower confidence is meaningful.
     PLAIN_CLASSES = {"plain_white", "plain_color", "gradient", "low_texture",
                      "metallic", "transparent", "glossy"}
     stroke_good = (stroke_info["confidence"] >= 0.25 and
@@ -1426,6 +1540,18 @@ def build_mask_layers(img_bgr: np.ndarray, mark_box: dict, roi_class: str,
     if stroke_good:
         final = repair_safe if repair_safe.any() else stroke_capped
         used = "stroke"
+    elif has_logo:
+        # V7: use logo-shaped mask as fallback instead of rectangular soft.
+        if protect_mask is not None:
+            logo_safe = cv2.bitwise_and(logo_mask, cv2.bitwise_not(protect_mask))
+        else:
+            logo_safe = logo_mask
+        if logo_safe.any():
+            final = logo_safe
+            used = "logo_fallback"
+        else:
+            final = logo_mask
+            used = "logo_fallback"
     elif roi_class in PLAIN_CLASSES:
         protect_overlap = 0.0
         if protect_mask is not None:
@@ -1449,6 +1575,7 @@ def build_mask_layers(img_bgr: np.ndarray, mark_box: dict, roi_class: str,
     return {"core": core, "soft": soft, "stroke": stroke,
             "stroke_capped": stroke_capped, "final": final,
             "repair": repair, "repair_safe": repair_safe,
+            "logo_mask": logo_mask, "logo_text_only": logo_text_only,
             "used": used,
             "stroke_info": stroke_info,
             "final_density_vs_soft": round(final_area / max(soft_area, 1), 3)}
@@ -3542,6 +3669,8 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     # Build masks with edge-stopped dilation and product protection.
     masks = build_mask_layers(img, mark_box, roi_class,
                               protect_mask=protect_combined)
+    logo_m = masks.get("logo_mask")
+    has_logo_mask = logo_m is not None and logo_m.any()
     masks_info = {
         "final_mask": masks["used"],
         "stroke_confidence": masks["stroke_info"]["confidence"],
@@ -3552,6 +3681,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                                     (H * W + 1e-6), 4),
         "soft_density": round(float((masks["soft"] > 0).sum()) /
                                (H * W + 1e-6), 4),
+        "logo_mask_active": has_logo_mask,
     }
 
     mark_area = max(1, mark_box["w"] * mark_box["h"])
@@ -3967,7 +4097,7 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
 
     if masks_dict is not None:
         for name in ("core", "soft", "stroke", "stroke_capped", "final",
-                     "repair", "repair_safe"):
+                     "repair", "repair_safe", "logo_mask", "logo_text_only"):
             m = masks_dict.get(name)
             if m is not None:
                 cv2.imwrite(str(base / f"mask_{name}.png"), m)
@@ -4315,7 +4445,8 @@ def write_compare_html(out_root, records):
     dark_overlap={ov.get('dark_overlap',0):.3f}<br>
     circle_overlap={ov.get('circle_overlap',0):.3f}<br>
     stroke_conf={mi.get('stroke_confidence',0):.2f}<br>
-    n_components={mi.get('n_components',0)}
+    n_components={mi.get('n_components',0)}<br>
+    logo={'Y' if mi.get('logo_mask_active') else 'N'}
   </small></td>
   <td><small>
     tier={qaw.get('template',{}).get('tier','?')}<br>
