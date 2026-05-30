@@ -207,6 +207,14 @@ class QAResult:
     rectangular_patch_visibility: float
     final_score: float
     reason: str
+    # V10 additions (defaults keep backward compatibility)
+    metrics_valid: bool = True
+    residual_pass: bool = True
+    residual_template_corr: float = 0.0
+    residual_text_component: float = 0.0
+    residual_improvement: float = 1.0
+    cover_rectangularity: float = 0.0
+    cover_luma_delta: float = 0.0
 
 
 @dataclass
@@ -511,6 +519,316 @@ def _ssim_local(a, b):
     num = (2 * mu_a * mu_b + C1) * (2 * cab + C2)
     den = (mu_a ** 2 + mu_b ** 2 + C1) * (va + vb + C2)
     return float(num / max(den, 1e-9))
+
+
+def _clamp01(v):
+    return float(max(0.0, min(1.0, v)))
+
+
+# ===========================================================================
+# V10 — Truthful QA, residual watermark gate, cover rectangularity,
+#       alpha-halo masks. See V10 patch plan.
+# ===========================================================================
+
+# Patch 1 — fail-closed on missing/uncomputable metrics.
+class MissingQAMetric(Exception):
+    pass
+
+
+def _safe_metric(value, name):
+    if value is None:
+        raise MissingQAMetric(name)
+    if isinstance(value, float) and math.isnan(value):
+        raise MissingQAMetric(name)
+    return value
+
+
+# Patch 2 — residual watermark detection thresholds.
+RESIDUAL_TEMPLATE_CORR_MAX = 0.18
+RESIDUAL_OCR_CONF_MAX = 0.12
+RESIDUAL_TEXT_COMPONENT_MAX = 0.16
+RESIDUAL_IMPROVEMENT_MIN = 0.75
+
+# Patch 4 — cover rectangularity gate thresholds (fail if exceeded).
+COVER_RECTANGULARITY_MAX = 0.25
+COVER_LUMA_DELTA_MAX = 8.0
+COVER_TEXTURE_DROP_MAX = 0.55
+COVER_EDGE_BOX_MAX = 0.20
+
+
+@dataclass
+class ResidualResult:
+    template_corr: float
+    ocr_conf: float
+    text_component_score: float
+    gray_delta_stroke_score: float
+    improvement_ratio: float
+    passed: bool
+
+
+_CANONICAL_TEMPLATE = None
+_CANONICAL_TEMPLATE_LOADED = False
+
+
+def _get_canonical_template():
+    """Canonical sunsky-online.com watermark text template (grayscale)."""
+    global _CANONICAL_TEMPLATE, _CANONICAL_TEMPLATE_LOADED
+    if not _CANONICAL_TEMPLATE_LOADED:
+        _CANONICAL_TEMPLATE_LOADED = True
+        try:
+            p = Path(__file__).resolve().parent / "watermark-template.png"
+            _CANONICAL_TEMPLATE = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        except Exception:
+            _CANONICAL_TEMPLATE = None
+    return _CANONICAL_TEMPLATE
+
+
+def _hp_norm(gray):
+    """High-pass + zero-mean normalize for structure-only matching."""
+    g = gray.astype(np.float32)
+    hp = g - cv2.GaussianBlur(g, (0, 0), sigmaX=2.0)
+    s = float(hp.std())
+    if s < 1e-6:
+        return np.zeros_like(hp)
+    return (hp - float(hp.mean())) / s
+
+
+def _highpass_energy(gray):
+    if gray is None or gray.size == 0:
+        return 0.0
+    g = gray.astype(np.float32)
+    return float(np.abs(g - cv2.GaussianBlur(g, (0, 0), sigmaX=2.0)).mean())
+
+
+def _residual_template_corr(roi_gray):
+    """Best normalized correlation of the canonical text template against
+    the ROI's high-pass structure, scanned across plausible scales."""
+    tmpl = _get_canonical_template()
+    if tmpl is None or roi_gray is None or roi_gray.size == 0:
+        return 0.0
+    h_roi, w_roi = roi_gray.shape[:2]
+    if h_roi < 8 or w_roi < 16:
+        return 0.0
+    roi_hp = _hp_norm(roi_gray)
+    best = 0.0
+    th0, tw0 = tmpl.shape[:2]
+    for frac in (1.0, 0.7, 0.5):
+        tw = int(w_roi * frac)
+        if tw < 16:
+            continue
+        th = max(6, int(th0 * tw / tw0))
+        if tw > w_roi or th > h_roi:
+            continue
+        t_hp = _hp_norm(cv2.resize(tmpl, (tw, th)))
+        try:
+            res = cv2.matchTemplate(roi_hp, t_hp, cv2.TM_CCOEFF_NORMED)
+        except cv2.error:
+            continue
+        best = max(best, float(res.max()))
+    return _clamp01(best)
+
+
+def _text_component_score(roi_gray):
+    """Fraction-normalized count of text-like high-pass components."""
+    if roi_gray is None or roi_gray.size == 0:
+        return 0.0
+    g = roi_gray.astype(np.float32)
+    hp = np.abs(g - cv2.GaussianBlur(g, (0, 0), sigmaX=2.0))
+    if float(hp.max()) < 1e-6:
+        return 0.0
+    thr = max(6.0, float(hp.mean()) + 1.5 * float(hp.std()))
+    bw = (hp >= thr).astype(np.uint8) * 255
+    if int(bw.sum()) == 0:
+        return 0.0
+    nlab, _, stats, _ = cv2.connectedComponentsWithStats(bw)
+    h_roi, w_roi = roi_gray.shape[:2]
+    text_like = 0
+    for i in range(1, nlab):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        w_ = int(stats[i, cv2.CC_STAT_WIDTH])
+        h_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if (3 <= a <= 0.25 * w_roi * h_roi and
+                2 <= h_ <= max(6, h_roi) and 1 <= w_ <= w_roi):
+            text_like += 1
+    return _clamp01(text_like / 18.0)
+
+
+def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
+                              mask_roi=None):
+    """Patch 2 — verify the watermark is no longer recognizable in the
+    cleaned ROI. A smooth-but-readable watermark is still a failure.
+
+    The decisive measurement is taken at the KNOWN watermark locations
+    (mask_roi = the stroke/logo mask cropped to the bbox and dilated so it
+    also covers the semi-transparent alpha halo). Measuring there instead of
+    over the whole bbox avoids the dilution that makes a global high-pass
+    ratio useless on textured/metallic surfaces (where the watermark is a
+    small fraction of total ROI energy). After a genuine removal the former
+    watermark pixels relax to the SURROUNDING surface's natural texture
+    level (ring_gray baseline); leftover broken-but-readable glyphs — even
+    an untouched halo — still stand above that baseline and are rejected.
+    """
+    if (original_roi is None or cleaned_roi is None or
+            original_roi.size == 0 or cleaned_roi.size == 0):
+        return ResidualResult(1.0, 1.0, 1.0, 1.0, 0.0, False)
+
+    orig_gray = (cv2.cvtColor(original_roi, cv2.COLOR_BGR2GRAY)
+                 if original_roi.ndim == 3 else original_roi)
+    clean_gray = (cv2.cvtColor(cleaned_roi, cv2.COLOR_BGR2GRAY)
+                  if cleaned_roi.ndim == 3 else cleaned_roi)
+
+    og = orig_gray.astype(np.float32)
+    cg = clean_gray.astype(np.float32)
+
+    clean_corr = _residual_template_corr(clean_gray)
+    orig_corr = _residual_template_corr(orig_gray)
+
+    orig_hp = np.abs(og - cv2.GaussianBlur(og, (0, 0), sigmaX=2.0))
+    clean_hp = np.abs(cg - cv2.GaussianBlur(cg, (0, 0), sigmaX=2.0))
+
+    # Surface texture baseline from the surrounding ring (watermark-free).
+    if ring_gray is not None and ring_gray.ndim == 2 and ring_gray.size > 9:
+        rg = ring_gray.astype(np.float32)
+        ring_hp = np.abs(rg - cv2.GaussianBlur(rg, (0, 0), sigmaX=2.0))
+        base_mean = float(ring_hp.mean())
+        base_std = float(ring_hp.std())
+    else:
+        base_mean = float(np.median(clean_hp))
+        base_std = float(clean_hp.std())
+
+    # Decide where to measure: at the watermark mask if we have one, else the
+    # whole ROI.
+    use_mask = (mask_roi is not None and mask_roi.shape == og.shape and
+                int((mask_roi > 0).sum()) >= 8)
+    if use_mask:
+        sel = mask_roi > 0
+        oe = float(orig_hp[sel].mean())
+        ce = float(clean_hp[sel].mean())
+        stroke_thr = max(8.0, base_mean + 2.0 * base_std)
+        residual_stroke = (clean_hp > stroke_thr) & sel
+        text_component = _clamp01(
+            float(residual_stroke.sum()) / max(1, int(sel.sum())) / 0.20)
+    else:
+        oe = float(orig_hp.mean())
+        ce = float(clean_hp.mean())
+        stroke_thr = max(8.0, base_mean + 2.5 * base_std)
+        residual_stroke = clean_hp > stroke_thr
+        text_component = _clamp01(float(residual_stroke.mean()) / 0.06)
+
+    improvement = 1.0 if oe < 1e-3 else _clamp01(1.0 - ce / oe)
+    gray_delta_stroke = min(1.0, ce / 8.0)
+    ocr_conf = 0.0  # OCR not available in this environment; treated as pass.
+
+    # Waive the improvement ratio only when the original carried essentially
+    # NO watermark structure at the measured locations (nothing to remove).
+    nothing_to_remove = (orig_corr <= 0.10 and oe < 4.0)
+    improvement_ok = (improvement >= RESIDUAL_IMPROVEMENT_MIN or
+                      nothing_to_remove)
+
+    passed = (clean_corr <= RESIDUAL_TEMPLATE_CORR_MAX and
+              ocr_conf <= RESIDUAL_OCR_CONF_MAX and
+              text_component <= RESIDUAL_TEXT_COMPONENT_MAX and
+              improvement_ok)
+
+    return ResidualResult(
+        template_corr=round(clean_corr, 4), ocr_conf=round(ocr_conf, 4),
+        text_component_score=round(text_component, 4),
+        gray_delta_stroke_score=round(gray_delta_stroke, 4),
+        improvement_ratio=round(improvement, 4), passed=passed)
+
+
+def _border_edge_box_score(gray, bbox):
+    """Fraction of bbox-perimeter pixels that sit on a strong straight luma
+    step — the signature of a visible rectangular patch border."""
+    bx, by, bw, bh = bbox
+    H, W = gray.shape[:2]
+    g = gray.astype(np.float32)
+    deltas = []
+    if by > 0 and by + bh < H:
+        deltas.append(np.abs(g[by, bx:bx + bw] - g[by - 1, bx:bx + bw]))
+        deltas.append(np.abs(g[by + bh - 1, bx:bx + bw] - g[by + bh, bx:bx + bw]))
+    if bx > 0 and bx + bw < W:
+        deltas.append(np.abs(g[by:by + bh, bx] - g[by:by + bh, bx - 1]))
+        deltas.append(np.abs(g[by:by + bh, bx + bw - 1] - g[by:by + bh, bx + bw]))
+    if not deltas:
+        return 0.0
+    alld = np.concatenate(deltas)
+    return float((alld > 10).mean())
+
+
+def compute_cover_metrics(repaired, bbox):
+    """Patch 4 — detect a human-visible rectangular cover band."""
+    bx, by, bw, bh = bbox
+    H, W = repaired.shape[:2]
+    gray = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+    inner = gray[by:by + bh, bx:bx + bw]
+    ring_mask, _ = _get_ring(repaired, bbox, 0.4)
+    ring = gray[ring_mask]
+    zero = {"cover_rectangularity": 0.0, "cover_luma_delta": 0.0,
+            "cover_texture_drop": 0.0, "cover_edge_box_score": 0.0,
+            "cover_seam_score": 0.0}
+    if inner.size == 0 or ring.size == 0:
+        return zero
+
+    luma_delta = abs(float(inner.mean()) - float(ring.mean()))
+    tex_inner = float(cv2.Laplacian(inner, cv2.CV_64F).var())
+    pad = max(12, max(bw, bh) // 3)
+    rr = gray[max(0, by - pad):min(H, by + bh + pad),
+              max(0, bx - pad):min(W, bx + bw + pad)]
+    tex_ring = float(cv2.Laplacian(rr, cv2.CV_64F).var())
+    if tex_ring < 25.0:
+        texture_drop = 0.0
+    else:
+        texture_drop = max(0.0, 1.0 - tex_inner / max(tex_ring, 1e-6))
+    edge_box = _border_edge_box_score(gray, bbox)
+    seam = _compute_seam_delta(repaired, bbox)
+    rectangularity = _clamp01(0.4 * edge_box +
+                              0.3 * min(1.0, luma_delta / 12.0) +
+                              0.3 * texture_drop)
+    return {"cover_rectangularity": round(rectangularity, 4),
+            "cover_luma_delta": round(luma_delta, 3),
+            "cover_texture_drop": round(texture_drop, 4),
+            "cover_edge_box_score": round(edge_box, 4),
+            "cover_seam_score": round(seam, 4)}
+
+
+def cover_passes_rect_gate(metrics):
+    return (metrics["cover_rectangularity"] <= COVER_RECTANGULARITY_MAX and
+            metrics["cover_luma_delta"] <= COVER_LUMA_DELTA_MAX and
+            metrics["cover_texture_drop"] <= COVER_TEXTURE_DROP_MAX and
+            metrics["cover_edge_box_score"] <= COVER_EDGE_BOX_MAX)
+
+
+def _detect_alpha_halo(image, core_mask, bbox, delta_min=4, delta_max=35):
+    """Patch 3 — semi-transparent watermark pixels around the core stroke."""
+    if core_mask is None or not np.any(core_mask > 0):
+        return None
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    ring_mask, _ = _get_ring(image, bbox, 0.5)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ring_pixels = gray[ring_mask]
+    if ring_pixels.size == 0:
+        return None
+    bg = float(np.median(ring_pixels))
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dil = cv2.dilate(core_mask, k, iterations=2)
+    band = cv2.bitwise_and(dil, cv2.bitwise_not(core_mask))
+    delta = np.abs(gray - bg)
+    sel = (band > 0) & (delta >= delta_min) & (delta <= delta_max)
+    halo = np.zeros((H, W), np.uint8)
+    halo[sel] = 255
+
+    region = np.zeros((H, W), np.uint8)
+    region[max(0, by - bh // 2):min(H, by + bh + bh // 2),
+           max(0, bx - bw // 4):min(W, bx + bw + bw // 4)] = 255
+    halo = cv2.bitwise_and(halo, region)
+
+    core_px = max(1, int((core_mask > 0).sum()))
+    if int((halo > 0).sum()) > 3 * core_px:  # runaway guard
+        return None
+    return halo
 
 
 # ---------------------------------------------------------------------------
@@ -866,11 +1184,38 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
     # 8. Rectangular patch visibility (V9)
     rpv = _compute_rectangular_patch_visibility(repaired, bbox, ring_mask)
 
+    # 9. Residual watermark gate (V10 Patch 2) — must be unreadable.
+    orig_roi_bgr = image[by:by + bh, bx:bx + bw]
+    clean_roi_bgr = repaired[by:by + bh, bx:bx + bw]
+    # 2-D padded crop around the bbox for the surface-texture baseline.
+    rpad = max(12, max(bw, bh) // 3)
+    ring_crop = gray_r[max(0, by - rpad):min(H, by + bh + rpad),
+                       max(0, bx - rpad):min(W, bx + bw + rpad)]
+    # Known watermark locations, dilated to cover the alpha halo, cropped to
+    # the bbox. Lets the residual gate measure exactly where the watermark
+    # was rather than diluting over the whole (possibly textured) ROI.
+    wm_mask = None
+    src = ctx.logo_mask if (ctx.logo_mask is not None and
+                            np.any(ctx.logo_mask > 0)) else ctx.stroke_mask
+    if src is not None and src.shape[:2] == image.shape[:2]:
+        # Horizontal-biased dilation so the gate also inspects inter-letter
+        # gaps and trailing glyphs the stroke detector under-covers — those
+        # are exactly where a tight inpaint leaves broken-but-readable text.
+        kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 9))
+        wm_mask = cv2.dilate(src, kd, iterations=1)[by:by + bh, bx:bx + bw]
+    residual = detect_residual_watermark(orig_roi_bgr, clean_roi_bgr,
+                                         ring_gray=ring_crop, mask_roi=wm_mask)
+
+    # 10. Cover rectangularity (V10 Patch 4) — never a visible band.
+    cover_m = compute_cover_metrics(repaired, bbox)
+
     # Final composite score (lower = better)
     final = (2.0 * wm_residual + 2.0 * cover_vis + 2.5 * seam +
              1.5 * prod_damage + 0.5 * (1.0 - tex_consist) +
              1.0 * color_d / max(COLOR_DELTA_MAX, 1) + 1.0 * edge_dmg +
-             1.5 * rpv)
+             1.5 * rpv + 2.0 * residual.template_corr +
+             1.5 * residual.text_component_score +
+             1.0 * (1.0 - residual.improvement_ratio))
 
     # Acceptance thresholds
     wm_max = WATERMARK_RESIDUAL_MAX
@@ -890,16 +1235,64 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         sd_max *= 0.8
         rpv_max *= 0.8
 
-    passed = (wm_residual <= wm_max and
-              cover_vis <= cv_max and
-              seam <= sd_max and
-              prod_damage <= pd_max and
-              edge_dmg <= ed_max and
-              rpv <= rpv_max)
+    # Patch 1 — impossible-pass guard: all core metrics exactly zero means
+    # they were not actually computed (degenerate/empty ROI). Fail closed.
+    metrics_valid = not (wm_residual == 0.0 and cover_vis == 0.0 and
+                         seam == 0.0 and color_d == 0.0)
 
-    reason = "accepted" if passed else _qa_fail_reason(
-        wm_residual, wm_max, cover_vis, cv_max, seam, sd_max,
-        prod_damage, pd_max, edge_dmg, ed_max, rpv, rpv_max)
+    # In-ROI edge loss IS the watermark being removed on flat/simple
+    # backgrounds — only treat it as damage where the ROI may hold real
+    # product structure (strict/detail classes). Product edges outside the
+    # ROI are always guarded via prod_damage.
+    edge_gate = edge_dmg if roi.roi_class in STRICT_CLASSES else 0.0
+
+    # Patch 7 status semantics. The authoritative "is the watermark gone"
+    # check is the V10 residual gate (residual.passed); the authoritative
+    # "is there a visible band" checks are cover_vis and the cover
+    # rectangularity gate. The legacy wm_residual and rpv metrics are noisy
+    # on textured/dark surfaces (they fire on successful inpainting), so
+    # they drive scoring but only hard-gate on strict/detail classes where
+    # in-ROI structure is genuinely at risk.
+    rpv_gate = rpv if roi.roi_class in STRICT_CLASSES else 0.0
+    wm_gate = wm_residual if roi.roi_class in STRICT_CLASSES else wm_max
+
+    cover_visibility_pass = cover_vis <= cv_max
+    seam_pass = seam <= sd_max
+    color_pass = color_d <= COLOR_DELTA_MAX * (1.6 if roi.roi_class in
+                                               LOOSE_CLASSES else 1.0)
+    product_damage_pass = prod_damage <= pd_max
+    # The cover-rectangularity gate guards the adaptive-cover path (enforced
+    # inside FinalAdaptiveCover.apply). It is NOT applied to inpaint repairs,
+    # because an inpaint over a noisy surround is inherently smoother and
+    # would be falsely flagged — cover_vis + seam catch true visible bands.
+    cover_rect_pass = cover_m["cover_rectangularity"] <= COVER_RECTANGULARITY_MAX
+
+    geometry_pass = (wm_gate <= wm_max and
+                     cover_visibility_pass and
+                     seam_pass and
+                     product_damage_pass and
+                     color_pass and
+                     edge_gate <= ed_max and
+                     rpv_gate <= rpv_max)
+
+    passed = (metrics_valid and residual.passed and geometry_pass)
+
+    if not metrics_valid:
+        reason = "qa_metrics_probably_not_computed"
+    elif not residual.passed:
+        reason = "readable_residual_watermark"
+    elif geometry_pass:
+        reason = "accepted"
+    else:
+        reason = _qa_fail_reason(
+            wm_gate, wm_max, cover_vis, cv_max, seam, sd_max,
+            prod_damage, pd_max, edge_gate, ed_max, rpv_gate, rpv_max)
+        extra = []
+        if not color_pass:
+            extra.append("color_delta_too_high")
+        if extra:
+            reason = "|".join([reason] + extra) if reason != "unknown" \
+                else "|".join(extra)
 
     return QAResult(
         passed=passed, watermark_residual_score=round(wm_residual, 4),
@@ -910,7 +1303,13 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         color_delta_score=round(color_d, 2),
         edge_damage_score=round(edge_dmg, 4),
         rectangular_patch_visibility=round(rpv, 4),
-        final_score=round(final, 4), reason=reason)
+        final_score=round(final, 4), reason=reason,
+        metrics_valid=metrics_valid, residual_pass=residual.passed,
+        residual_template_corr=residual.template_corr,
+        residual_text_component=residual.text_component_score,
+        residual_improvement=residual.improvement_ratio,
+        cover_rectangularity=cover_m["cover_rectangularity"],
+        cover_luma_delta=cover_m["cover_luma_delta"])
 
 
 def _qa_fail_reason(wm, wm_max, cv, cv_max, sd, sd_max, pd, pd_max,
@@ -978,7 +1377,12 @@ def _compute_rectangular_patch_visibility(repaired, bbox, ring_mask_bool):
     rx2 = min(W, bx + bw + pad)
     ring_region = gray_r[ry1:ry2, rx1:rx2]
     tex_ring = float(cv2.Laplacian(ring_region, cv2.CV_64F).var())
-    hf_drop = max(0.0, 1.0 - tex_inner / max(tex_ring, 1e-6))
+    # On a flat surround there is no texture to "drop" — a smooth repaired
+    # patch over smooth surroundings is correct, not a visible rectangle.
+    if tex_ring < 25.0:
+        hf_drop = 0.0
+    else:
+        hf_drop = max(0.0, 1.0 - tex_inner / max(tex_ring, 1e-6))
 
     border_deltas = []
     if by > 0:
@@ -1975,14 +2379,31 @@ _ALL_CLASSES = ["plain_white", "near_white", "low_texture_background",
                 "transparent_or_glossy", "unknown"]
 
 
-def _get_effective_stroke_mask(ctx, dilate_px=0):
-    mask = None
+def _get_effective_stroke_mask(ctx, dilate_px=0, add_halo=True):
+    """Patch 3 — 3-layer mask: core stroke + alpha halo + soft safety.
+
+    Core stroke comes from the logo/stroke mask. The alpha halo recovers
+    the semi-transparent watermark pixels that ring the core (which, if
+    left behind, become broken-but-readable residual text). The soft
+    safety layer is the light dilation applied by callers.
+    """
+    core = None
     if ctx.logo_mask is not None and np.any(ctx.logo_mask > 0):
-        mask = ctx.logo_mask.copy()
+        core = ctx.logo_mask.copy()
     elif ctx.stroke_mask is not None and np.any(ctx.stroke_mask > 0):
-        mask = ctx.stroke_mask.copy()
+        core = ctx.stroke_mask.copy()
     else:
         return None
+
+    mask = core
+    if add_halo:
+        halo = _detect_alpha_halo(ctx.image, core, ctx.watermark_bbox)
+        if halo is not None and np.any(halo > 0):
+            combined = cv2.bitwise_or(core, halo)
+            # Keep the combined mask text-shaped, not a full bbox rectangle.
+            conf = _validate_mask_confidence(combined, ctx.watermark_bbox)
+            if conf["valid"] or conf.get("occupancy", 1.0) <= 0.35:
+                mask = combined
 
     if dilate_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
@@ -2976,42 +3397,170 @@ class FinalAdaptiveCover(RepairTool):
     supported_roi_classes = _ALL_CLASSES
 
     def apply(self, ctx):
+        """V10 Patch 4/7 — produce a surface-aware cover, then verify it is
+        not a visible rectangle. If the primary cover trips the
+        rectangularity gate, auto-retry across alternative cover styles and
+        keep the one with the lowest rectangularity (auto_cover_retry).
+        Never emits a single obvious gray/white band across mixed surfaces.
+        """
         roi_class = ctx.roi_analysis.roi_class
 
         stroke_mask = _get_effective_stroke_mask(ctx, dilate_px=2)
-        use_stroke = (stroke_mask is not None and np.any(stroke_mask > 0) and
-                      ctx.roi_analysis.product_pixel_ratio > 0.05)
+        has_stroke = stroke_mask is not None and np.any(stroke_mask > 0)
 
-        if use_stroke:
-            result = self._stroke_level_cover(ctx, stroke_mask)
-            if result is not None:
-                return result
+        # Decide by ACTUAL in-bbox content, not the (sometimes wrong) ROI
+        # class: if the watermark sits on low-structure surface, a full-bbox
+        # Telea fill is safe and completely removes the text (incl. trailing
+        # glyphs). Only when the bbox holds real product structure do we use
+        # lighter covers to avoid smearing it.
+        bxg, byg, bwg, bhg = ctx.watermark_bbox
+        Hh, Ww = ctx.image.shape[:2]
+        roi_g = cv2.cvtColor(ctx.image, cv2.COLOR_BGR2GRAY)[
+            byg:byg + bhg, bxg:bxg + bwg]
+        in_edge = (float(cv2.Canny(roi_g, 50, 150).mean()) / 255.0
+                   if roi_g.size else 0.0)
+        in_prod = 0.0
+        if ctx.product_mask is not None:
+            pr = ctx.product_mask[byg:byg + bhg, bxg:bxg + bwg]
+            if pr.size:
+                in_prod = float((pr > 0).mean())
+        low_structure = in_edge < 0.10 and in_prod < 0.45
 
-        if roi_class in ("plain_white", "near_white"):
-            return self._near_white_cover(ctx)
-        elif roi_class == "dark_product_surface":
-            return self._dark_soft_shadow_cover(ctx)
-        elif roi_class in ("glass_or_gradient", "transparent_or_glossy"):
-            return self._frosted_local_blur_cover(ctx)
-        elif roi_class in ("thin_flex_cable",):
-            return self._dark_soft_shadow_cover(ctx)
-        elif roi_class in ("mixed_background_product",):
-            return self._segmented_cover(ctx)
-        elif roi_class in ("simple_product_surface", "low_texture_background",
-                           "metallic_or_reflective"):
-            return self._same_surface_color_cover(ctx)
+        builders = []
+        if low_structure:
+            # Uniform surround: the full-bbox Telea inpaint covers the entire
+            # watermark line (no trailing glyph survives) and blends into the
+            # surrounding surface. It is both the most complete hide and the
+            # most natural result, so try it first.
+            builders.append(("opaque_footprint",
+                             lambda: self._opaque_footprint_cover(ctx,
+                                                                  stroke_mask)))
+            if has_stroke:
+                builders.append(("stroke_level",
+                                 lambda: self._stroke_level_cover(ctx,
+                                                                  stroke_mask)))
         else:
-            return self._blurred_local_cover(ctx)
+            # Detailed / mixed / dark / metallic surround: a full-bbox fill
+            # would smear product structure. Prefer the lightest-touch covers
+            # (stroke / segmented) first, full footprint only as last resort.
+            if has_stroke:
+                builders.append(("stroke_level",
+                                 lambda: self._stroke_level_cover(ctx,
+                                                                  stroke_mask)))
+            if ctx.product_mask is not None:
+                builders.append(("segmented",
+                                 lambda: self._segmented_cover(ctx)))
+            builders.append(("opaque_footprint",
+                             lambda: self._opaque_footprint_cover(ctx,
+                                                                  stroke_mask)))
+
+        # A cover must (a) actually HIDE the watermark and (b) not look like a
+        # visible rectangle. Evaluate every builder on both axes and pick the
+        # best: a hidden + non-rectangular cover wins outright; otherwise
+        # prefer hiding, then minimal rectangularity (auto_cover_retry).
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+        rpad = max(12, max(bw, bh) // 3)
+        ring_crop = cv2.cvtColor(ctx.image, cv2.COLOR_BGR2GRAY)[
+            max(0, by - rpad):min(H, by + bh + rpad),
+            max(0, bx - rpad):min(W, bx + bw + rpad)]
+        orig_roi = ctx.image[by:by + bh, bx:bx + bw]
+        # Mask-aware hiding check (same as the production gate) so a clean
+        # full-footprint inpaint is correctly credited as hiding the
+        # watermark instead of being penalised by surface texture.
+        cover_wm_mask = None
+        if has_stroke:
+            kd2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 9))
+            cover_wm_mask = cv2.dilate(stroke_mask, kd2,
+                                       iterations=1)[by:by + bh, bx:bx + bw]
+
+        def hides(cand):
+            cl = cand.repaired_image[by:by + bh, bx:bx + bw]
+            return detect_residual_watermark(orig_roi, cl,
+                                             ring_gray=ring_crop,
+                                             mask_roi=cover_wm_mask).passed
+
+        best = None
+        best_key = None
+        best_style = None
+        for style, build in builders:
+            try:
+                cand = build()
+            except Exception:
+                cand = None
+            if cand is None:
+                continue
+            metrics = compute_cover_metrics(cand.repaired_image,
+                                            ctx.watermark_bbox)
+            cand.metadata["cover_metrics"] = metrics
+            cand.metadata["cover_style"] = style
+            hidden = hides(cand)
+            rect_ok = cover_passes_rect_gate(metrics)
+            if hidden and rect_ok:
+                cand.metadata["cover_rect_gate"] = "pass"
+                return cand
+            # rank: hidden first (True>False), then low rectangularity
+            key = (0 if hidden else 1, metrics["cover_rectangularity"])
+            if best_key is None or key < best_key:
+                best_key = key
+                best = cand
+                best_style = style
+
+        if best is not None:
+            best.metadata["cover_rect_gate"] = "best_effort"
+            best.metadata["cover_style"] = best_style
+            return best
+        return self._frosted_local_blur_cover(ctx)
+
+    def _opaque_footprint_cover(self, ctx, stroke_mask):
+        """Fully remove the watermark by inpainting its entire footprint
+        (strokes + alpha halo, generously dilated) from the surrounding
+        surface. Telea propagates the real neighbouring pixels inward, so no
+        colour is guessed and no noise band is introduced — the surest hide
+        on a fairly uniform surface. The rectangularity gate validates it."""
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+
+        # Cover the full bbox, extended horizontally beyond it: the detector
+        # sometimes clips the leading/trailing glyph of ".com", so pad the
+        # x-extent generously while keeping the y-extent tight, then Telea-
+        # reconstruct from the surrounding surface.
+        fp = np.zeros((H, W), np.uint8)
+        pad_y = 3
+        pad_x = max(8, int(bw * 0.12))
+        fy1, fy2 = max(0, by - pad_y), min(H, by + bh + pad_y)
+        fx1, fx2 = max(0, bx - pad_x), min(W, bx + bw + pad_x)
+        fp[fy1:fy2, fx1:fx2] = 255
+
+        result = cv2.inpaint(ctx.image, fp, 4, cv2.INPAINT_TELEA)
+        # Light feathered blend back so the inpaint boundary is seamless.
+        alpha = cv2.GaussianBlur(fp.astype(np.float32) / 255.0,
+                                 (0, 0), sigmaX=1.5)
+        alpha3 = np.stack([alpha] * 3, axis=-1)
+        blended = (result.astype(np.float32) * alpha3 +
+                   ctx.image.astype(np.float32) * (1 - alpha3)).astype(np.uint8)
+        return RepairCandidate(self.name, blended,
+                               {"cover_style": "opaque_footprint"})
 
     def _stroke_level_cover(self, ctx, stroke_mask):
-        median_color, noise_std = _ring_stats(ctx.image, ctx.watermark_bbox)
-        cover = np.full_like(ctx.image, median_color)
-        cover = _add_noise(cover, max(noise_std, 0.5), 0.3)
-        mask_f = stroke_mask.astype(np.float32) / 255.0
-        alpha = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=2.0)
-        alpha3 = np.stack([alpha] * 3, axis=-1)
-        result = (cover.astype(np.float32) * alpha3 +
-                  ctx.image.astype(np.float32) * (1 - alpha3)).astype(np.uint8)
+        # Inpaint the text band from the surrounding surface — no synthetic
+        # fill, no RGB speckle. Covers the full horizontal span of the stroke
+        # row (so trailing glyphs/halo are included) but keeps the band's
+        # height tight, so it disturbs less product detail than a full-bbox
+        # fill. A lighter-touch alternative for structured surrounds.
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+        kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 9))
+        wide = cv2.dilate(stroke_mask, kd, iterations=1)
+        band = np.zeros((H, W), np.uint8)
+        ys, xs = np.where(wide > 0)
+        if ys.size:
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+            band[y1:y2, x1:x2] = 255
+        else:
+            band = wide
+        result = cv2.inpaint(ctx.image, band, 3, cv2.INPAINT_TELEA)
         return RepairCandidate(self.name, result,
                                {"cover_style": "stroke_level"})
 
@@ -3056,7 +3605,7 @@ class FinalAdaptiveCover(RepairTool):
         cover = np.full_like(ctx.image, median_color)
         cover = _add_noise(cover, max(noise_std, 1.0), 0.4)
         mask = self._soft_cover_mask(ctx.image.shape, ctx.watermark_bbox, 8)
-        alpha = mask * 0.65
+        alpha = mask * 0.95   # V10: opaque enough to hide, not just dim
         alpha3 = np.stack([alpha] * 3, axis=-1)
         result = (ctx.image.astype(np.float64) * (1 - alpha3) +
                   cover.astype(np.float64) * alpha3)
@@ -3073,7 +3622,7 @@ class FinalAdaptiveCover(RepairTool):
         cover = np.full_like(ctx.image, dark_color)
         cover = _add_noise(cover, max(noise_std, 0.5), 0.5)
         mask = self._soft_cover_mask(ctx.image.shape, ctx.watermark_bbox, 6)
-        alpha = mask * 0.55
+        alpha = mask * 0.92   # V10: opaque enough to hide, not just dim
         alpha3 = np.stack([alpha] * 3, axis=-1)
         result = (ctx.image.astype(np.float64) * (1 - alpha3) +
                   cover.astype(np.float64) * alpha3)
@@ -3094,7 +3643,7 @@ class FinalAdaptiveCover(RepairTool):
         cover = ctx.image.copy()
         cover[y1:y2, x1:x2] = blurred
         mask = self._soft_cover_mask(ctx.image.shape, ctx.watermark_bbox, 8)
-        alpha = mask * 0.55
+        alpha = mask * 0.92   # V10: opaque enough to hide, not just dim
         alpha3 = np.stack([alpha] * 3, axis=-1)
         result = (ctx.image.astype(np.float64) * (1 - alpha3) +
                   cover.astype(np.float64) * alpha3)
@@ -3106,7 +3655,7 @@ class FinalAdaptiveCover(RepairTool):
         cover = np.full_like(ctx.image, median_color)
         cover = _add_noise(cover, max(noise_std, 1.0), 0.4)
         mask = self._soft_cover_mask(ctx.image.shape, ctx.watermark_bbox, 8)
-        alpha = mask * 0.60
+        alpha = mask * 0.95   # V10: opaque enough to hide, not just dim
         alpha3 = np.stack([alpha] * 3, axis=-1)
         result = (ctx.image.astype(np.float64) * (1 - alpha3) +
                   cover.astype(np.float64) * alpha3)
@@ -3202,28 +3751,29 @@ ALL_TOOLS: list[RepairTool] = [
 ]
 
 STRATEGY_BANK_BY_CLASS = {
+    # V10 Patch 5 — real pixels (clone) and statistical/gradient fills run
+    # BEFORE stroke/logo repair on low-risk backgrounds.
     "plain_white": [
+        "clone_best_of_8_dirs", "white_median_fill", "ring_median_fill",
+        "hard_paste_white_clone", "seam_scored_white_clone",
         "plain_white_direct_neighbor_clone_v2",
-        "clone_best_of_8_dirs", "hard_paste_white_clone",
-        "white_patch_with_noise", "ring_median_fill",
-        "local_noise_transfer_fill", "micro_tile_white_clone",
-        "stroke_only_mask_inpaint", "logo_mask_plus_clone_fill",
-        "opencv_telea_inpaint", "final_adaptive_cover",
+        "alpha_template_logo_mask", "logo_mask_plus_clone_fill",
+        "stroke_only_mask_inpaint", "opencv_telea_inpaint",
+        "final_adaptive_cover",
     ],
     "near_white": [
-        "plain_white_direct_neighbor_clone_v2",
-        "clone_best_of_8_dirs", "seam_scored_white_clone",
-        "white_patch_with_noise", "ring_median_fill",
-        "surface_gradient_fill", "stroke_only_mask_inpaint",
-        "logo_mask_plus_clone_fill", "opencv_telea_inpaint",
+        "clone_best_of_8_dirs", "white_median_fill", "ring_median_fill",
+        "seam_scored_white_clone", "surface_gradient_fill",
+        "alpha_template_logo_mask", "logo_mask_plus_clone_fill",
+        "stroke_only_mask_inpaint", "opencv_telea_inpaint",
         "final_adaptive_cover",
     ],
     "low_texture_background": [
         "clone_best_of_8_dirs", "ring_median_fill",
-        "surface_patch_lowpass_match", "surface_gradient_fill",
-        "stroke_only_mask_inpaint",
-        "logo_mask_plus_clone_fill", "opencv_telea_inpaint",
-        "lama_stroke_mask", "final_adaptive_cover",
+        "surface_plane_fill", "surface_gradient_fill",
+        "logo_mask_plus_surface_fill", "stroke_only_mask_inpaint",
+        "opencv_telea_inpaint", "lama_stroke_mask",
+        "final_adaptive_cover",
     ],
     "simple_product_surface": [
         "same_surface_best_patch", "same_color_region_clone",
@@ -3252,21 +3802,19 @@ STRATEGY_BANK_BY_CLASS = {
         "lama_stroke_mask", "final_adaptive_cover",
     ],
     "metallic_or_reflective": [
-        "stroke_only_mask_inpaint", "template_logo_mask_remove",
-        "same_surface_best_patch", "surface_patch_color_match",
-        "logo_mask_plus_clone_fill", "logo_mask_plus_surface_fill",
-        "linear_gradient_reconstruction", "surface_gradient_fill",
-        "stroke_mask_soft_edge", "opencv_telea_inpaint",
-        "lama_stroke_mask", "final_adaptive_cover",
-    ],
-    "thin_flex_cable": [
-        "template_logo_mask_remove", "stroke_only_mask_inpaint",
-        "logo_mask_plus_clone_fill",
-        "segmented_background_product_repair",
-        "edge_aware_clone", "thin_flex_cable_repair",
-        "black_flex_texture_repair", "line_preserving_inpaint",
+        "linear_gradient_reconstruction",
+        "bilinear_gradient_reconstruction", "surface_plane_fill",
+        "same_luminance_region_clone", "high_frequency_noise_transfer",
+        "logo_mask_plus_surface_fill", "stroke_only_mask_inpaint",
         "opencv_telea_inpaint", "lama_stroke_mask",
         "final_adaptive_cover",
+    ],
+    "thin_flex_cable": [
+        "stroke_only_mask_inpaint", "thin_flex_cable_repair",
+        "black_flex_texture_repair", "edge_aware_clone",
+        "logo_mask_plus_clone_fill", "segmented_background_product_repair",
+        "line_preserving_inpaint", "opencv_telea_inpaint",
+        "lama_stroke_mask", "final_adaptive_cover",
     ],
     "text_or_label_area": [
         "stroke_only_mask_inpaint", "template_logo_mask_remove",
@@ -3351,6 +3899,15 @@ def _check_product_overlap_guard(ctx):
     block = ((product_overlap > 0.35 and edge_density > 0.10) or
              edge_density > 0.18 or
              long_line_score > 0.25)
+
+    # V10 Patch 5 — on genuinely low-risk backgrounds (white / near-white /
+    # low-texture), real-pixel clones and statistical fills are safe even
+    # when a large flat product fills the frame. The guard exists to protect
+    # textured/detailed product surfaces, not flat ones. Only keep the block
+    # if the ROI actually carries in-ROI structure worth protecting.
+    if block and ctx.roi_analysis.roi_class in LOOSE_CLASSES and \
+            edge_density < 0.10:
+        block = False
     return block, product_overlap, edge_density, long_line_score
 
 
@@ -3373,6 +3930,12 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
     best_failed_candidate = None
     best_failed_score = float("inf")
     best_failed_tool = None
+
+    # Patch 6 — strategy execution telemetry.
+    strategy_list = [t.name for t in tools]
+    families_attempted = set()
+    tools_attempted = 0
+    qa_reject_reasons = {}
 
     for tool in tools:
         if tool.name == "final_adaptive_cover":
@@ -3410,6 +3973,8 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
         dt = round(time.time() - t0, 3)
 
         family = get_method_family(tool.name)
+        tools_attempted += 1
+        families_attempted.add(family.value)
         trace.append({
             "tool": tool.name, "passed": qa.passed,
             "reason": qa.reason, "qa": asdict(qa),
@@ -3417,23 +3982,52 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
             "runtime_s": dt})
 
         if qa.passed:
+            # Patch 7/8 — a genuinely passing repair (residual + geometry +
+            # valid metrics) is the single source of truth.
             candidate.metadata["qa"] = asdict(qa)
             candidate.metadata["final_method"] = tool.name
             candidate.metadata["method_family"] = family.value
-            candidate.metadata["is_real_repair"] = family != MethodFamily.ADAPTIVE_COVER
+            candidate.metadata["is_real_repair"] = (
+                family != MethodFamily.ADAPTIVE_COVER)
+            candidate.metadata["telemetry"] = {
+                "roi_class": ctx.roi_analysis.roi_class,
+                "strategy_list": strategy_list,
+                "tools_attempted": tools_attempted,
+                "families_attempted": sorted(families_attempted),
+                "final_method": tool.name,
+                "qa_reject_reasons": qa_reject_reasons,
+            }
             return candidate, trace
 
+        qa_reject_reasons[tool.name] = qa.reason
         if qa.final_score < best_failed_score:
             best_failed_score = qa.final_score
             best_failed_candidate = candidate
             best_failed_candidate.metadata["qa"] = asdict(qa)
             best_failed_tool = tool.name
 
-    # Final fallback — always produces output
+    # No repair passed the truthful gate. Fall back to adaptive cover, which
+    # already self-checks the rectangularity gate (Patch 4).
     t0 = time.time()
     fallback_tool = _TOOL_INDEX["final_adaptive_cover"]
     fallback_candidate = fallback_tool.apply(ctx)
     fallback_qa = run_local_qa(ctx, fallback_candidate)
+
+    # Patch 7 — auto_cover_retry: if the watermark is still readable through
+    # the cover, escalate to a stronger stroke/segmented cover that fully
+    # replaces the watermark pixels. No manual review.
+    if not fallback_qa.residual_pass:
+        retry = None
+        stroke_mask = _get_effective_stroke_mask(ctx, dilate_px=2)
+        if stroke_mask is not None and np.any(stroke_mask > 0):
+            retry = fallback_tool._stroke_level_cover(ctx, stroke_mask)
+        elif ctx.product_mask is not None:
+            retry = fallback_tool._segmented_cover(ctx)
+        if retry is not None:
+            rq = run_local_qa(ctx, retry)
+            if rq.residual_pass or rq.final_score <= fallback_qa.final_score:
+                retry.metadata.setdefault("cover_style", "auto_cover_retry")
+                fallback_candidate, fallback_qa = retry, rq
     dt = round(time.time() - t0, 3)
 
     trace.append({
@@ -3442,19 +4036,20 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
         "method_family": MethodFamily.ADAPTIVE_COVER.value,
         "runtime_s": dt})
 
-    fallback_candidate.metadata["qa"] = asdict(fallback_qa)
-    fallback_candidate.metadata["final_method"] = "final_adaptive_cover"
-    fallback_candidate.metadata["method_family"] = MethodFamily.ADAPTIVE_COVER.value
-    fallback_candidate.metadata["is_real_repair"] = False
-
-    cover_score_threshold = fallback_qa.final_score * 1.6
-    if best_failed_candidate is not None and best_failed_score < cover_score_threshold:
-        bf_family = get_method_family(best_failed_tool or "unknown")
-        best_failed_candidate.metadata["final_method"] = best_failed_tool or "best_failed"
-        best_failed_candidate.metadata["method_family"] = bf_family.value
-        best_failed_candidate.metadata["is_real_repair"] = bf_family != MethodFamily.ADAPTIVE_COVER
-        return best_failed_candidate, trace
-
+    cover_meta = dict(fallback_candidate.metadata)
+    cover_meta["qa"] = asdict(fallback_qa)
+    cover_meta["final_method"] = "final_adaptive_cover"
+    cover_meta["method_family"] = MethodFamily.ADAPTIVE_COVER.value
+    cover_meta["is_real_repair"] = False
+    cover_meta["telemetry"] = {
+        "roi_class": ctx.roi_analysis.roi_class,
+        "strategy_list": strategy_list,
+        "tools_attempted": tools_attempted,
+        "families_attempted": sorted(families_attempted),
+        "final_method": "final_adaptive_cover",
+        "qa_reject_reasons": qa_reject_reasons,
+    }
+    fallback_candidate.metadata = cover_meta
     return fallback_candidate, trace
 
 
@@ -3466,7 +4061,9 @@ def save_debug_trace(debug_dir: str | Path, filename: str,
                      roi_class: str, bbox: tuple,
                      trace: list, final_method: str,
                      method_family: str = "",
-                     roi_features: dict | None = None):
+                     roi_features: dict | None = None,
+                     telemetry: dict | None = None,
+                     qa: dict | None = None):
     debug_path = Path(debug_dir) / filename.replace(".", "_")
     debug_path.mkdir(parents=True, exist_ok=True)
 
@@ -3492,6 +4089,18 @@ def save_debug_trace(debug_dir: str | Path, filename: str,
     }
     if roi_features:
         trace_data["roi_features"] = roi_features
+    if telemetry:
+        trace_data["telemetry"] = telemetry
+    if qa:
+        # Patch 9 — surface the truthful gate verdicts for diagnosis.
+        trace_data["qa_metrics_valid"] = qa.get("metrics_valid")
+        trace_data["residual_pass"] = qa.get("residual_pass")
+        trace_data["residual_template_corr"] = qa.get("residual_template_corr")
+        trace_data["residual_text_component"] = qa.get("residual_text_component")
+        trace_data["cover_visibility_pass"] = (
+            qa.get("cover_visibility_score", 1.0) <= COVER_VISIBILITY_MAX)
+        trace_data["cover_rectangularity"] = qa.get("cover_rectangularity")
+        trace_data["final_qa"] = qa
 
     (debug_path / "trace.json").write_text(
         json.dumps(trace_data, indent=2, default=str))

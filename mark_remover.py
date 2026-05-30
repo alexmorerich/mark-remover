@@ -52,8 +52,8 @@ DEFAULT_OUT = Path("output")
 # ---------------------------------------------------------------------------
 # V5 — Version constant and assertion.
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V9_QUALITY_PATCH"
-assert PIPELINE_VERSION == "V9_QUALITY_PATCH"
+PIPELINE_VERSION = "V10_QUALITY_PATCH"
+assert PIPELINE_VERSION == "V10_QUALITY_PATCH"
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -3828,6 +3828,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     method_family = candidate.metadata.get("method_family",
                                             get_method_family(final_method).value)
     qa_info = candidate.metadata.get("qa", {})
+    telemetry = candidate.metadata.get("telemetry", {})
 
     roi_features = {
         "product_overlap": round(pr_roi.product_pixel_ratio, 3),
@@ -3844,7 +3845,8 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
         save_debug_trace(debug_root, path.name, pr_roi.roi_class,
                          bbox_tuple, trace, final_method,
                          method_family=method_family,
-                         roi_features=roi_features)
+                         roi_features=roi_features,
+                         telemetry=telemetry, qa=qa_info)
 
     is_cover = method_family == MethodFamily.ADAPTIVE_COVER.value
     status = ST_CLEAN_COVERED if is_cover else ST_CLEAN_REPAIRED
@@ -3873,6 +3875,19 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["v9_tools_tried"] = len(trace)
     rec["v9_qa_final_score"] = qa_info.get("final_score")
     rec["v9_rect_patch_visibility"] = qa_info.get("rectangular_patch_visibility")
+    # V10 truthful-gate verdicts + diversity telemetry.
+    rec["v10_metrics_valid"] = qa_info.get("metrics_valid")
+    rec["v10_residual_pass"] = qa_info.get("residual_pass")
+    rec["v10_residual_template_corr"] = qa_info.get("residual_template_corr")
+    rec["v10_residual_text_component"] = qa_info.get("residual_text_component")
+    rec["v10_residual_improvement"] = qa_info.get("residual_improvement")
+    rec["v10_cover_rectangularity"] = qa_info.get("cover_rectangularity")
+    rec["v10_cover_luma_delta"] = qa_info.get("cover_luma_delta")
+    rec["v10_families_attempted"] = telemetry.get("families_attempted")
+    rec["v10_tools_attempted"] = telemetry.get("tools_attempted")
+    rec["v10_qa_reject_reasons"] = telemetry.get("qa_reject_reasons")
+    rec["repair_qa_pass"] = (not is_cover) and bool(qa_info.get("residual_pass")) \
+        and bool(qa_info.get("metrics_valid"))
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,

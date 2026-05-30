@@ -6,3 +6,6 @@ output/
 dist/
 build/
 .env
+
+# V10 benchmark scratch outputs
+output_*/

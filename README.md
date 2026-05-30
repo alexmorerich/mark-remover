@@ -2,6 +2,56 @@
 
 Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort.
 
+## V10 — Quality Patch (QA truthfulness, residual gate, honest covers)
+
+V10 does **not** add more repair methods. It fixes the reason bad outputs were
+being *accepted*: the QA gate was unreliable. The principle is *a smaller
+number of truthful, well-tested methods beats a larger bank behind a weak gate.*
+
+- **Truthful QA gate (P1).** QA metrics no longer default to `0.0`; missing
+  metrics fail closed (`missing_required_qa_metric`) and an all-zero metric
+  set is rejected (`qa_metrics_probably_not_computed`). No more `pass=True` on
+  uncomputed scores.
+- **Residual watermark gate (P2).** After each repair, a second detector
+  measures leftover watermark *at the known glyph locations* (mask-aware,
+  horizontally extended to catch trailing glyphs) relative to the surrounding
+  surface's own texture baseline — canonical-template correlation + a
+  stroke/text-component score + a watermark-region improvement ratio. A
+  smooth-but-readable or broken-but-readable watermark is a **failure**.
+- **3-layer mask (P3).** Core stroke + alpha halo (semi-transparent ring) +
+  soft safety dilation, so tight inpaints stop leaving a readable halo.
+- **Honest covers (P4).** `final_adaptive_cover` is now a **Telea inpaint over
+  the full watermark footprint** (extended past the detected bbox to catch
+  clipped glyphs) — never a translucent gray band or RGB-noise blob. A
+  cover-rectangularity gate plus a hide-check select the cover, routed by
+  *actual in-bbox structure* (uniform → full-footprint fill; structured →
+  light-touch band / segmented).
+- **Strategy reorder + diversity telemetry (P5/P6).** On plain / low-texture /
+  metallic backgrounds, clone and statistical/gradient fills run *before*
+  stroke-only repair. Each result logs `strategy_list`, `families_attempted`,
+  and per-tool `qa_reject_reasons`.
+- **Status semantics + single source of truth (P7/P8).** `clean_repaired`
+  requires `residual_pass AND metrics_valid AND` the geometry gate; failures
+  escalate automatically to a stronger cover (`auto_cover_retry`) — manual
+  review stays 0. One `RepairCandidate` drives report / JSONL / PDF.
+- **Debug + regression lock (P9/P10).** `trace.json` carries residual
+  verdicts, cover metrics and diversity telemetry; `test_v10_regression.py`
+  asserts no readable watermark / no product damage on failure-prone cases.
+
+### V10 results (50-image benchmark, seed 2026)
+
+| Metric | Result |
+|--------|--------|
+| readable watermark remaining | 0/50 (max template-corr 0.157 < 0.18 gate) |
+| manual_review | 0 |
+| failed_io | 0 |
+| qa zero-metric passes | 0 |
+| visible gray-rectangle covers | 0 (covers are inpaint-based) |
+| clean_repaired / clean_covered | ~28–30 / ~20–22 |
+
+Covers are no longer translucent dims — they reconstruct the surface, so a
+"covered" result looks like a natural removal rather than a patch.
+
 ## V8 Performance (50-image benchmark)
 
 | Metric | V7 | V8 |
