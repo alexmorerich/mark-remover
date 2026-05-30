@@ -1,13 +1,18 @@
 """
-Progressive Watermark Repair Strategy Bank — V8.
+Progressive Watermark Repair Strategy Bank — V9 Quality Patch.
 
-Treats watermark removal as a strategy bank instead of a single inpainting method.
-Each image passes through a staged repair pipeline:
-  1. Classify watermark ROI
-  2. Select cheapest/safest repair tools
-  3. Run candidates with local QA
-  4. Stop at first passing candidate
-  5. Final adaptive cover as fallback (never gray rectangle first)
+V9 addresses three root issues from V8 benchmarking:
+  - final_adaptive_cover dominated (37/50) — now gated by product-overlap guard
+  - Status semantics were misleading — method_family now drives status mapping
+  - QA missed visible rectangle artifacts — rectangular_patch_visibility gate added
+
+Pipeline:
+  1. Classify watermark ROI (expanded to 13 classes)
+  2. Select cheapest/safest repair tools from strategy bank
+  3. Validate mask confidence before use
+  4. Run candidates with local QA (8 metrics including rect visibility)
+  5. Product-overlap guard blocks full-bbox cover on product pixels
+  6. Final adaptive cover as last resort (class-specific, smallest mask)
 """
 from __future__ import annotations
 
@@ -15,11 +20,136 @@ import json
 import math
 import time
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Method Family — drives truthful status mapping (P0)
+# ---------------------------------------------------------------------------
+
+class MethodFamily(Enum):
+    REAL_PIXEL_CLONE = "real_pixel_clone"
+    STATISTICAL_FILL = "statistical_fill"
+    GRADIENT_RECONSTRUCTION = "gradient_reconstruction"
+    STROKE_LOGO_REPAIR = "stroke_logo_repair"
+    CLASSICAL_INPAINT = "classical_inpaint"
+    DEEP_INPAINT = "deep_inpaint"
+    ADAPTIVE_COVER = "adaptive_cover"
+
+
+_TOOL_FAMILY_MAP = {
+    "clone_above_patch": MethodFamily.REAL_PIXEL_CLONE,
+    "clone_below_patch": MethodFamily.REAL_PIXEL_CLONE,
+    "clone_left_patch": MethodFamily.REAL_PIXEL_CLONE,
+    "clone_right_patch": MethodFamily.REAL_PIXEL_CLONE,
+    "clone_best_of_4_dirs": MethodFamily.REAL_PIXEL_CLONE,
+    "clone_best_of_8_dirs": MethodFamily.REAL_PIXEL_CLONE,
+    "white_median_fill": MethodFamily.STATISTICAL_FILL,
+    "white_patch_with_noise": MethodFamily.STATISTICAL_FILL,
+    "corner_background_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "canvas_margin_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "ring_median_fill": MethodFamily.STATISTICAL_FILL,
+    "ring_mean_fill": MethodFamily.STATISTICAL_FILL,
+    "ring_mode_fill": MethodFamily.STATISTICAL_FILL,
+    "local_noise_transfer_fill": MethodFamily.STATISTICAL_FILL,
+    "jpeg_texture_clone_fill": MethodFamily.REAL_PIXEL_CLONE,
+    "micro_tile_white_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "feathered_white_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "hard_paste_white_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "seam_scored_white_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "edge_safe_white_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "plain_white_direct_neighbor_clone_v2": MethodFamily.REAL_PIXEL_CLONE,
+    "same_surface_clone_above": MethodFamily.REAL_PIXEL_CLONE,
+    "same_surface_clone_below": MethodFamily.REAL_PIXEL_CLONE,
+    "same_surface_clone_left": MethodFamily.REAL_PIXEL_CLONE,
+    "same_surface_clone_right": MethodFamily.REAL_PIXEL_CLONE,
+    "same_surface_best_patch": MethodFamily.REAL_PIXEL_CLONE,
+    "same_color_region_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "same_luminance_region_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "same_texture_region_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "surface_plane_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "surface_gradient_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "surface_noise_preserved_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "surface_patch_border_blend": MethodFamily.REAL_PIXEL_CLONE,
+    "surface_patch_gamma_match": MethodFamily.REAL_PIXEL_CLONE,
+    "surface_patch_color_match": MethodFamily.REAL_PIXEL_CLONE,
+    "surface_patch_contrast_match": MethodFamily.REAL_PIXEL_CLONE,
+    "surface_patch_lowpass_match": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "surface_patch_highpass_transfer": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "large_uniform_area_repair": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "dark_surface_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "light_surface_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "template_logo_mask_remove": MethodFamily.STROKE_LOGO_REPAIR,
+    "scaled_template_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "rotated_template_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "alpha_template_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "stroke_only_mask_inpaint": MethodFamily.STROKE_LOGO_REPAIR,
+    "stroke_mask_dilate_1px": MethodFamily.STROKE_LOGO_REPAIR,
+    "stroke_mask_dilate_2px": MethodFamily.STROKE_LOGO_REPAIR,
+    "stroke_mask_soft_edge": MethodFamily.STROKE_LOGO_REPAIR,
+    "text_component_filter_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "frequency_signature_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "lab_l_channel_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "blue_channel_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "gray_delta_logo_mask": MethodFamily.STROKE_LOGO_REPAIR,
+    "template_residual_minimization": MethodFamily.STROKE_LOGO_REPAIR,
+    "multi_size_logo_mask_bank": MethodFamily.STROKE_LOGO_REPAIR,
+    "multi_position_logo_mask_bank": MethodFamily.STROKE_LOGO_REPAIR,
+    "logo_mask_plus_clone_fill": MethodFamily.STROKE_LOGO_REPAIR,
+    "logo_mask_plus_surface_fill": MethodFamily.STROKE_LOGO_REPAIR,
+    "logo_mask_plus_telea": MethodFamily.STROKE_LOGO_REPAIR,
+    "logo_mask_plus_lama": MethodFamily.DEEP_INPAINT,
+    "linear_gradient_reconstruction": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "bilinear_gradient_reconstruction": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "radial_gradient_reconstruction": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "thin_plate_spline_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "poisson_gradient_clone": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "glass_surface_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "frosted_glass_noise_fill": MethodFamily.STATISTICAL_FILL,
+    "transparent_back_cover_fill": MethodFamily.STATISTICAL_FILL,
+    "specular_highlight_preserve_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "shadow_gradient_preserve_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "low_frequency_gradient_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "high_frequency_noise_transfer": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "glass_edge_aware_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "reflection_aware_patch_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "soft_material_surface_repair": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "edge_aware_clone": MethodFamily.REAL_PIXEL_CLONE,
+    "line_preserving_inpaint": MethodFamily.STROKE_LOGO_REPAIR,
+    "contour_guided_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "thin_flex_cable_repair": MethodFamily.STROKE_LOGO_REPAIR,
+    "black_flex_texture_repair": MethodFamily.REAL_PIXEL_CLONE,
+    "metal_connector_repair": MethodFamily.STROKE_LOGO_REPAIR,
+    "screw_area_avoid_repair": MethodFamily.STROKE_LOGO_REPAIR,
+    "product_mask_protected_fill": MethodFamily.GRADIENT_RECONSTRUCTION,
+    "background_only_repair": MethodFamily.REAL_PIXEL_CLONE,
+    "foreground_surface_only_repair": MethodFamily.REAL_PIXEL_CLONE,
+    "edge_direction_extrapolation": MethodFamily.CLASSICAL_INPAINT,
+    "structure_tensor_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "anisotropic_diffusion_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "patchmatch_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "nearest_neighbor_texture_synthesis": MethodFamily.REAL_PIXEL_CLONE,
+    "segmented_background_product_repair": MethodFamily.STROKE_LOGO_REPAIR,
+    "opencv_telea_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "opencv_ns_inpaint": MethodFamily.CLASSICAL_INPAINT,
+    "lama_small_mask": MethodFamily.DEEP_INPAINT,
+    "lama_full_bbox": MethodFamily.DEEP_INPAINT,
+    "lama_stroke_mask": MethodFamily.DEEP_INPAINT,
+    "lama_with_context_padding": MethodFamily.DEEP_INPAINT,
+    "deepfill_style_inpaint": MethodFamily.DEEP_INPAINT,
+    "mat_inpaint": MethodFamily.DEEP_INPAINT,
+    "sd_inpaint_low_strength": MethodFamily.DEEP_INPAINT,
+    "final_adaptive_cover": MethodFamily.ADAPTIVE_COVER,
+}
+
+
+def get_method_family(tool_name: str) -> MethodFamily:
+    return _TOOL_FAMILY_MAP.get(tool_name, MethodFamily.CLASSICAL_INPAINT)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +204,7 @@ class QAResult:
     texture_consistency_score: float
     color_delta_score: float
     edge_damage_score: float
+    rectangular_patch_visibility: float
     final_score: float
     reason: str
 
@@ -104,7 +235,7 @@ TEXTURE_CONSISTENCY_MIN = 0.30
 COLOR_DELTA_MAX = 12.0
 
 STRICT_CLASSES = {"complex_product_detail", "thin_flex_cable",
-                  "text_or_label_area"}
+                  "text_or_label_area", "mixed_background_product"}
 LOOSE_CLASSES = {"plain_white", "near_white", "low_texture_background"}
 
 
@@ -223,31 +354,56 @@ def analyze_roi(image: np.ndarray, bbox: tuple,
 def _classify_roi(white_ratio, edge_d, brightness, tex_var,
                   dark_ratio, grad_str, has_lines, has_text,
                   saturation, product_ratio):
+    bg_ratio = 1.0 - product_ratio
+
     if white_ratio > 0.85 and edge_d < 0.03:
         return "plain_white"
     if brightness > 220 and tex_var < 80 and edge_d < 0.05:
         return "near_white"
-    if tex_var < 120 and edge_d < 0.06:
+
+    if product_ratio > 0.15 and bg_ratio > 0.25 and white_ratio > 0.30:
+        return "mixed_background_product"
+
+    if tex_var < 120 and edge_d < 0.06 and product_ratio < 0.10:
         return "low_texture_background"
-    if dark_ratio > 0.65 and tex_var < 300:
-        return "dark_product_surface"
-    if grad_str > 8.0 and edge_d < 0.08:
-        return "glass_or_gradient"
-    if has_lines and dark_ratio > 0.3:
+
+    if has_lines and dark_ratio > 0.25:
         return "thin_flex_cable"
-    if has_text and edge_d > 0.12:
-        return "text_or_label_area"
+
+    if dark_ratio > 0.45:
+        return "dark_product_surface"
+
     if edge_d > 0.18:
         return "complex_product_detail"
-    if dark_ratio > 0.4:
-        return "dark_product_surface"
-    if saturation > 25 and edge_d > 0.06:
-        return "simple_product_surface"
-    if product_ratio > 0.5 and edge_d < 0.10:
-        return "simple_product_surface"
-    if grad_str > 5.0:
+
+    if grad_str > 8.0 and edge_d < 0.08:
         return "glass_or_gradient"
-    return "unknown"
+
+    if grad_str > 4.0 and saturation > 10 and edge_d < 0.12:
+        return "transparent_or_glossy"
+
+    if has_text and edge_d > 0.10:
+        return "text_or_label_area"
+
+    if dark_ratio > 0.3:
+        return "dark_product_surface"
+
+    if product_ratio > 0.15 and edge_d > 0.04:
+        return "metallic_or_reflective"
+
+    if saturation > 15 and edge_d > 0.04:
+        return "simple_product_surface"
+
+    if product_ratio > 0.3:
+        return "simple_product_surface"
+
+    if tex_var < 200 and edge_d < 0.08:
+        return "low_texture_background"
+
+    if grad_str > 3.0:
+        return "glass_or_gradient"
+
+    return "metallic_or_reflective"
 
 
 # ---------------------------------------------------------------------------
@@ -707,10 +863,14 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         edge_dmg = 0.0
     edge_dmg = min(1.0, edge_dmg)
 
+    # 8. Rectangular patch visibility (V9)
+    rpv = _compute_rectangular_patch_visibility(repaired, bbox, ring_mask)
+
     # Final composite score (lower = better)
     final = (2.0 * wm_residual + 2.0 * cover_vis + 2.5 * seam +
              1.5 * prod_damage + 0.5 * (1.0 - tex_consist) +
-             1.0 * color_d / max(COLOR_DELTA_MAX, 1) + 1.0 * edge_dmg)
+             1.0 * color_d / max(COLOR_DELTA_MAX, 1) + 1.0 * edge_dmg +
+             1.5 * rpv)
 
     # Acceptance thresholds
     wm_max = WATERMARK_RESIDUAL_MAX
@@ -718,24 +878,28 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
     sd_max = SEAM_DELTA_MAX
     pd_max = PRODUCT_DAMAGE_MAX
     ed_max = EDGE_DAMAGE_MAX
+    rpv_max = _RECT_VIS_THRESHOLDS.get(roi.roi_class, 0.12)
 
     if roi.roi_class in LOOSE_CLASSES:
         cv_max *= 1.3
         sd_max *= 1.2
+        rpv_max *= 1.3
     elif roi.roi_class in STRICT_CLASSES:
         wm_max *= 0.8
         cv_max *= 0.8
         sd_max *= 0.8
+        rpv_max *= 0.8
 
     passed = (wm_residual <= wm_max and
               cover_vis <= cv_max and
               seam <= sd_max and
               prod_damage <= pd_max and
-              edge_dmg <= ed_max)
+              edge_dmg <= ed_max and
+              rpv <= rpv_max)
 
     reason = "accepted" if passed else _qa_fail_reason(
         wm_residual, wm_max, cover_vis, cv_max, seam, sd_max,
-        prod_damage, pd_max, edge_dmg, ed_max)
+        prod_damage, pd_max, edge_dmg, ed_max, rpv, rpv_max)
 
     return QAResult(
         passed=passed, watermark_residual_score=round(wm_residual, 4),
@@ -745,11 +909,12 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         texture_consistency_score=round(tex_consist, 4),
         color_delta_score=round(color_d, 2),
         edge_damage_score=round(edge_dmg, 4),
+        rectangular_patch_visibility=round(rpv, 4),
         final_score=round(final, 4), reason=reason)
 
 
 def _qa_fail_reason(wm, wm_max, cv, cv_max, sd, sd_max, pd, pd_max,
-                    ed, ed_max):
+                    ed, ed_max, rpv=0.0, rpv_max=1.0):
     reasons = []
     if wm > wm_max:
         reasons.append("watermark_residual_too_high")
@@ -761,7 +926,113 @@ def _qa_fail_reason(wm, wm_max, cv, cv_max, sd, sd_max, pd, pd_max,
         reasons.append("product_damage")
     if ed > ed_max:
         reasons.append("edge_damage")
+    if rpv > rpv_max:
+        reasons.append("visible_rectangle_artifact")
     return "|".join(reasons) if reasons else "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Rectangular Patch Visibility — detects human-visible rectangular patches (P0)
+# ---------------------------------------------------------------------------
+
+_RECT_VIS_THRESHOLDS = {
+    "plain_white": 0.18,
+    "near_white": 0.18,
+    "low_texture_background": 0.22,
+    "simple_product_surface": 0.20,
+    "dark_product_surface": 0.20,
+    "complex_product_detail": 0.14,
+    "thin_flex_cable": 0.14,
+    "text_or_label_area": 0.14,
+    "glass_or_gradient": 0.22,
+    "metallic_or_reflective": 0.22,
+    "mixed_background_product": 0.16,
+    "transparent_or_glossy": 0.22,
+    "unknown": 0.20,
+}
+
+
+def _compute_rectangular_patch_visibility(repaired, bbox, ring_mask_bool):
+    bx, by, bw, bh = bbox
+    H, W = repaired.shape[:2]
+
+    gray_r = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+    inner = gray_r[by:by + bh, bx:bx + bw]
+    ring_gray = gray_r[ring_mask_bool]
+
+    if inner.size == 0 or ring_gray.size == 0:
+        return 0.0
+
+    luma_delta = abs(float(inner.mean()) - float(ring_gray.mean())) / 255.0
+
+    lab_r = cv2.cvtColor(repaired, cv2.COLOR_BGR2LAB)
+    inner_lab = lab_r[by:by + bh, bx:bx + bw].reshape(-1, 3).mean(axis=0).astype(np.float64)
+    ring_lab = lab_r[ring_mask_bool].reshape(-1, 3).mean(axis=0).astype(np.float64)
+    color_delta = float(np.linalg.norm(inner_lab - ring_lab)) / 20.0
+
+    tex_inner = float(cv2.Laplacian(inner, cv2.CV_64F).var())
+    pad = max(12, max(bw, bh) // 3)
+    ry1 = max(0, by - pad)
+    ry2 = min(H, by + bh + pad)
+    rx1 = max(0, bx - pad)
+    rx2 = min(W, bx + bw + pad)
+    ring_region = gray_r[ry1:ry2, rx1:rx2]
+    tex_ring = float(cv2.Laplacian(ring_region, cv2.CV_64F).var())
+    hf_drop = max(0.0, 1.0 - tex_inner / max(tex_ring, 1e-6))
+
+    border_deltas = []
+    if by > 0:
+        border_deltas.append(float(np.abs(
+            gray_r[by - 1, bx:bx + bw].astype(np.float32) -
+            gray_r[by, bx:bx + bw].astype(np.float32)).mean()) / 255.0)
+    if by + bh < H:
+        border_deltas.append(float(np.abs(
+            gray_r[by + bh, bx:bx + bw].astype(np.float32) -
+            gray_r[by + bh - 1, bx:bx + bw].astype(np.float32)).mean()) / 255.0)
+    if bx > 0:
+        border_deltas.append(float(np.abs(
+            gray_r[by:by + bh, bx - 1].astype(np.float32) -
+            gray_r[by:by + bh, bx].astype(np.float32)).mean()) / 255.0)
+    if bx + bw < W:
+        border_deltas.append(float(np.abs(
+            gray_r[by:by + bh, bx + bw].astype(np.float32) -
+            gray_r[by:by + bh, bx + bw - 1].astype(np.float32)).mean()) / 255.0)
+    edge_score = max(border_deltas) if border_deltas else 0.0
+
+    return min(1.0, 0.25 * luma_delta + 0.25 * color_delta +
+               0.30 * hf_drop + 0.20 * edge_score)
+
+
+# ---------------------------------------------------------------------------
+# Mask Confidence Validation (P1)
+# ---------------------------------------------------------------------------
+
+def _validate_mask_confidence(mask, bbox):
+    if mask is None or not np.any(mask > 0):
+        return {"valid": False, "reason": "empty_mask",
+                "occupancy": 0.0, "rectangularity": 0.0}
+    bx, by, bw, bh = bbox
+    bbox_area = max(1, bw * bh)
+    mask_roi = mask[by:by + bh, bx:bx + bw]
+    occupancy = float((mask_roi > 0).sum()) / bbox_area
+
+    ys, xs = np.where(mask_roi > 0)
+    if ys.size == 0:
+        return {"valid": False, "reason": "empty_mask",
+                "occupancy": 0.0, "rectangularity": 0.0}
+    bbox_of_mask = max(1, (int(xs.max()) - int(xs.min()) + 1) *
+                       (int(ys.max()) - int(ys.min()) + 1))
+    rectangularity = ys.size / bbox_of_mask
+
+    if occupancy > 0.35:
+        return {"valid": False, "reason": "mask_too_large",
+                "occupancy": occupancy, "rectangularity": rectangularity}
+    if rectangularity > 0.75 and occupancy > 0.20:
+        return {"valid": False, "reason": "bbox_like_mask",
+                "occupancy": occupancy, "rectangularity": rectangularity}
+
+    return {"valid": True, "occupancy": occupancy,
+            "rectangularity": rectangularity}
 
 
 # ============================================================================
@@ -1252,6 +1523,82 @@ class EdgeSafeWhiteClone(RepairTool):
         return RepairCandidate(self.name, result)
 
 
+class PlainWhiteDirectNeighborCloneV2(RepairTool):
+    name = "plain_white_direct_neighbor_clone_v2"
+    cost_level = 1
+    risk_level = 1
+    supported_roi_classes = ["plain_white", "near_white",
+                             "low_texture_background"]
+
+    def apply(self, ctx):
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+        expand = max(2, min(4, bh // 4))
+
+        dirs = [
+            (0, -(bh + expand)),
+            (0, bh + expand),
+            (-(bw + expand), 0),
+            (bw + expand, 0),
+            (-(bw + expand), -(bh + expand)),
+            (bw + expand, -(bh + expand)),
+            (-(bw + expand), bh + expand),
+            (bw + expand, bh + expand),
+        ]
+        ring_mask, _ = _get_ring(ctx.image, ctx.watermark_bbox, 0.4)
+        ring_pixels = ctx.image[ring_mask]
+        if ring_pixels.size == 0:
+            return None
+        target_lab = cv2.cvtColor(
+            np.median(ring_pixels, axis=0).reshape(1, 1, 3).astype(np.uint8),
+            cv2.COLOR_BGR2LAB).reshape(3).astype(np.float64)
+
+        valid = []
+        for dx, dy in dirs:
+            sx, sy = bx + dx, by + dy
+            if sx < 0 or sy < 0 or sx + bw > W or sy + bh > H:
+                continue
+            patch = ctx.image[sy:sy + bh, sx:sx + bw]
+            if patch.shape[0] != bh or patch.shape[1] != bw:
+                continue
+            if ctx.product_mask is not None:
+                prod_roi = ctx.product_mask[sy:sy + bh, sx:sx + bw]
+                if prod_roi.shape == (bh, bw) and float((prod_roi > 0).mean()) > 0.02:
+                    continue
+            ed = _patch_edge_density(patch)
+            if ed > 0.06:
+                continue
+            patch_lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).reshape(-1, 3).mean(0).astype(np.float64)
+            cd = float(np.linalg.norm(patch_lab - target_lab))
+            if cd > 15.0:
+                continue
+            valid.append((patch.copy(), cd, ed, dx, dy))
+
+        if not valid:
+            return None
+
+        best = None
+        best_seam = float("inf")
+        for patch, cd, ed, dx, dy in valid:
+            test = ctx.image.copy()
+            test[by:by + bh, bx:bx + bw] = patch
+            seam = _compute_seam_delta(test, ctx.watermark_bbox)
+            total = seam + 0.3 * cd / 15.0
+            if total < best_seam:
+                best_seam = total
+                best = patch
+
+        if best is None or best_seam > 0.15:
+            return None
+
+        out = ctx.image.copy()
+        out[by:by + bh, bx:bx + bw] = best
+        feather = max(1, min(2, bh // 8))
+        out = _feather_blend(ctx.image, out, ctx.watermark_bbox, feather)
+        return RepairCandidate(self.name, out,
+                               {"seam_score": round(best_seam, 4)})
+
+
 # ---------------------------------------------------------------------------
 # Group B: Simple Product Surface Methods (21-40)
 # ---------------------------------------------------------------------------
@@ -1624,7 +1971,8 @@ _ALL_CLASSES = ["plain_white", "near_white", "low_texture_background",
                 "simple_product_surface", "dark_product_surface",
                 "glass_or_gradient", "metallic_or_reflective",
                 "thin_flex_cable", "text_or_label_area",
-                "complex_product_detail", "unknown"]
+                "complex_product_detail", "mixed_background_product",
+                "transparent_or_glossy", "unknown"]
 
 
 def _get_effective_stroke_mask(ctx, dilate_px=0):
@@ -2439,6 +2787,57 @@ class NearestNeighborTextureSynthesis(RepairTool):
         return RepairCandidate(self.name, result)
 
 
+class SegmentedBackgroundProductRepair(RepairTool):
+    name = "segmented_background_product_repair"
+    cost_level = 4
+    risk_level = 2
+    supported_roi_classes = ["mixed_background_product", "thin_flex_cable",
+                             "complex_product_detail", "dark_product_surface",
+                             "simple_product_surface", "text_or_label_area"]
+
+    def apply(self, ctx):
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+
+        if ctx.product_mask is None:
+            return None
+        prod_roi = ctx.product_mask[by:by + bh, bx:bx + bw]
+        if prod_roi.shape != (bh, bw):
+            return None
+        product_ratio = float((prod_roi > 0).mean())
+        if product_ratio < 0.05 or product_ratio > 0.95:
+            return None
+
+        bg_mask_roi = (prod_roi == 0).astype(np.uint8) * 255
+        fg_mask_roi = (prod_roi > 0).astype(np.uint8) * 255
+
+        out = ctx.image.copy()
+
+        if np.any(bg_mask_roi > 0):
+            bg_full = np.zeros((H, W), np.uint8)
+            bg_full[by:by + bh, bx:bx + bw] = bg_mask_roi
+            median_color, noise_std = _ring_stats(ctx.image, ctx.watermark_bbox)
+            fill = np.full((H, W, 3), median_color, dtype=np.uint8)
+            fill = _add_noise(fill, max(noise_std, 0.5), 0.3)
+            bg_alpha = bg_full.astype(np.float32) / 255.0
+            bg_alpha = cv2.GaussianBlur(bg_alpha, (0, 0), sigmaX=1.5)
+            bg_alpha3 = np.stack([bg_alpha] * 3, axis=-1)
+            out = (fill.astype(np.float32) * bg_alpha3 +
+                   out.astype(np.float32) * (1 - bg_alpha3)).astype(np.uint8)
+
+        if np.any(fg_mask_roi > 0):
+            stroke = _get_effective_stroke_mask(ctx, dilate_px=1)
+            if stroke is not None:
+                fg_full = np.zeros((H, W), np.uint8)
+                fg_full[by:by + bh, bx:bx + bw] = fg_mask_roi
+                combined = cv2.bitwise_and(stroke, fg_full)
+                if np.any(combined > 0):
+                    out = cv2.inpaint(out, combined, 2, cv2.INPAINT_TELEA)
+
+        return RepairCandidate(self.name, out,
+                               {"product_ratio": round(product_ratio, 3)})
+
+
 # ---------------------------------------------------------------------------
 # Group F: Classical / Deep Inpainting Methods (91-99)
 # ---------------------------------------------------------------------------
@@ -2578,16 +2977,77 @@ class FinalAdaptiveCover(RepairTool):
 
     def apply(self, ctx):
         roi_class = ctx.roi_analysis.roi_class
+
+        stroke_mask = _get_effective_stroke_mask(ctx, dilate_px=2)
+        use_stroke = (stroke_mask is not None and np.any(stroke_mask > 0) and
+                      ctx.roi_analysis.product_pixel_ratio > 0.05)
+
+        if use_stroke:
+            result = self._stroke_level_cover(ctx, stroke_mask)
+            if result is not None:
+                return result
+
         if roi_class in ("plain_white", "near_white"):
             return self._near_white_cover(ctx)
         elif roi_class == "dark_product_surface":
             return self._dark_soft_shadow_cover(ctx)
-        elif roi_class == "glass_or_gradient":
+        elif roi_class in ("glass_or_gradient", "transparent_or_glossy"):
             return self._frosted_local_blur_cover(ctx)
-        elif roi_class in ("simple_product_surface", "low_texture_background"):
+        elif roi_class in ("thin_flex_cable",):
+            return self._dark_soft_shadow_cover(ctx)
+        elif roi_class in ("mixed_background_product",):
+            return self._segmented_cover(ctx)
+        elif roi_class in ("simple_product_surface", "low_texture_background",
+                           "metallic_or_reflective"):
             return self._same_surface_color_cover(ctx)
         else:
             return self._blurred_local_cover(ctx)
+
+    def _stroke_level_cover(self, ctx, stroke_mask):
+        median_color, noise_std = _ring_stats(ctx.image, ctx.watermark_bbox)
+        cover = np.full_like(ctx.image, median_color)
+        cover = _add_noise(cover, max(noise_std, 0.5), 0.3)
+        mask_f = stroke_mask.astype(np.float32) / 255.0
+        alpha = cv2.GaussianBlur(mask_f, (0, 0), sigmaX=2.0)
+        alpha3 = np.stack([alpha] * 3, axis=-1)
+        result = (cover.astype(np.float32) * alpha3 +
+                  ctx.image.astype(np.float32) * (1 - alpha3)).astype(np.uint8)
+        return RepairCandidate(self.name, result,
+                               {"cover_style": "stroke_level"})
+
+    def _segmented_cover(self, ctx):
+        bx, by, bw, bh = ctx.watermark_bbox
+        H, W = ctx.image.shape[:2]
+        out = ctx.image.copy()
+
+        if ctx.product_mask is not None:
+            prod_roi = ctx.product_mask[by:by + bh, bx:bx + bw]
+            if prod_roi.shape == (bh, bw):
+                bg_mask = (prod_roi == 0)
+                if bg_mask.any():
+                    median_color, noise_std = _ring_stats(ctx.image, ctx.watermark_bbox)
+                    fill = np.full((bh, bw, 3), median_color, dtype=np.uint8)
+                    fill = _add_noise(fill, max(noise_std, 0.5), 0.3)
+                    bg_alpha = bg_mask.astype(np.float32)
+                    bg_alpha = cv2.GaussianBlur(bg_alpha, (0, 0), sigmaX=1.5)
+                    bg_alpha3 = np.stack([bg_alpha] * 3, axis=-1)
+                    roi = out[by:by + bh, bx:bx + bw].astype(np.float32)
+                    roi = fill.astype(np.float32) * bg_alpha3 + roi * (1 - bg_alpha3)
+                    out[by:by + bh, bx:bx + bw] = roi.astype(np.uint8)
+
+                stroke = _get_effective_stroke_mask(ctx, dilate_px=2)
+                if stroke is not None:
+                    fg_mask = (prod_roi > 0).astype(np.uint8) * 255
+                    fg_full = np.zeros((H, W), np.uint8)
+                    fg_full[by:by + bh, bx:bx + bw] = fg_mask
+                    combined = cv2.bitwise_and(stroke, fg_full)
+                    if np.any(combined > 0):
+                        out = cv2.inpaint(out, combined, 2, cv2.INPAINT_TELEA)
+
+                return RepairCandidate(self.name, out,
+                                       {"cover_style": "segmented"})
+
+        return self._blurred_local_cover(ctx)
 
     def _near_white_cover(self, ctx):
         median_color, noise_std = _ring_stats(ctx.image, ctx.watermark_bbox)
@@ -2689,15 +3149,15 @@ class FinalAdaptiveCover(RepairTool):
 # ============================================================================
 
 ALL_TOOLS: list[RepairTool] = [
-    # Group A (1-20)
+    # Group A (1-21)
     CloneAbovePatch(), CloneBelowPatch(), CloneLeftPatch(), CloneRightPatch(),
     CloneBestOf4Dirs(), CloneBestOf8Dirs(), WhiteMedianFill(),
     WhitePatchWithNoise(), CornerBackgroundClone(), CanvasMarginClone(),
     RingMedianFill(), RingMeanFill(), RingModeFill(),
     LocalNoiseTransferFill(), JpegTextureCloneFill(), MicroTileWhiteClone(),
     FeatheredWhiteClone(), HardPasteWhiteClone(), SeamScoredWhiteClone(),
-    EdgeSafeWhiteClone(),
-    # Group B (21-40)
+    EdgeSafeWhiteClone(), PlainWhiteDirectNeighborCloneV2(),
+    # Group B (22-41)
     SameSurfaceCloneAbove(), SameSurfaceCloneBelow(),
     SameSurfaceCloneLeft(), SameSurfaceCloneRight(),
     SameSurfaceBestPatch(), SameColorRegionClone(),
@@ -2707,7 +3167,7 @@ ALL_TOOLS: list[RepairTool] = [
     SurfacePatchColorMatch(), SurfacePatchContrastMatch(),
     SurfacePatchLowpassMatch(), SurfacePatchHighpassTransfer(),
     LargeUniformAreaRepair(), DarkSurfaceClone(), LightSurfaceClone(),
-    # Group C (41-60)
+    # Group C (42-61)
     TemplateLogoMaskRemove(), ScaledTemplateLogoMask(),
     RotatedTemplateLogoMask(), AlphaTemplateLogoMask(),
     StrokeOnlyMaskInpaint(), StrokeMaskDilate1px(), StrokeMaskDilate2px(),
@@ -2717,7 +3177,7 @@ ALL_TOOLS: list[RepairTool] = [
     TemplateResidualMinimization(), MultiSizeLogoMaskBank(),
     MultiPositionLogoMaskBank(), LogoMaskPlusCloneFill(),
     LogoMaskPlusSurfaceFill(), LogoMaskPlusTelea(), LogoMaskPlusLama(),
-    # Group D (61-75)
+    # Group D (62-76)
     LinearGradientReconstruction(), BilinearGradientReconstruction(),
     RadialGradientReconstruction(), ThinPlateSplineFill(),
     PoissonGradientClone(), GlassSurfaceClone(), FrostedGlassNoiseFill(),
@@ -2725,24 +3185,25 @@ ALL_TOOLS: list[RepairTool] = [
     ShadowGradientPreserveFill(), LowFrequencyGradientFill(),
     HighFrequencyNoiseTransfer(), GlassEdgeAwareInpaint(),
     ReflectionAwarePatchClone(), SoftMaterialSurfaceRepair(),
-    # Group E (76-90)
+    # Group E (77-92)
     EdgeAwareClone(), LinePreservingInpaint(), ContourGuidedInpaint(),
     ThinFlexCableRepair(), BlackFlexTextureRepair(), MetalConnectorRepair(),
     ScrewAreaAvoidRepair(), ProductMaskProtectedFill(),
     BackgroundOnlyRepair(), ForegroundSurfaceOnlyRepair(),
     EdgeDirectionExtrapolation(), StructureTensorInpaint(),
     AnisotropicDiffusionInpaint(), PatchMatchInpaint(),
-    NearestNeighborTextureSynthesis(),
-    # Group F (91-99)
+    NearestNeighborTextureSynthesis(), SegmentedBackgroundProductRepair(),
+    # Group F (93-101)
     OpenCVTeleaInpaint(), OpenCVNSInpaint(), LamaSmallMask(),
     LamaFullBbox(), LamaStrokeMask(), LamaWithContextPadding(),
     DeepfillStyleInpaint(), MATInpaint(), SDInpaintLowStrength(),
-    # Tool 100
+    # Tool 102
     FinalAdaptiveCover(),
 ]
 
 STRATEGY_BANK_BY_CLASS = {
     "plain_white": [
+        "plain_white_direct_neighbor_clone_v2",
         "clone_best_of_8_dirs", "hard_paste_white_clone",
         "white_patch_with_noise", "ring_median_fill",
         "local_noise_transfer_fill", "micro_tile_white_clone",
@@ -2750,6 +3211,7 @@ STRATEGY_BANK_BY_CLASS = {
         "opencv_telea_inpaint", "final_adaptive_cover",
     ],
     "near_white": [
+        "plain_white_direct_neighbor_clone_v2",
         "clone_best_of_8_dirs", "seam_scored_white_clone",
         "white_patch_with_noise", "ring_median_fill",
         "surface_gradient_fill", "stroke_only_mask_inpaint",
@@ -2759,20 +3221,25 @@ STRATEGY_BANK_BY_CLASS = {
     "low_texture_background": [
         "clone_best_of_8_dirs", "ring_median_fill",
         "surface_patch_lowpass_match", "surface_gradient_fill",
+        "stroke_only_mask_inpaint",
         "logo_mask_plus_clone_fill", "opencv_telea_inpaint",
         "lama_stroke_mask", "final_adaptive_cover",
     ],
     "simple_product_surface": [
         "same_surface_best_patch", "same_color_region_clone",
         "surface_patch_color_match", "surface_gradient_fill",
-        "surface_noise_preserved_fill", "logo_mask_plus_surface_fill",
-        "stroke_only_mask_inpaint", "opencv_telea_inpaint",
-        "lama_stroke_mask", "final_adaptive_cover",
+        "surface_noise_preserved_fill",
+        "segmented_background_product_repair",
+        "stroke_only_mask_inpaint", "logo_mask_plus_surface_fill",
+        "opencv_telea_inpaint", "lama_stroke_mask",
+        "final_adaptive_cover",
     ],
     "dark_product_surface": [
-        "dark_surface_clone", "same_surface_best_patch",
-        "surface_patch_gamma_match", "surface_patch_contrast_match",
-        "stroke_only_mask_inpaint", "logo_mask_plus_surface_fill",
+        "stroke_only_mask_inpaint", "dark_surface_clone",
+        "same_surface_best_patch", "surface_patch_gamma_match",
+        "segmented_background_product_repair",
+        "surface_patch_contrast_match",
+        "logo_mask_plus_surface_fill",
         "opencv_telea_inpaint", "lama_stroke_mask",
         "final_adaptive_cover",
     ],
@@ -2785,31 +3252,60 @@ STRATEGY_BANK_BY_CLASS = {
         "lama_stroke_mask", "final_adaptive_cover",
     ],
     "metallic_or_reflective": [
+        "stroke_only_mask_inpaint", "template_logo_mask_remove",
         "same_surface_best_patch", "surface_patch_color_match",
-        "linear_gradient_reconstruction", "stroke_only_mask_inpaint",
-        "opencv_telea_inpaint", "final_adaptive_cover",
+        "logo_mask_plus_clone_fill", "logo_mask_plus_surface_fill",
+        "linear_gradient_reconstruction", "surface_gradient_fill",
+        "stroke_mask_soft_edge", "opencv_telea_inpaint",
+        "lama_stroke_mask", "final_adaptive_cover",
     ],
     "thin_flex_cable": [
-        "stroke_only_mask_inpaint", "template_logo_mask_remove",
-        "logo_mask_plus_clone_fill", "edge_aware_clone",
-        "thin_flex_cable_repair", "black_flex_texture_repair",
+        "template_logo_mask_remove", "stroke_only_mask_inpaint",
+        "logo_mask_plus_clone_fill",
+        "segmented_background_product_repair",
+        "edge_aware_clone", "thin_flex_cable_repair",
+        "black_flex_texture_repair", "line_preserving_inpaint",
         "opencv_telea_inpaint", "lama_stroke_mask",
         "final_adaptive_cover",
     ],
     "text_or_label_area": [
-        "stroke_only_mask_inpaint", "logo_mask_plus_clone_fill",
+        "stroke_only_mask_inpaint", "template_logo_mask_remove",
+        "logo_mask_plus_clone_fill",
+        "segmented_background_product_repair",
+        "text_component_filter_mask",
         "opencv_telea_inpaint", "final_adaptive_cover",
     ],
     "complex_product_detail": [
         "template_logo_mask_remove", "stroke_only_mask_inpaint",
-        "text_component_filter_mask", "logo_mask_plus_telea",
-        "edge_aware_clone", "contour_guided_inpaint",
-        "patchmatch_inpaint", "lama_stroke_mask",
-        "lama_with_context_padding", "final_adaptive_cover",
+        "text_component_filter_mask",
+        "segmented_background_product_repair",
+        "logo_mask_plus_telea", "edge_aware_clone",
+        "contour_guided_inpaint", "patchmatch_inpaint",
+        "lama_stroke_mask", "lama_with_context_padding",
+        "final_adaptive_cover",
+    ],
+    "mixed_background_product": [
+        "segmented_background_product_repair",
+        "template_logo_mask_remove", "stroke_only_mask_inpaint",
+        "logo_mask_plus_clone_fill", "stroke_mask_dilate_1px",
+        "edge_aware_clone", "opencv_telea_inpaint",
+        "lama_stroke_mask", "final_adaptive_cover",
+    ],
+    "transparent_or_glossy": [
+        "linear_gradient_reconstruction",
+        "bilinear_gradient_reconstruction",
+        "glass_surface_clone", "frosted_glass_noise_fill",
+        "surface_gradient_fill", "high_frequency_noise_transfer",
+        "logo_mask_plus_surface_fill",
+        "poisson_gradient_clone", "lama_stroke_mask",
+        "final_adaptive_cover",
     ],
     "unknown": [
-        "clone_best_of_8_dirs", "stroke_only_mask_inpaint",
-        "surface_gradient_fill", "opencv_telea_inpaint",
+        "stroke_only_mask_inpaint", "template_logo_mask_remove",
+        "clone_best_of_8_dirs", "logo_mask_plus_clone_fill",
+        "same_surface_best_patch", "surface_gradient_fill",
+        "stroke_mask_soft_edge", "logo_mask_plus_surface_fill",
+        "opencv_telea_inpaint", "lama_stroke_mask",
         "final_adaptive_cover",
     ],
 }
@@ -2833,16 +3329,65 @@ def select_tools_for_roi(ctx: RepairContext) -> list[RepairTool]:
 # Progressive Repair Loop
 # ============================================================================
 
+def _check_product_overlap_guard(ctx):
+    bx, by, bw, bh = ctx.watermark_bbox
+    if ctx.product_mask is None:
+        return False, 0.0, 0.0, 0.0
+    prod_roi = ctx.product_mask[by:by + bh, bx:bx + bw]
+    if prod_roi.shape != (bh, bw):
+        return False, 0.0, 0.0, 0.0
+    product_overlap = float((prod_roi > 0).mean())
+
+    gray = cv2.cvtColor(ctx.image, cv2.COLOR_BGR2GRAY)
+    roi_gray = gray[by:by + bh, bx:bx + bw]
+    edges = cv2.Canny(roi_gray, 50, 150)
+    edge_density = float(edges.mean()) / 255.0
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 30, minLineLength=20, maxLineGap=5)
+    long_line_score = 0.0
+    if lines is not None:
+        long_line_score = min(1.0, len(lines) / 10.0)
+
+    block = ((product_overlap > 0.35 and edge_density > 0.10) or
+             edge_density > 0.18 or
+             long_line_score > 0.25)
+    return block, product_overlap, edge_density, long_line_score
+
+
 def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, list]:
     tools = select_tools_for_roi(ctx)
     trace = []
 
+    block_full_bbox, prod_ov, prod_ed, prod_lls = _check_product_overlap_guard(ctx)
+
+    _STROKE_ONLY_TOOLS = {
+        "template_logo_mask_remove", "stroke_only_mask_inpaint",
+        "stroke_mask_dilate_1px", "stroke_mask_soft_edge",
+        "logo_mask_plus_clone_fill", "logo_mask_plus_telea",
+        "logo_mask_plus_surface_fill", "text_component_filter_mask",
+        "segmented_background_product_repair",
+        "thin_flex_cable_repair", "line_preserving_inpaint",
+        "contour_guided_inpaint", "edge_direction_extrapolation",
+    }
+
     best_failed_candidate = None
     best_failed_score = float("inf")
+    best_failed_tool = None
 
     for tool in tools:
         if tool.name == "final_adaptive_cover":
             continue
+
+        if block_full_bbox and tool.name not in _STROKE_ONLY_TOOLS:
+            family = get_method_family(tool.name)
+            if family in (MethodFamily.REAL_PIXEL_CLONE,
+                          MethodFamily.STATISTICAL_FILL,
+                          MethodFamily.GRADIENT_RECONSTRUCTION):
+                trace.append({
+                    "tool": tool.name, "passed": False,
+                    "reason": "blocked_by_product_overlap_guard",
+                    "qa": {}, "runtime_s": 0.0})
+                continue
 
         t0 = time.time()
         try:
@@ -2864,20 +3409,25 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
         qa = run_local_qa(ctx, candidate)
         dt = round(time.time() - t0, 3)
 
+        family = get_method_family(tool.name)
         trace.append({
             "tool": tool.name, "passed": qa.passed,
             "reason": qa.reason, "qa": asdict(qa),
+            "method_family": family.value,
             "runtime_s": dt})
 
         if qa.passed:
             candidate.metadata["qa"] = asdict(qa)
             candidate.metadata["final_method"] = tool.name
+            candidate.metadata["method_family"] = family.value
+            candidate.metadata["is_real_repair"] = family != MethodFamily.ADAPTIVE_COVER
             return candidate, trace
 
         if qa.final_score < best_failed_score:
             best_failed_score = qa.final_score
             best_failed_candidate = candidate
             best_failed_candidate.metadata["qa"] = asdict(qa)
+            best_failed_tool = tool.name
 
     # Final fallback — always produces output
     t0 = time.time()
@@ -2889,15 +3439,20 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
     trace.append({
         "tool": "final_adaptive_cover", "passed": True,
         "reason": "final_fallback", "qa": asdict(fallback_qa),
+        "method_family": MethodFamily.ADAPTIVE_COVER.value,
         "runtime_s": dt})
 
     fallback_candidate.metadata["qa"] = asdict(fallback_qa)
     fallback_candidate.metadata["final_method"] = "final_adaptive_cover"
+    fallback_candidate.metadata["method_family"] = MethodFamily.ADAPTIVE_COVER.value
+    fallback_candidate.metadata["is_real_repair"] = False
 
-    if best_failed_candidate is not None and best_failed_score < fallback_qa.final_score:
-        best_failed_candidate.metadata["final_method"] = (
-            best_failed_candidate.metadata.get("final_method",
-                                                "best_failed_candidate"))
+    cover_score_threshold = fallback_qa.final_score * 1.6
+    if best_failed_candidate is not None and best_failed_score < cover_score_threshold:
+        bf_family = get_method_family(best_failed_tool or "unknown")
+        best_failed_candidate.metadata["final_method"] = best_failed_tool or "best_failed"
+        best_failed_candidate.metadata["method_family"] = bf_family.value
+        best_failed_candidate.metadata["is_real_repair"] = bf_family != MethodFamily.ADAPTIVE_COVER
         return best_failed_candidate, trace
 
     return fallback_candidate, trace
@@ -2909,16 +3464,35 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
 
 def save_debug_trace(debug_dir: str | Path, filename: str,
                      roi_class: str, bbox: tuple,
-                     trace: list, final_method: str):
+                     trace: list, final_method: str,
+                     method_family: str = "",
+                     roi_features: dict | None = None):
     debug_path = Path(debug_dir) / filename.replace(".", "_")
     debug_path.mkdir(parents=True, exist_ok=True)
+
+    non_cover_tried = [t for t in trace
+                       if t.get("tool") != "final_adaptive_cover"
+                       and t.get("reason") not in ("not_applicable",
+                                                    "blocked_by_product_overlap_guard")]
+    non_cover_passed = [t for t in non_cover_tried if t.get("passed")]
+    family = method_family or get_method_family(final_method).value
+
     trace_data = {
         "filename": filename,
         "roi_class": roi_class,
         "watermark_bbox": list(bbox),
-        "tools_tried": trace,
         "final_method": final_method,
+        "method_family": family,
+        "is_real_repair": family != MethodFamily.ADAPTIVE_COVER.value,
+        "is_cover": family == MethodFamily.ADAPTIVE_COVER.value,
+        "tools_tried_count": len(trace),
+        "non_cover_tools_tried_count": len(non_cover_tried),
+        "non_cover_tools_passed_count": len(non_cover_passed),
+        "tools_tried": trace,
     }
+    if roi_features:
+        trace_data["roi_features"] = roi_features
+
     (debug_path / "trace.json").write_text(
         json.dumps(trace_data, indent=2, default=str))
     return debug_path

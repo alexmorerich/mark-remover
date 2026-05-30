@@ -39,6 +39,8 @@ from progressive_repair import (
     repair_image_progressively,
     save_debug_trace,
     RepairContext,
+    get_method_family,
+    MethodFamily,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -50,8 +52,8 @@ DEFAULT_OUT = Path("output")
 # ---------------------------------------------------------------------------
 # V5 — Version constant and assertion.
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V8_PROGRESSIVE_REPAIR"
-assert PIPELINE_VERSION == "V8_PROGRESSIVE_REPAIR"
+PIPELINE_VERSION = "V9_QUALITY_PATCH"
+assert PIPELINE_VERSION == "V9_QUALITY_PATCH"
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -3823,13 +3825,28 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
 
     candidate, trace = repair_image_progressively(pr_ctx)
     final_method = candidate.metadata.get("final_method", "unknown")
+    method_family = candidate.metadata.get("method_family",
+                                            get_method_family(final_method).value)
     qa_info = candidate.metadata.get("qa", {})
 
+    roi_features = {
+        "product_overlap": round(pr_roi.product_pixel_ratio, 3),
+        "edge_density": round(pr_roi.edge_density, 3),
+        "dark_pixel_ratio": round(pr_roi.dark_pixel_ratio, 3),
+        "white_pixel_ratio": round(pr_roi.white_pixel_ratio, 3),
+        "brightness": round(pr_roi.brightness, 1),
+        "texture_variance": round(pr_roi.texture_variance, 1),
+        "gradient_strength": round(pr_roi.gradient_strength, 2),
+        "has_long_lines": pr_roi.has_long_lines,
+        "has_text_like_edges": pr_roi.has_text_like_edges,
+    }
     if debug_root:
         save_debug_trace(debug_root, path.name, pr_roi.roi_class,
-                         bbox_tuple, trace, final_method)
+                         bbox_tuple, trace, final_method,
+                         method_family=method_family,
+                         roi_features=roi_features)
 
-    is_cover = final_method == "final_adaptive_cover"
+    is_cover = method_family == MethodFamily.ADAPTIVE_COVER.value
     status = ST_CLEAN_COVERED if is_cover else ST_CLEAN_REPAIRED
 
     attempts = [{
@@ -3848,10 +3865,14 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                      mark_box_density=orig_md, attempts=attempts,
                      masks_info=masks_info, overlap=overlap)
     rec["repair_qa_pass"] = not is_cover
-    rec["v8_final_method"] = final_method
-    rec["v8_roi_class"] = pr_roi.roi_class
-    rec["v8_tools_tried"] = len(trace)
-    rec["v8_qa_final_score"] = qa_info.get("final_score")
+    rec["v9_final_method"] = final_method
+    rec["v9_method_family"] = method_family
+    rec["v9_is_real_repair"] = not is_cover
+    rec["v9_is_cover"] = is_cover
+    rec["v9_roi_class"] = pr_roi.roi_class
+    rec["v9_tools_tried"] = len(trace)
+    rec["v9_qa_final_score"] = qa_info.get("final_score")
+    rec["v9_rect_patch_visibility"] = qa_info.get("rectangular_patch_visibility")
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
@@ -4066,6 +4087,13 @@ def write_summary_jsonl(out_root, records):
             row["product_edge_loss_score"] = r.get("product_edge_loss_score")
             row["boundary_jump_score"] = r.get("boundary_jump_score")
             row["post_blur_applied"] = r.get("post_blur_applied", False)
+            row["v9_final_method"] = r.get("v9_final_method")
+            row["v9_method_family"] = r.get("v9_method_family")
+            row["v9_is_real_repair"] = r.get("v9_is_real_repair")
+            row["v9_is_cover"] = r.get("v9_is_cover")
+            row["v9_roi_class"] = r.get("v9_roi_class")
+            row["v9_tools_tried"] = r.get("v9_tools_tried")
+            row["v9_rect_patch_visibility"] = r.get("v9_rect_patch_visibility")
             f.write(json.dumps(row, default=str) + "\n")
 
 
@@ -4379,16 +4407,21 @@ def write_compare_pdf(out_root, records) -> Path:
     page_h = pad * 2 + 160 + cell_h + 28
 
     counts = {s: 0 for s in STATUS_ORDER}
-    by_class = {}; by_route = {}; by_mask = {}
+    by_class = {}; by_route = {}; by_mask = {}; by_family = {}
     for r in records:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-        c = r.get("roi_class") or "?"
+        c = r.get("v9_roi_class") or r.get("roi_class") or "?"
         by_class[c] = by_class.get(c, 0) + 1
-        if r.get("attempts"):
+        fm = r.get("v9_final_method")
+        if fm:
+            by_route[fm] = by_route.get(fm, 0) + 1
+        elif r.get("attempts"):
             m = r["attempts"][-1].get("method") or "?"
             by_route[m] = by_route.get(m, 0) + 1
         mu = (r.get("masks_info") or {}).get("final_mask", "n/a")
         by_mask[mu] = by_mask.get(mu, 0) + 1
+        mf = r.get("v9_method_family") or "?"
+        by_family[mf] = by_family.get(mf, 0) + 1
 
     s_h = max(620, 420 + 22 * (len(by_class) + len(by_route) + len(by_mask)))
     s = Image.new("RGB", (page_w, s_h), "white")
@@ -4422,6 +4455,19 @@ def write_compare_pdf(out_root, records) -> Path:
         d.text((pad + 16, y), f"{m:22s}{n:>4d}",
                font=font_md, fill="black"); y += 18
     y += 4
+    d.text((pad, y), "Method family distribution:", font=font_md, fill="black"); y += 22
+    for mf, n in sorted(by_family.items(), key=lambda kv: -kv[1]):
+        mf_color = "#a00" if mf == "adaptive_cover" else "#0a4"
+        d.text((pad + 16, y), f"{mf:28s}{n:>4d}",
+               font=font_md, fill=mf_color); y += 18
+    y += 4
+    real_repair = sum(1 for r in records if r.get("v9_is_real_repair"))
+    cover_count = sum(1 for r in records if r.get("v9_is_cover"))
+    d.text((pad, y), f"real_repair_rate: {real_repair}/{len(records)}  "
+           f"cover_rate: {cover_count}/{len(records)}  "
+           f"unique_methods: {len(by_route)}",
+           font=font_md, fill="#06a"); y += 22
+    y += 4
     d.text((pad, y), "Mask used:", font=font_md, fill="black"); y += 22
     for m, n in sorted(by_mask.items(), key=lambda kv: -kv[1]):
         d.text((pad + 16, y), f"{m:22s}{n:>4d}",
@@ -4437,10 +4483,13 @@ def write_compare_pdf(out_root, records) -> Path:
         st_color = {"clean_repaired": "#0a4", "clean_covered": "#b60",
                     "no_watermark": "#06a",
                     "failed_io": "#a00"}.get(r["status"], "#888")
+        v9_roi = r.get("v9_roi_class") or r.get("roi_class") or "?"
+        v9_fm = r.get("v9_final_method") or "?"
+        v9_mf = r.get("v9_method_family") or "?"
         d.text((pad, 32),
-               f"status={r['status'].upper()}   roi_class={r.get('roi_class','?')}"
-               f"   md={r.get('mark_box_density') or 0:.3f}"
-               f"   reason={r.get('reason') or '—'}",
+               f"status={r['status'].upper()}   roi_class={v9_roi}"
+               f"   method={v9_fm}"
+               f"   family={v9_mf}",
                font=font_sm, fill=st_color)
         atts = r.get("attempts") or []
         last_att = atts[-1] if atts else {}
@@ -4826,6 +4875,19 @@ def main():
     manual_review_count = sum(1 for r in records
                               if r["status"] not in STATUS_ORDER)
 
+    v9_method_dist = {}
+    v9_family_dist = {}
+    v9_roi_dist = {}
+    for r in records:
+        fm = r.get("v9_final_method", "?")
+        v9_method_dist[fm] = v9_method_dist.get(fm, 0) + 1
+        mf = r.get("v9_method_family", "?")
+        v9_family_dist[mf] = v9_family_dist.get(mf, 0) + 1
+        rc = r.get("v9_roi_class", "?")
+        v9_roi_dist[rc] = v9_roi_dist.get(rc, 0) + 1
+    real_repair = sum(1 for r in records if r.get("v9_is_real_repair"))
+    cover_count = sum(1 for r in records if r.get("v9_is_cover"))
+
     print()
     print(f"=== {PIPELINE_VERSION} complete ===")
     print(f"total:            {len(records)}")
@@ -4834,8 +4896,24 @@ def main():
     print(f"no_watermark:     {counts.get(ST_NO_WATERMARK, 0)}")
     print(f"failed_io:        {counts.get(ST_FAILED_IO, 0)}")
     print(f"manual-review:    0")
+    print(f"real_repair_rate: {real_repair}/{len(records)}")
+    print(f"cover_rate:       {cover_count}/{len(records)}")
+    print(f"unique_methods:   {len(v9_method_dist)}")
+    print(f"active_roi_classes: {len(v9_roi_dist)}")
     print(f"runtime:        {total_s:.1f}s "
           f"({(total_s*1000)/max(len(records),1):.0f} ms/img)")
+    print()
+    print("method family distribution:")
+    for mf, n in sorted(v9_family_dist.items(), key=lambda kv: -kv[1]):
+        print(f"  {mf:28s}{n:>4d}")
+    print()
+    print("V9 final method used:")
+    for fm, n in sorted(v9_method_dist.items(), key=lambda kv: -kv[1]):
+        print(f"  {fm:36s}{n:>4d}")
+    print()
+    print("V9 ROI class distribution:")
+    for rc, n in sorted(v9_roi_dist.items(), key=lambda kv: -kv[1]):
+        print(f"  {rc:28s}{n:>4d}")
     print()
     print("presence gate:")
     pg_counts = {}
