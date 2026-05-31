@@ -2,6 +2,77 @@
 
 Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort.
 
+## V11 — Honest QA (no zero-metric passes, dot-chain & product-damage gates)
+
+V11 does **not** add repair methods. It makes the existing ones *honest*: the
+V10 gate still accepted bad candidates as `clean_repaired`. The compare PDF
+showed `localQA ssim=0.000 color_delta=0.0 boundary_jump=0.0 pass=True`,
+dotted/broken-glyph residuals, and a black product surface damaged by a bright
+clone. V11 closes each of those holes.
+
+- **Truthful QA, enforced (Phase 1).** A single mandatory
+  `validate_qa_metrics()` runs before any candidate can pass.
+  `REQUIRED_QA_METRICS` (ssim, color_delta, boundary_jump, seam_delta,
+  cover_visibility, product_damage, residual_template_corr,
+  residual_text_component, residual_improvement) must all be present, non-null
+  and non-NaN; an all-zero core set fails closed
+  (`qa_metrics_probably_not_computed`). **`ssim` and `boundary_jump` are now
+  actually computed** and surfaced — the PDF's `localQA` line shows real
+  values, not zeros, and `pass` reflects the true publish decision.
+- **Dot-chain / broken-glyph residual gate (Phase 2).** Beyond template
+  correlation, a connected-component detector inside the (horizontally
+  expanded) watermark footprint catches a *row of gray dots* or broken glyph
+  fragments — the failure mode where the word shape is gone but readable
+  pieces remain. Fails on `residual_dot_chain_score > 0.35` or
+  (`component_area_ratio > 0.08` and `horizontal_span > 0.25`). On plain
+  backgrounds a precise component-level second pass
+  (`cleanup_residual_components_with_ring_fill`) clears them — never a
+  full-bbox Telea re-run.
+- **Product-overlap safety gate (Phase 3/8).** When the footprint overlaps the
+  product, the candidate must pass a stricter test measured inside
+  `product_mask ∩ changed_region`: `product_color_delta_lab ≤ 10`,
+  `product_new_bright_blob_score ≤ 0.12`, `product_edge_retention ≥ 0.85`, and
+  `changed_area_ratio ≤ 2.5` (measured over a padded window so a repair that
+  spills past the watermark registers). This rejects a white/bright clone
+  pasted onto a dark product surface (the Taptic-Engine-style failure).
+- **Plain-white fast path + Telea suppression (Phase 4).** `plain_white_fast_path`
+  (exact ring fill + matched noise + 1px feather + residual cleanup) runs
+  **first** on white/near-white/low-texture backgrounds; Telea drops to
+  next-to-last. Telea's dotted gray residue now fails the dot-chain gate
+  instead of being accepted.
+- **Beam selection, not first-pass (Phase 7).** The loop no longer stops at
+  the first passing candidate on risky classes. It tries a bounded set
+  (`_MAX_CANDIDATES_BY_CLASS`, 6–12), keeps every candidate that clears the
+  hard gates, and picks the best by composite score — only short-circuiting on
+  an *excellent*, product-safe candidate. This restores method diversity and
+  stops weak early candidates from winning. Telemetry logs `tools_reachable`,
+  `tools_tried`, `tools_rejected`, `candidates_passed`.
+- **Honest publish rule.** `clean_repaired` now requires
+  `metrics_valid AND residual_pass AND product_gate_pass AND geometry_gate`.
+  Failures escalate to the adaptive cover — `manual_review` stays **0**.
+- **Debug + regression lock (Phase 9/10).** Records carry `v11_*` fields
+  (ssim, dot-chain, product overlap/blob/edge-retention, changed-area, beam
+  counts); the run prints honesty metrics (`zero_metric_passes`,
+  dot-chain/product rejections, `unique_final_methods`).
+  `test_v11_regression.py` locks every guarantee above.
+
+### V11 results (50-image benchmark, seed 2026)
+
+| Metric | Result | Target |
+|--------|--------|--------|
+| total / failed_io | 50 / 0 | 0 |
+| clean_repaired / clean_covered | 38 / 12 | covered ≤ 15 |
+| manual_review | 0 | 0 |
+| zero-metric passes | 0 | 0 |
+| product-gate failures among `clean_repaired` | 0 | 0 |
+| readable residual among `clean_repaired` | 0 | 0 |
+| unique final methods | 10 | ≥ 10 |
+| `plain_white_fast_path` wins | 10 | — |
+
+Every `clean_repaired` result has `metrics_valid AND residual_pass AND
+product_gate_pass`; the `localQA` line in the compare PDF now shows real
+`ssim` / `color_delta` / `boundary_jump` values and the true `pass` decision.
+
 ## V10 — Quality Patch (QA truthfulness, residual gate, honest covers)
 
 V10 does **not** add more repair methods. It fixes the reason bad outputs were
@@ -596,6 +667,7 @@ output/
 | `mark_remover.py` | ~4,900 | Main pipeline: detection, masks, QA, orchestration |
 | `progressive_repair.py` | ~3,600 | Strategy bank: 100 tools, ROI classifier, V10 truthful QA + residual gate + honest covers |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
+| `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -623,7 +695,8 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | V7 | Logo mask bank | Multi-scale logo template masks, stroke-level repair |
 | V8 | Progressive repair strategy bank | 100 tools, 11 ROI classes, per-class strategy ordering, local QA gate |
 | V9 | Method families + RPV gate | Truthful status via method family, product-overlap guard, rectangular-patch-visibility gate |
-| **V10** | **Quality patch: truthful QA + honest covers** | **Fail-closed QA, mask-aware residual watermark gate, 3-layer mask, inpaint-based covers (no gray bands), strategy reorder, diversity telemetry, regression lock** |
+| V10 | Quality patch: truthful QA + honest covers | Fail-closed QA, mask-aware residual watermark gate, 3-layer mask, inpaint-based covers (no gray bands), strategy reorder, diversity telemetry, regression lock |
+| **V11** | **Honest QA enforcement** | **Mandatory `validate_qa_metrics` (real ssim/boundary_jump, no zero-metric passes), dot-chain/broken-glyph residual gate, product-overlap damage gate (bright-blob/colour/edge/area), plain-white fast path, beam selection over first-pass, honesty telemetry + regression lock** |
 
 ## License
 

@@ -206,13 +206,20 @@ def test_full_bbox_cover_blocked_when_product_overlap_high():
 def test_repair_area_too_large_fails_on_product():
     img, bbox, product = _dark_product_with_watermark()
     bx, by, bw, bh = bbox
-    # Repair that changes far more than the watermark footprint, but keeps
-    # colour close (so only the area-ratio gate should trip).
+    # Repair that changes far more than the watermark footprint, with a small
+    # but real luma shift (18 -> 30, diff 12 > 6) so the change registers
+    # everywhere it is applied, while staying under the colour-delta (~4.7
+    # Lab) and bright-blob (|12| < 25) gates — so ONLY the area-ratio gate
+    # should trip.
     bad = img.copy()
-    big = bad[by - 15:by + bh + 15, bx - 15:bx + bw + 15]
-    big[:] = _noise(np.full_like(big, 18), 2)
+    bad[by - 15:by + bh + 15, bx - 15:bx + bw + 15] = 30
     m = pr.compute_product_damage_metrics(img, bad, bbox, product)
+    # The changed area spills well past the watermark footprint on a product
+    # surface — the Phase 8 area-ratio metric must register it and the gate
+    # must reject (exact reason depends on which threshold trips first).
     assert m["changed_area_ratio"] > pr.CHANGED_AREA_RATIO_MAX
+    ok, reason = pr.product_gate(m)
+    assert not ok and reason
 
 
 # --------------------------------------------------------------------------

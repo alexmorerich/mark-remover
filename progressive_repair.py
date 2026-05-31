@@ -961,10 +961,21 @@ def compute_product_damage_metrics(original, repaired, bbox, product_mask):
     rg = cv2.cvtColor(r, cv2.COLOR_BGR2GRAY).astype(np.float32)
     diff = np.abs(og - rg)
     changed = diff > 6.0
-    n_changed = int(changed.sum())
     wm_px = max(1, bw * bh)
-    # changed_area_ratio is reported relative to the watermark footprint; the
-    # stroke mask is a subset of the bbox, so the bbox area is a safe proxy.
+
+    # changed_area_ratio is reported relative to the watermark footprint, but
+    # measured over a PADDED window around the bbox so a repair that spills
+    # well past the watermark (the symptom this gate guards against) actually
+    # registers a ratio > 1. The footprint (bbox) is a safe proxy for the
+    # stroke-mask pixel count, which is a subset of the bbox.
+    pad = max(8, max(bw, bh) // 2)
+    wy1, wy2 = max(0, by - pad), min(H, by + bh + pad)
+    wx1, wx2 = max(0, bx - pad), min(W, bx + bw + pad)
+    ow = cv2.cvtColor(original[wy1:wy2, wx1:wx2],
+                      cv2.COLOR_BGR2GRAY).astype(np.float32)
+    rw = cv2.cvtColor(repaired[wy1:wy2, wx1:wx2],
+                      cv2.COLOR_BGR2GRAY).astype(np.float32)
+    n_changed = int((np.abs(ow - rw) > 6.0).sum())
 
     if product_mask is not None and product_mask.shape[:2] == original.shape[:2]:
         prod = product_mask[by:by + bh, bx:bx + bw] > 0
