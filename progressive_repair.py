@@ -50,6 +50,7 @@ _TOOL_FAMILY_MAP = {
     "clone_best_of_4_dirs": MethodFamily.REAL_PIXEL_CLONE,
     "clone_best_of_8_dirs": MethodFamily.REAL_PIXEL_CLONE,
     "white_median_fill": MethodFamily.STATISTICAL_FILL,
+    "plain_white_fast_path": MethodFamily.STATISTICAL_FILL,
     "white_patch_with_noise": MethodFamily.STATISTICAL_FILL,
     "corner_background_clone": MethodFamily.REAL_PIXEL_CLONE,
     "canvas_margin_clone": MethodFamily.REAL_PIXEL_CLONE,
@@ -215,6 +216,21 @@ class QAResult:
     residual_improvement: float = 1.0
     cover_rectangularity: float = 0.0
     cover_luma_delta: float = 0.0
+    # V11 additions
+    ssim_score: float = 1.0
+    boundary_jump: float = 0.0
+    metrics_invalid_reasons: list = field(default_factory=list)
+    residual_dot_chain_score: float = 0.0
+    residual_component_area_ratio: float = 0.0
+    residual_component_horizontal_span: float = 0.0
+    residual_component_count: int = 0
+    product_overlap: float = 0.0
+    product_color_delta_lab: float = 0.0
+    product_new_bright_blob_score: float = 0.0
+    product_edge_retention: float = 1.0
+    product_gate_pass: bool = True
+    product_gate_reason: str = ""
+    changed_area_ratio: float = 0.0
 
 
 @dataclass
@@ -245,6 +261,60 @@ COLOR_DELTA_MAX = 12.0
 STRICT_CLASSES = {"complex_product_detail", "thin_flex_cable",
                   "text_or_label_area", "mixed_background_product"}
 LOOSE_CLASSES = {"plain_white", "near_white", "low_texture_background"}
+
+PLAIN_BG_CLASSES = {"plain_white", "near_white", "low_texture_background"}
+
+
+# ---------------------------------------------------------------------------
+# V11 Phase 1 — mandatory QA-metric validation (fail closed)
+# ---------------------------------------------------------------------------
+
+REQUIRED_QA_METRICS = [
+    "ssim",
+    "color_delta",
+    "boundary_jump",
+    "seam_delta",
+    "cover_visibility",
+    "product_damage",
+    "residual_template_corr",
+    "residual_text_component",
+    "residual_improvement",
+]
+
+# The subset whose simultaneous all-zero state is the tell-tale sign that the
+# QA stage never actually executed (a degenerate / empty ROI).
+_QA_CORE_METRICS = [
+    "ssim", "color_delta", "boundary_jump", "seam_delta",
+    "cover_visibility", "product_damage",
+]
+
+
+def validate_qa_metrics(qa: dict) -> tuple[bool, list]:
+    """V11 Phase 1. A candidate may only pass when every required metric was
+    actually computed. Missing / null / NaN metrics fail closed, and an
+    all-zero core set is treated as 'metrics were never computed'."""
+    reasons = []
+
+    for key in REQUIRED_QA_METRICS:
+        if key not in qa:
+            reasons.append(f"missing_required_qa_metric:{key}")
+        elif qa[key] is None:
+            reasons.append(f"null_required_qa_metric:{key}")
+        elif isinstance(qa[key], float) and math.isnan(qa[key]):
+            reasons.append(f"nan_required_qa_metric:{key}")
+
+    core_values = [qa.get(k) for k in _QA_CORE_METRICS]
+    numeric_core = [v for v in core_values
+                    if isinstance(v, (int, float)) and not
+                    (isinstance(v, float) and math.isnan(v))]
+
+    if len(numeric_core) == 0:
+        reasons.append("qa_metrics_not_computed")
+
+    if len(numeric_core) > 0 and all(abs(v) < 1e-9 for v in numeric_core):
+        reasons.append("qa_metrics_probably_not_computed")
+
+    return len(reasons) == 0, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +634,100 @@ class ResidualResult:
     gray_delta_stroke_score: float
     improvement_ratio: float
     passed: bool
+    # V11 Phase 2 — broken-glyph / dotted residual detection
+    dot_chain_score: float = 0.0
+    component_count: int = 0
+    component_area_ratio: float = 0.0
+    component_horizontal_span: float = 0.0
+    failure_reason: str = ""
+
+
+# V11 Phase 2 — residual component thresholds (fail if exceeded).
+RESIDUAL_DOT_CHAIN_MAX = 0.35
+RESIDUAL_COMPONENT_AREA_MAX = 0.08
+RESIDUAL_COMPONENT_SPAN_MAX = 0.25
+
+
+def detect_residual_components(clean_gray, sel_mask, base_mean, base_std):
+    """V11 Phase 2 — detect leftover broken-glyph / dotted residuals inside
+    the (horizontally expanded) watermark footprint. Catches the case where
+    the full word shape is gone but a row of gray dots / glyph fragments
+    remains, which template correlation alone misses.
+
+    Returns (dot_chain_score, component_count, area_ratio, horizontal_span).
+    """
+    if clean_gray is None or sel_mask is None or clean_gray.size == 0:
+        return 0.0, 0, 0.0, 0.0
+    sel = sel_mask > 0
+    n_sel = int(sel.sum())
+    if n_sel < 12:
+        return 0.0, 0, 0.0, 0.0
+
+    cg = clean_gray.astype(np.float32)
+    hp = np.abs(cg - cv2.GaussianBlur(cg, (0, 0), sigmaX=2.0))
+    # Only pixels meaningfully above the surrounding surface baseline.
+    thr = max(8.0, base_mean + 2.0 * base_std)
+    fg = ((hp > thr) & sel).astype(np.uint8) * 255
+    if int(fg.sum()) == 0:
+        return 0.0, 0, 0.0, 0.0
+
+    nlab, _, stats, cents = cv2.connectedComponentsWithStats(fg)
+    h_roi, w_roi = clean_gray.shape[:2]
+    glyph_like = []
+    total_area = 0
+    for i in range(1, nlab):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        w_ = int(stats[i, cv2.CC_STAT_WIDTH])
+        h_ = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if a < 2:
+            continue
+        # glyph fragment: small, not a full-ROI blob
+        if a <= 0.20 * w_roi * h_roi and h_ <= max(6, h_roi):
+            glyph_like.append((float(cents[i][0]), float(cents[i][1]),
+                               a, w_))
+            total_area += a
+
+    comp_count = len(glyph_like)
+    area_ratio = float(total_area) / max(1, n_sel)
+    if comp_count == 0:
+        return 0.0, 0, area_ratio, 0.0
+
+    xs = sorted(c[0] for c in glyph_like)
+    ys = [c[1] for c in glyph_like]
+    h_span = (xs[-1] - xs[0]) / max(1.0, w_roi)
+
+    # Horizontal chain: several similar-y fragments spread across the band.
+    dot_chain = 0.0
+    if comp_count >= 3:
+        y_med = float(np.median(ys))
+        y_tol = max(2.0, 0.30 * h_roi)
+        aligned = sum(1 for y in ys if abs(y - y_med) <= y_tol)
+        align_frac = aligned / comp_count
+        count_term = min(1.0, comp_count / 6.0)
+        span_term = min(1.0, h_span / 0.5)
+        dot_chain = _clamp01(0.45 * align_frac + 0.30 * span_term +
+                             0.25 * count_term)
+    return float(dot_chain), comp_count, float(area_ratio), float(h_span)
+
+
+def cleanup_residual_components_with_ring_fill(cleaned, bbox, comp_mask,
+                                               ring_bgr_median):
+    """V11 Phase 4 — precise second-pass cleanup of residual dot/glyph
+    fragments on plain backgrounds: paint just the residual components with
+    the ring background colour + a light feather. NOT a full-bbox re-inpaint.
+    """
+    if comp_mask is None or not np.any(comp_mask > 0):
+        return cleaned
+    out = cleaned.copy()
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    m = cv2.dilate((comp_mask > 0).astype(np.uint8), k, iterations=1)
+    sel = m > 0
+    out[sel] = ring_bgr_median
+    blurred = cv2.GaussianBlur(out, (3, 3), 0)
+    edge = cv2.dilate(m, k, iterations=1) - m
+    esel = edge > 0
+    out[esel] = blurred[esel]
+    return out
 
 
 _CANONICAL_TEMPLATE = None
@@ -719,22 +883,140 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
     gray_delta_stroke = min(1.0, ce / 8.0)
     ocr_conf = 0.0  # OCR not available in this environment; treated as pass.
 
+    # V11 Phase 2 — broken-glyph / dotted residual detection inside the
+    # measured footprint, relative to the surrounding surface baseline.
+    if use_mask:
+        comp_sel = (mask_roi > 0).astype(np.uint8) * 255
+    else:
+        comp_sel = np.ones_like(clean_gray, np.uint8) * 255
+    dot_chain, comp_count, comp_area, comp_span = detect_residual_components(
+        clean_gray, comp_sel, base_mean, base_std)
+
     # Waive the improvement ratio only when the original carried essentially
     # NO watermark structure at the measured locations (nothing to remove).
     nothing_to_remove = (orig_corr <= 0.10 and oe < 4.0)
     improvement_ok = (improvement >= RESIDUAL_IMPROVEMENT_MIN or
                       nothing_to_remove)
 
-    passed = (clean_corr <= RESIDUAL_TEMPLATE_CORR_MAX and
-              ocr_conf <= RESIDUAL_OCR_CONF_MAX and
-              text_component <= RESIDUAL_TEXT_COMPONENT_MAX and
-              improvement_ok)
+    failure_reason = ""
+    if clean_corr > RESIDUAL_TEMPLATE_CORR_MAX:
+        failure_reason = "residual_template_corr_too_high"
+    elif text_component > RESIDUAL_TEXT_COMPONENT_MAX:
+        failure_reason = "residual_text_component_too_high"
+    elif dot_chain > RESIDUAL_DOT_CHAIN_MAX:
+        failure_reason = "residual_dot_chain_visible"
+    elif (comp_area > RESIDUAL_COMPONENT_AREA_MAX and
+          comp_span > RESIDUAL_COMPONENT_SPAN_MAX):
+        failure_reason = "broken_glyph_residual_visible"
+    elif not improvement_ok:
+        failure_reason = "insufficient_watermark_improvement"
+
+    passed = (failure_reason == "" and ocr_conf <= RESIDUAL_OCR_CONF_MAX)
 
     return ResidualResult(
         template_corr=round(clean_corr, 4), ocr_conf=round(ocr_conf, 4),
         text_component_score=round(text_component, 4),
         gray_delta_stroke_score=round(gray_delta_stroke, 4),
-        improvement_ratio=round(improvement, 4), passed=passed)
+        improvement_ratio=round(improvement, 4), passed=passed,
+        dot_chain_score=round(dot_chain, 4), component_count=comp_count,
+        component_area_ratio=round(comp_area, 4),
+        component_horizontal_span=round(comp_span, 4),
+        failure_reason=failure_reason)
+
+
+# V11 Phase 3 — product-overlap safety thresholds.
+PRODUCT_OVERLAP_GATE_MIN = 0.15
+PRODUCT_COLOR_DELTA_MAX = 10.0
+PRODUCT_NEW_BRIGHT_BLOB_MAX = 0.12
+PRODUCT_EDGE_RETENTION_MIN = 0.85
+CHANGED_AREA_RATIO_MAX = 2.5
+
+
+def compute_product_damage_metrics(original, repaired, bbox, product_mask):
+    """V11 Phase 3/8 — when the watermark footprint overlaps the product, the
+    repair must not damage the product surface (no bright/dark blob on a dark
+    part, no large colour/texture/edge change). Measured inside
+    product_mask ∩ changed_region.
+
+    Returns a dict of metrics + product_overlap + changed_area_ratio.
+    """
+    bx, by, bw, bh = bbox
+    H, W = original.shape[:2]
+    out = {
+        "product_overlap": 0.0,
+        "product_color_delta_lab": 0.0,
+        "product_new_bright_blob_score": 0.0,
+        "product_edge_retention": 1.0,
+        "changed_area_ratio": 0.0,
+    }
+    if bw <= 1 or bh <= 1:
+        return out
+
+    o = original[by:by + bh, bx:bx + bw]
+    r = repaired[by:by + bh, bx:bx + bw]
+    if o.shape != r.shape or o.size == 0:
+        return out
+
+    og = cv2.cvtColor(o, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    rg = cv2.cvtColor(r, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    diff = np.abs(og - rg)
+    changed = diff > 6.0
+    n_changed = int(changed.sum())
+    wm_px = max(1, bw * bh)
+    # changed_area_ratio is reported relative to the watermark footprint; the
+    # stroke mask is a subset of the bbox, so the bbox area is a safe proxy.
+
+    if product_mask is not None and product_mask.shape[:2] == original.shape[:2]:
+        prod = product_mask[by:by + bh, bx:bx + bw] > 0
+        out["product_overlap"] = float(prod.mean())
+        region = prod & changed
+        n_region = int(region.sum())
+        if n_region >= 8:
+            o_lab = cv2.cvtColor(o, cv2.COLOR_BGR2LAB).astype(np.float32)
+            r_lab = cv2.cvtColor(r, cv2.COLOR_BGR2LAB).astype(np.float32)
+            d_lab = np.linalg.norm(o_lab - r_lab, axis=2)
+            out["product_color_delta_lab"] = float(d_lab[region].mean())
+
+            # new bright/dark blob: large signed luma change forming a blob
+            signed = rg - og
+            blob = (np.abs(signed) > 25) & prod
+            blob_u8 = blob.astype(np.uint8) * 255
+            if int(blob_u8.sum()) > 0:
+                nlab, _, stats, _ = cv2.connectedComponentsWithStats(blob_u8)
+                biggest = 0
+                for i in range(1, nlab):
+                    biggest = max(biggest, int(stats[i, cv2.CC_STAT_AREA]))
+                out["product_new_bright_blob_score"] = float(
+                    biggest) / max(1, int(prod.sum()))
+
+            eo = cv2.Canny(o, 50, 150) > 0
+            er = cv2.Canny(r, 50, 150) > 0
+            eo_p = int((eo & prod).sum())
+            if eo_p > 0:
+                retained = int((eo & er & prod).sum())
+                out["product_edge_retention"] = float(retained) / eo_p
+
+    out["changed_area_ratio"] = float(n_changed) / wm_px
+    return out
+
+
+def product_gate(metrics):
+    """V11 Phase 3 — hard rejection rules for product-overlap cases."""
+    ov = metrics.get("product_overlap", 0.0)
+    reason = ""
+    if ov > PRODUCT_OVERLAP_GATE_MIN:
+        if metrics.get("product_color_delta_lab", 0.0) > PRODUCT_COLOR_DELTA_MAX:
+            reason = "product_color_delta_too_high"
+        elif metrics.get("product_new_bright_blob_score",
+                         0.0) > PRODUCT_NEW_BRIGHT_BLOB_MAX:
+            reason = "new_bright_blob_on_product"
+        elif metrics.get("product_edge_retention",
+                         1.0) < PRODUCT_EDGE_RETENTION_MIN:
+            reason = "product_edge_loss"
+    if (not reason and ov > 0.10 and
+            metrics.get("changed_area_ratio", 0.0) > CHANGED_AREA_RATIO_MAX):
+        reason = "repair_area_too_large_for_product_overlap"
+    return reason == "", reason
 
 
 def _border_edge_box_score(gray, bbox):
@@ -1209,6 +1491,18 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
     # 10. Cover rectangularity (V10 Patch 4) — never a visible band.
     cover_m = compute_cover_metrics(repaired, bbox)
 
+    # 11. SSIM + raw boundary jump (V11 — real, named QA metrics).
+    if roi_o.size > 0 and roi_r.size > 0:
+        ssim_score = _ssim_local(roi_o, roi_r)
+    else:
+        ssim_score = 1.0
+    boundary_jump = round(seam * 255.0, 2)
+
+    # 12. Product-overlap safety metrics (V11 Phase 3/8).
+    prod_m = compute_product_damage_metrics(image, repaired, bbox,
+                                            ctx.product_mask)
+    product_gate_pass, product_gate_reason = product_gate(prod_m)
+
     # Final composite score (lower = better)
     final = (2.0 * wm_residual + 2.0 * cover_vis + 2.5 * seam +
              1.5 * prod_damage + 0.5 * (1.0 - tex_consist) +
@@ -1235,10 +1529,20 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         sd_max *= 0.8
         rpv_max *= 0.8
 
-    # Patch 1 — impossible-pass guard: all core metrics exactly zero means
-    # they were not actually computed (degenerate/empty ROI). Fail closed.
-    metrics_valid = not (wm_residual == 0.0 and cover_vis == 0.0 and
-                         seam == 0.0 and color_d == 0.0)
+    # V11 Phase 1 — mandatory QA-metric validation. Every required metric
+    # must be actually computed; all-zero core set fails closed.
+    qa_metrics = {
+        "ssim": ssim_score,
+        "color_delta": color_d,
+        "boundary_jump": boundary_jump,
+        "seam_delta": seam,
+        "cover_visibility": cover_vis,
+        "product_damage": prod_damage,
+        "residual_template_corr": residual.template_corr,
+        "residual_text_component": residual.text_component_score,
+        "residual_improvement": residual.improvement_ratio,
+    }
+    metrics_valid, metrics_invalid_reasons = validate_qa_metrics(qa_metrics)
 
     # In-ROI edge loss IS the watermark being removed on flat/simple
     # backgrounds — only treat it as damage where the ROI may hold real
@@ -1275,12 +1579,16 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
                      edge_gate <= ed_max and
                      rpv_gate <= rpv_max)
 
-    passed = (metrics_valid and residual.passed and geometry_pass)
+    passed = (metrics_valid and residual.passed and product_gate_pass and
+              geometry_pass)
 
     if not metrics_valid:
-        reason = "qa_metrics_probably_not_computed"
+        reason = (metrics_invalid_reasons[0] if metrics_invalid_reasons
+                  else "qa_metrics_probably_not_computed")
     elif not residual.passed:
-        reason = "readable_residual_watermark"
+        reason = residual.failure_reason or "readable_residual_watermark"
+    elif not product_gate_pass:
+        reason = product_gate_reason or "product_damage"
     elif geometry_pass:
         reason = "accepted"
     else:
@@ -1309,7 +1617,21 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         residual_text_component=residual.text_component_score,
         residual_improvement=residual.improvement_ratio,
         cover_rectangularity=cover_m["cover_rectangularity"],
-        cover_luma_delta=cover_m["cover_luma_delta"])
+        cover_luma_delta=cover_m["cover_luma_delta"],
+        ssim_score=round(ssim_score, 4), boundary_jump=boundary_jump,
+        metrics_invalid_reasons=metrics_invalid_reasons,
+        residual_dot_chain_score=residual.dot_chain_score,
+        residual_component_area_ratio=residual.component_area_ratio,
+        residual_component_horizontal_span=residual.component_horizontal_span,
+        residual_component_count=residual.component_count,
+        product_overlap=round(prod_m["product_overlap"], 4),
+        product_color_delta_lab=round(prod_m["product_color_delta_lab"], 3),
+        product_new_bright_blob_score=round(
+            prod_m["product_new_bright_blob_score"], 4),
+        product_edge_retention=round(prod_m["product_edge_retention"], 4),
+        product_gate_pass=product_gate_pass,
+        product_gate_reason=product_gate_reason,
+        changed_area_ratio=round(prod_m["changed_area_ratio"], 4))
 
 
 def _qa_fail_reason(wm, wm_max, cv, cv_max, sd, sd_max, pd, pd_max,
@@ -1589,6 +1911,57 @@ class WhiteMedianFill(RepairTool):
         out[by:by + bh, bx:bx + bw] = fill
         out = _feather_blend(ctx.image, out, ctx.watermark_bbox, 5)
         return RepairCandidate(self.name, out)
+
+
+class PlainWhiteFastPath(RepairTool):
+    """V11 Phase 4 — on pure/near-white, low-texture, non-product backgrounds
+    the safest repair is an exact background fill (ring colour + matched
+    noise, 1px feather) rather than Telea, which leaves dotted gray residue.
+    A precise residual-component second pass removes any leftover fragments.
+    """
+    name = "plain_white_fast_path"
+    cost = 1
+    risk = 1
+
+    def is_applicable(self, ctx):
+        roi = ctx.roi_analysis
+        if roi.roi_class not in PLAIN_BG_CLASSES:
+            return False
+        return (roi.white_pixel_ratio > 0.80 and roi.edge_density < 0.05 and
+                roi.product_pixel_ratio < 0.10)
+
+    def apply(self, ctx):
+        if not self.is_applicable(ctx):
+            return None
+        bx, by, bw, bh = ctx.watermark_bbox
+        ring_med, sigma = _ring_stats(ctx.image, ctx.watermark_bbox)
+        result = ctx.image.copy()
+        patch = np.full((bh, bw, 3), ring_med, dtype=np.uint8)
+        patch = _add_noise(patch, max(1.0, sigma))
+        result[by:by + bh, bx:bx + bw] = patch
+        result = _feather_blend(ctx.image, result, ctx.watermark_bbox,
+                                feather_px=1)
+
+        # Second pass — clear any residual dot/glyph fragments precisely.
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)[by:by + bh, bx:bx + bw]
+        ring_mask, _ = _get_ring(ctx.image, ctx.watermark_bbox, 0.5)
+        rg = cv2.cvtColor(ctx.image, cv2.COLOR_BGR2GRAY)[ring_mask]
+        if rg.size > 0:
+            rhp = np.abs(rg.astype(np.float32) - float(rg.mean()))
+            base_mean, base_std = float(rhp.mean()), float(rhp.std())
+            full = np.ones_like(gray, np.uint8) * 255
+            dot, _c, _a, _s = detect_residual_components(
+                gray, full, base_mean, base_std)
+            if dot > 0.0:
+                cg = gray.astype(np.float32)
+                hp = np.abs(cg - cv2.GaussianBlur(cg, (0, 0), sigmaX=2.0))
+                thr = max(8.0, base_mean + 2.0 * base_std)
+                comp = (hp > thr).astype(np.uint8) * 255
+                sub = result[by:by + bh, bx:bx + bw]
+                sub = cleanup_residual_components_with_ring_fill(
+                    sub, (0, 0, bw, bh), comp, ring_med)
+                result[by:by + bh, bx:bx + bw] = sub
+        return RepairCandidate(self.name, result)
 
 
 class WhitePatchWithNoise(RepairTool):
@@ -3701,6 +4074,7 @@ ALL_TOOLS: list[RepairTool] = [
     # Group A (1-21)
     CloneAbovePatch(), CloneBelowPatch(), CloneLeftPatch(), CloneRightPatch(),
     CloneBestOf4Dirs(), CloneBestOf8Dirs(), WhiteMedianFill(),
+    PlainWhiteFastPath(),
     WhitePatchWithNoise(), CornerBackgroundClone(), CanvasMarginClone(),
     RingMedianFill(), RingMeanFill(), RingModeFill(),
     LocalNoiseTransferFill(), JpegTextureCloneFill(), MicroTileWhiteClone(),
@@ -3754,22 +4128,25 @@ STRATEGY_BANK_BY_CLASS = {
     # V10 Patch 5 — real pixels (clone) and statistical/gradient fills run
     # BEFORE stroke/logo repair on low-risk backgrounds.
     "plain_white": [
-        "clone_best_of_8_dirs", "white_median_fill", "ring_median_fill",
+        "plain_white_fast_path",
+        "ring_median_fill", "white_median_fill", "clone_best_of_8_dirs",
         "hard_paste_white_clone", "seam_scored_white_clone",
-        "plain_white_direct_neighbor_clone_v2",
+        "plain_white_direct_neighbor_clone_v2", "surface_gradient_fill",
         "alpha_template_logo_mask", "logo_mask_plus_clone_fill",
         "stroke_only_mask_inpaint", "opencv_telea_inpaint",
         "final_adaptive_cover",
     ],
     "near_white": [
-        "clone_best_of_8_dirs", "white_median_fill", "ring_median_fill",
+        "plain_white_fast_path",
+        "ring_median_fill", "white_median_fill", "clone_best_of_8_dirs",
         "seam_scored_white_clone", "surface_gradient_fill",
         "alpha_template_logo_mask", "logo_mask_plus_clone_fill",
         "stroke_only_mask_inpaint", "opencv_telea_inpaint",
         "final_adaptive_cover",
     ],
     "low_texture_background": [
-        "clone_best_of_8_dirs", "ring_median_fill",
+        "plain_white_fast_path",
+        "ring_median_fill", "clone_best_of_8_dirs",
         "surface_plane_fill", "surface_gradient_fill",
         "logo_mask_plus_surface_fill", "stroke_only_mask_inpaint",
         "opencv_telea_inpaint", "lama_stroke_mask",
@@ -3877,6 +4254,27 @@ def select_tools_for_roi(ctx: RepairContext) -> list[RepairTool]:
 # Progressive Repair Loop
 # ============================================================================
 
+# V11 Phase 7 — beam-search budget per ROI class (number of tools to try
+# before selecting the best passing candidate).
+_MAX_CANDIDATES_BY_CLASS = {
+    "plain_white": 6,
+    "near_white": 6,
+    "low_texture_background": 8,
+    "metallic_or_reflective": 10,
+    "transparent_or_glossy": 10,
+    "glass_or_gradient": 10,
+    "simple_product_surface": 10,
+    "dark_product_surface": 10,
+    "complex_product_detail": 12,
+    "thin_flex_cable": 12,
+    "mixed_background_product": 12,
+    "text_or_label_area": 10,
+    "unknown": 10,
+}
+# A passing candidate this good (and product-safe) is accepted immediately.
+_EXCELLENT_SCORE = 0.9
+
+
 def _check_product_overlap_guard(ctx):
     bx, by, bw, bh = ctx.watermark_bbox
     if ctx.product_mask is None:
@@ -3937,6 +4335,16 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
     tools_attempted = 0
     qa_reject_reasons = {}
 
+    # V11 Phase 7 — beam selection. Do NOT stop at the first passing
+    # candidate on risky classes; try a bounded set of tools, keep every
+    # candidate that clears the hard gates, and pick the best by composite
+    # score. Only first-pass early-exit on an "excellent", product-safe
+    # candidate.
+    passed_candidates = []  # (final_score, idx, tool_name, family, candidate, qa)
+    tools_reachable = len(tools)
+    max_try = _MAX_CANDIDATES_BY_CLASS.get(
+        ctx.roi_analysis.roi_class, 10)
+
     for tool in tools:
         if tool.name == "final_adaptive_cover":
             continue
@@ -3982,29 +4390,50 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
             "runtime_s": dt})
 
         if qa.passed:
-            # Patch 7/8 — a genuinely passing repair (residual + geometry +
-            # valid metrics) is the single source of truth.
             candidate.metadata["qa"] = asdict(qa)
-            candidate.metadata["final_method"] = tool.name
-            candidate.metadata["method_family"] = family.value
-            candidate.metadata["is_real_repair"] = (
-                family != MethodFamily.ADAPTIVE_COVER)
-            candidate.metadata["telemetry"] = {
-                "roi_class": ctx.roi_analysis.roi_class,
-                "strategy_list": strategy_list,
-                "tools_attempted": tools_attempted,
-                "families_attempted": sorted(families_attempted),
-                "final_method": tool.name,
-                "qa_reject_reasons": qa_reject_reasons,
-            }
-            return candidate, trace
+            passed_candidates.append(
+                (qa.final_score, len(passed_candidates), tool.name,
+                 family, candidate, qa))
+            # Excellent + product-safe → accept immediately (early exit).
+            excellent = (qa.final_score <= _EXCELLENT_SCORE and
+                         qa.residual_pass and qa.product_gate_pass and
+                         qa.product_overlap <= 0.05)
+            if excellent:
+                break
+        else:
+            qa_reject_reasons[tool.name] = qa.reason
+            if qa.final_score < best_failed_score:
+                best_failed_score = qa.final_score
+                best_failed_candidate = candidate
+                best_failed_candidate.metadata["qa"] = asdict(qa)
+                best_failed_tool = tool.name
 
-        qa_reject_reasons[tool.name] = qa.reason
-        if qa.final_score < best_failed_score:
-            best_failed_score = qa.final_score
-            best_failed_candidate = candidate
-            best_failed_candidate.metadata["qa"] = asdict(qa)
-            best_failed_tool = tool.name
+        # Beam budget: stop after exploring max_try real attempts.
+        if tools_attempted >= max_try:
+            break
+
+    # V11 Phase 7 — pick the best passing candidate (lowest composite score).
+    if passed_candidates:
+        passed_candidates.sort(key=lambda c: c[0])
+        _, _, win_name, win_family, win_cand, win_qa = passed_candidates[0]
+        win_cand.metadata["qa"] = asdict(win_qa)
+        win_cand.metadata["final_method"] = win_name
+        win_cand.metadata["method_family"] = win_family.value
+        win_cand.metadata["is_real_repair"] = (
+            win_family != MethodFamily.ADAPTIVE_COVER)
+        win_cand.metadata["telemetry"] = {
+            "roi_class": ctx.roi_analysis.roi_class,
+            "strategy_list": strategy_list,
+            "tools_reachable": tools_reachable,
+            "tools_tried": tools_attempted,
+            "tools_rejected": len(qa_reject_reasons),
+            "candidates_passed": len(passed_candidates),
+            "tools_attempted": tools_attempted,
+            "families_attempted": sorted(families_attempted),
+            "final_method": win_name,
+            "qa_reject_reasons": qa_reject_reasons,
+        }
+        return win_cand, trace
 
     # No repair passed the truthful gate. Fall back to adaptive cover, which
     # already self-checks the rectangularity gate (Patch 4).

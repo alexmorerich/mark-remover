@@ -3851,6 +3851,33 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     is_cover = method_family == MethodFamily.ADAPTIVE_COVER.value
     status = ST_CLEAN_COVERED if is_cover else ST_CLEAN_REPAIRED
 
+    def _qa_local_view(q):
+        # V11 — surface the real, computed QA metrics in the trace/PDF so a
+        # passing repair never shows ssim=0 color_delta=0 boundary_jump=0.
+        if not q:
+            return {"pass": False}
+        return {
+            "ssim": q.get("ssim_score"),
+            "color_delta": q.get("color_delta_score"),
+            "boundary_jump": q.get("boundary_jump"),
+            "seam_delta": q.get("seam_delta_score"),
+            "metrics_valid": q.get("metrics_valid"),
+            "pass": bool(q.get("passed")),
+        }
+
+    def _qa_water_view(q):
+        if not q:
+            return {"pass": False}
+        return {
+            "pass": bool(q.get("residual_pass")),
+            "template": {"tier": f"corr={q.get('residual_template_corr', 0):.3f}"},
+            "secondary": {"edge_score": q.get("residual_template_corr", 0.0)},
+            "edge": {"boundary_jump": q.get("boundary_jump", 0.0),
+                     "inside_edge": q.get("residual_text_component", 0.0)},
+            "dot_chain": q.get("residual_dot_chain_score", 0.0),
+            "product_gate_pass": q.get("product_gate_pass", True),
+        }
+
     attempts = [{
         "label": t.get("tool", "unknown"),
         "method": t.get("tool", "unknown"),
@@ -3858,14 +3885,16 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
         "runtime_s": t.get("runtime_s", 0.0),
         "over_budget": False,
         "error": None if t.get("reason") != "error" else t.get("reason"),
-        "qa_water": {"pass": t.get("passed", False)},
-        "qa_local": {"pass": t.get("passed", False)},
+        "qa_water": _qa_water_view(t.get("qa")),
+        "qa_local": _qa_local_view(t.get("qa")),
     } for t in trace]
 
     rec = _mk_record(path, det, status=status, reason=None,
                      roi_class=roi_class, features=features,
                      mark_box_density=orig_md, attempts=attempts,
-                     masks_info=masks_info, overlap=overlap)
+                     masks_info=masks_info, overlap=overlap,
+                     qa_local=_qa_local_view(qa_info),
+                     qa_water=_qa_water_view(qa_info))
     rec["repair_qa_pass"] = not is_cover
     rec["v9_final_method"] = final_method
     rec["v9_method_family"] = method_family
@@ -3886,6 +3915,21 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["v10_families_attempted"] = telemetry.get("families_attempted")
     rec["v10_tools_attempted"] = telemetry.get("tools_attempted")
     rec["v10_qa_reject_reasons"] = telemetry.get("qa_reject_reasons")
+    # V11 telemetry
+    rec["v11_ssim"] = qa_info.get("ssim_score")
+    rec["v11_boundary_jump"] = qa_info.get("boundary_jump")
+    rec["v11_metrics_invalid_reasons"] = qa_info.get("metrics_invalid_reasons")
+    rec["v11_residual_dot_chain_score"] = qa_info.get("residual_dot_chain_score")
+    rec["v11_product_overlap"] = qa_info.get("product_overlap")
+    rec["v11_product_color_delta_lab"] = qa_info.get("product_color_delta_lab")
+    rec["v11_product_new_bright_blob_score"] = qa_info.get(
+        "product_new_bright_blob_score")
+    rec["v11_product_edge_retention"] = qa_info.get("product_edge_retention")
+    rec["v11_product_gate_pass"] = qa_info.get("product_gate_pass")
+    rec["v11_changed_area_ratio"] = qa_info.get("changed_area_ratio")
+    rec["v11_tools_reachable"] = telemetry.get("tools_reachable")
+    rec["v11_tools_tried"] = telemetry.get("tools_tried")
+    rec["v11_candidates_passed"] = telemetry.get("candidates_passed")
     rec["repair_qa_pass"] = (not is_cover) and bool(qa_info.get("residual_pass")) \
         and bool(qa_info.get("metrics_valid"))
 
