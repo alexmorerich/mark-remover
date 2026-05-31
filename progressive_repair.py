@@ -276,8 +276,8 @@ PLAIN_BG_CLASSES = {"plain_white", "near_white", "low_texture_background"}
 
 # V12 — schema versions surfaced in every report so a run can never claim a
 # different version than the code that produced it.
-QA_SCHEMA_VERSION = "v12"
-STRATEGY_SCHEMA_VERSION = "v12"
+QA_SCHEMA_VERSION = "v13"
+STRATEGY_SCHEMA_VERSION = "v13"
 
 # V12 Phase F — tool families that must NEVER fire on a dark product surface
 # or a thin flex cable (a white/median/plain fill there leaves a bright block).

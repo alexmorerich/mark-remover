@@ -214,19 +214,19 @@ def test_white_fill_banned_on_dark_and_flex():
 # --------------------------------------------------------------------------
 
 def test_version_string_is_v12():
-    assert mr.PIPELINE_VERSION == "V12_VISUAL_TRUTHFULNESS"
+    assert mr.PIPELINE_VERSION == "V13_FINAL_VISUAL_FIDELITY"
 
 
 def test_schema_versions_are_v12():
-    assert pr.QA_SCHEMA_VERSION == "v12"
-    assert pr.STRATEGY_SCHEMA_VERSION == "v12"
+    assert pr.QA_SCHEMA_VERSION == "v13"
+    assert pr.STRATEGY_SCHEMA_VERSION == "v13"
 
 
 def test_run_metadata_carries_version():
     meta = mr.run_metadata(2026)
-    assert meta["version"] == "V12_VISUAL_TRUTHFULNESS"
-    assert meta["qa_schema_version"] == "v12"
-    assert meta["strategy_schema_version"] == "v12"
+    assert meta["version"] == "V13_FINAL_VISUAL_FIDELITY"
+    assert meta["qa_schema_version"] == "v13"
+    assert meta["strategy_schema_version"] == "v13"
     assert meta["run_seed"] == 2026
 
 

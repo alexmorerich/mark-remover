@@ -1,6 +1,91 @@
 # Mark Remover
 
-Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort.
+Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. **V13 (current)** adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success.
+
+## V13 — Final Visual Fidelity (publish gate on covers too, shape/silhouette detectors)
+
+V13 keeps the V12 honesty direction but fixes its two remaining gaps: too many
+genuine repairs were demoted to `clean_covered`, and some published covers still
+carried a visible rectangle, wedge, pale band, bright patch on a dark surface,
+or a broken product contour. **V13 does not relax any V12 gate.** It adds a
+single final visual gate that runs on the *chosen output* — repaired **or**
+covered — plus new shape / silhouette / dot-chain detectors, so a visually-bad
+result can never be published as a success.
+
+- **`final_visual_publish_gate_v13()` — applies to BOTH repaired and covered
+  (P0).** After the beam picks a candidate, `process_image` runs one composite
+  verdict requiring *all* of: `metrics_valid`, `residual_pass`, dot-chain v2,
+  rectangular-band, visible-patch-shape, product-damage, silhouette, and
+  protected-text. A `clean_repaired` that fails any gate is **honestly demoted**
+  to `clean_covered` (re-scored under the looser covered thresholds); a cover is
+  never silently upgraded. Returns a `FinalVisualVerdict` with every sub-gate
+  boolean. Lives in the new self-contained `v13_gates.py`.
+- **Visible-patch-shape detector (Section 8).** `detect_visible_patch_shape_v13`
+  flags rectangles, wedges, straight-edged polygons, hard luma boundaries and
+  over-smoothed low-texture islands in the changed region — artifacts the band
+  detector alone misses. A change is only "visible" when it carries a real
+  boundary (edge or luma step), so a seamless inpaint still passes.
+- **Product-silhouette / contour gate (Section 10).**
+  `detect_product_silhouette_damage_v13` measures contour IoU, edge retention,
+  contour break and new bright/dark blobs on the product surface. Crucially it
+  **excludes the watermark footprint** (its strokes are *supposed* to vanish)
+  and only fires on real product overlap — so it catches a smeared cable or a
+  bright blob on a black frame without demoting a clean removal.
+- **Dot-chain detector v2 (Section 7).** `detect_residual_dot_chain_v2` searches
+  a horizontally-expanded window (trailing `.com` glyphs) and counts **discrete**
+  fragments from the solid luma-deviation mask (the high-pass response bridges
+  the gaps and would merge a readable chain into one blob), scoring component
+  count, horizontal span, alignment and luma delta.
+- **Product-overlap routing v13 (Section 9).** `estimate_product_overlap_v13`
+  judges overlap from bbox-interior signals (non-white / dark / edge density /
+  long lines), not only the surrounding ring, and emits a routing override class
+  (`dark_product_surface`, `thin_flex_cable`, `complex_product_detail`,
+  `text_or_label_area`).
+- **Protected product text (Section 11).** `detect_protected_product_text_v13`
+  refuses to publish an output that flattened away real high-contrast printed
+  product text near the watermark.
+- **Honesty counters that must all be 0 (Section 14).** `v13_report.py` scans the
+  per-image `qa.json` records and tallies
+  `clean_{repaired,covered}_with_{dot_chain,visible_patch,product_damage,silhouette_damage}`
+  and `final_publish_failures`. It exits non-zero if any are non-zero, doubling
+  as a CI gate. Every report carries `V13_FINAL_VISUAL_FIDELITY` with
+  `qa_schema_version = strategy_schema_version = final_visual_gate_version = v13`.
+
+### V13 results (50-image benchmark, seed 2026)
+
+| Metric | Result | Target |
+|--------|--------|--------|
+| total / failed_io | 50 / 0 | 0 |
+| clean_repaired / clean_covered | 24 / 26 | honesty first |
+| manual_review | 0 | 0 |
+| zero-metric passes | 0 | 0 |
+| `clean_repaired_with_dot_chain` | 0 | 0 |
+| `clean_repaired_with_visible_patch` | 0 | 0 |
+| `clean_repaired_with_product_damage` | 0 | 0 |
+| `clean_repaired_with_silhouette_damage` | 0 | 0 |
+| `v13_demoted_from_repaired` (caught by the new gate) | 4 | — |
+| unique final methods | 9 | ≥ 8 |
+
+The headline V13 guarantee holds: **every `clean_repaired_with_*` counter is 0** —
+no output is published as a genuine repair while carrying readable residue, a
+visible patch/band, product damage, or a broken silhouette. The new final
+visual gate honestly demoted 4 outputs that V12 would have shipped as
+`clean_repaired`.
+
+**Cover side (honest, not yet perfect):** the report still flags some
+`clean_covered` outputs — `clean_covered_with_dot_chain = 2`,
+`clean_covered_with_visible_patch = 9` (`final_publish_failures = 16`). These
+are genuine: `final_adaptive_cover` still leaves a visibly patchy region on a
+few hard metallic / low-texture surfaces. The detectors are working (they are
+not hiding these); driving these counters to 0 is the next step and needs the
+**cover-quality remediation** in the plan's §3–6 (segmented micro-cover beam,
+dark/flex tool activation, adaptive feathering, HF texture matching, residual
+micro-cleanup inside the candidate loop). V13 ships the *detection + honest
+labelling* of that gap; it does not yet rebuild the cover generator.
+
+`test_v13_final_visual_gate.py`, `test_v13_detectors.py` and
+`test_v13_report_honesty.py` lock the new gates; the V10/V11/V12 regression
+suites stay green (45 cases total).
 
 ## V12 — Visual Truthfulness (unified publish gate, band detector, residual cleanup)
 
@@ -745,11 +830,16 @@ output/
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mark_remover.py` | ~5,000 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + provenance/counters |
+| `mark_remover.py` | ~5,100 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + **V13 final visual gate / honest demotion** + provenance/counters |
 | `progressive_repair.py` | ~4,700 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` |
+| `v13_gates.py` | ~620 | **V13 final visual fidelity gates**: `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
+| `v13_report.py` | ~95 | **V13 honesty report / CI gate**: tallies must-be-zero counters from per-image `qa.json` |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
-| `test_v12_visual_truthfulness.py` | ~260 | V12 lock: publish gate authority, dot-chain 0.28, band gate, dark-product ban, version/schema consistency (16 cases) |
+| `test_v12_visual_truthfulness.py` | ~260 | V12 lock: publish gate authority, dot-chain 0.28, band gate, dark-product ban, version/schema consistency |
+| `test_v13_final_visual_gate.py` | ~70 | V13 lock: final visual gate accepts clean / rejects bad output, repaired **and** covered |
+| `test_v13_detectors.py` | ~95 | V13 lock: dot-chain v2, visible-patch-shape, silhouette, product-overlap detectors |
+| `test_v13_report_honesty.py` | ~55 | V13 lock: honesty counters increment on bad output, stay 0 on clean |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -780,6 +870,7 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | V10 | Quality patch: truthful QA + honest covers | Fail-closed QA, mask-aware residual watermark gate, 3-layer mask, inpaint-based covers (no gray bands), strategy reorder, diversity telemetry, regression lock |
 | V11 | Honest QA enforcement | Mandatory `validate_qa_metrics` (real ssim/boundary_jump, no zero-metric passes), dot-chain/broken-glyph residual gate, product-overlap damage gate (bright-blob/colour/edge/area), plain-white fast path, beam selection over first-pass, honesty telemetry + regression lock |
 | **V12** | **Visual truthfulness** | **Unified `final_publish_gate` as the only `clean_repaired` authority, dot-chain ceiling 0.35→0.28 + count rule, residual micro-cleanup before cover, rectangular-band gate on every candidate, full-changed-region product gate + contour-break, dark-product/thin-flex white-fill ban, beam visual-residue penalties, forced-cover semantics, version/schema provenance in PDF/HTML/JSONL/trace + three must-be-zero counters** |
+| **V13** | **Final visual fidelity** | **`final_visual_publish_gate_v13` applied to repaired AND covered outputs (honest demotion of weak repairs), new dot-chain-v2 / visible-patch-shape / product-silhouette / product-overlap / protected-text detectors in `v13_gates.py`, `v13_report.py` must-be-zero honesty counters, version → `V13_FINAL_VISUAL_FIDELITY` / schema `v13`** |
 
 ## License
 

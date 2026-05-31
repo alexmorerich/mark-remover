@@ -46,6 +46,7 @@ from progressive_repair import (
     RESIDUAL_DOT_CHAIN_MAX,
     BAND_VISIBLE_REPAIRED_MAX,
 )
+import v13_gates
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -58,8 +59,9 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V12_VISUAL_TRUTHFULNESS"
-assert PIPELINE_VERSION == "V12_VISUAL_TRUTHFULNESS"
+PIPELINE_VERSION = "V13_FINAL_VISUAL_FIDELITY"
+assert PIPELINE_VERSION == "V13_FINAL_VISUAL_FIDELITY"
+FINAL_VISUAL_GATE_VERSION = "v13"
 
 
 def _git_commit() -> str:
@@ -81,6 +83,7 @@ def run_metadata(seed: int) -> dict:
         "run_seed": seed,
         "qa_schema_version": QA_SCHEMA_VERSION,
         "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
+        "final_visual_gate_version": FINAL_VISUAL_GATE_VERSION,
     }
 
 # ---------------------------------------------------------------------------
@@ -3980,6 +3983,32 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["pipeline_version"] = PIPELINE_VERSION
     rec["repair_qa_pass"] = (not is_cover) and bool(qa_info.get("residual_pass")) \
         and bool(qa_info.get("metrics_valid")) and bool(qa_info.get("publish_ok"))
+
+    # --- V13 Final Visual Fidelity gate — applies to BOTH repaired and ---
+    # covered outputs (patch plan section 2 / P0). It never relaxes a V12 gate;
+    # it adds shape / silhouette / dot-chain / protected-text checks. A
+    # clean_repaired that fails any visual gate is honestly demoted to
+    # clean_covered (we never silently upgrade a cover).
+    v13_verdict = v13_gates.final_visual_publish_gate_v13(
+        img, candidate.repaired_image, bbox_tuple, protect_combined,
+        qa_info, repaired=(not is_cover),
+        watermark_mask=masks.get("stroke"))
+    if (not is_cover) and (not v13_verdict.publish_ok):
+        is_cover = True
+        status = ST_CLEAN_COVERED
+        rec["status"] = ST_CLEAN_COVERED
+        rec["v13_demoted_from_repaired"] = True
+        # Re-evaluate under the (looser, but still real) covered thresholds so
+        # the recorded verdict + honesty counters reflect what was published.
+        v13_verdict = v13_gates.final_visual_publish_gate_v13(
+            img, candidate.repaired_image, bbox_tuple, protect_combined,
+            qa_info, repaired=False, watermark_mask=masks.get("stroke"))
+    else:
+        rec.setdefault("v13_demoted_from_repaired", False)
+    rec.update(v13_verdict.to_record())
+    rec["repair_qa_pass"] = rec["repair_qa_pass"] and v13_verdict.publish_ok
+    rec["v9_is_cover"] = is_cover
+    rec["v9_is_real_repair"] = not is_cover
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
