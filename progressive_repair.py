@@ -857,6 +857,7 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
         base_mean = float(ring_hp.mean())
         base_std = float(ring_hp.std())
     else:
+        ring_hp = None
         base_mean = float(np.median(clean_hp))
         base_std = float(clean_hp.std())
 
@@ -869,15 +870,24 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
         oe = float(orig_hp[sel].mean())
         ce = float(clean_hp[sel].mean())
         stroke_thr = max(8.0, base_mean + 2.0 * base_std)
-        residual_stroke = (clean_hp > stroke_thr) & sel
-        text_component = _clamp01(
-            float(residual_stroke.sum()) / max(1, int(sel.sum())) / 0.20)
+        # V11 fix — measure the residual stroke fraction RELATIVE to the
+        # watermark-free ring's own exceedance at the same threshold. A
+        # matched-noise / JPEG-textured fill makes the cleaned region exceed
+        # the absolute threshold just as often as the surrounding surface
+        # does; only the EXCESS over that baseline is genuine residual.
+        clean_exc = float(((clean_hp > stroke_thr) & sel).sum()) / max(
+            1, int(sel.sum()))
+        ring_exc = (float((ring_hp > stroke_thr).mean())
+                    if ring_hp is not None else 0.0)
+        text_component = _clamp01(max(0.0, clean_exc - ring_exc) / 0.20)
     else:
         oe = float(orig_hp.mean())
         ce = float(clean_hp.mean())
         stroke_thr = max(8.0, base_mean + 2.5 * base_std)
-        residual_stroke = clean_hp > stroke_thr
-        text_component = _clamp01(float(residual_stroke.mean()) / 0.06)
+        clean_exc = float((clean_hp > stroke_thr).mean())
+        ring_exc = (float((ring_hp > stroke_thr).mean())
+                    if ring_hp is not None else 0.0)
+        text_component = _clamp01(max(0.0, clean_exc - ring_exc) / 0.06)
 
     improvement = 1.0 if oe < 1e-3 else _clamp01(1.0 - ce / oe)
     gray_delta_stroke = min(1.0, ce / 8.0)
@@ -891,6 +901,14 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
         comp_sel = np.ones_like(clean_gray, np.uint8) * 255
     dot_chain, comp_count, comp_area, comp_span = detect_residual_components(
         clean_gray, comp_sel, base_mean, base_std)
+    # V11 fix — a clean fill whose matched noise exceeds the baseline as
+    # often as the watermark-free surround is NOT residual. Suppress the
+    # dot-chain / broken-glyph signals when the cleaned region carries no
+    # meaningful EXCESS structure over the ring baseline (text_component is
+    # already ring-relative above).
+    if text_component < 0.04:
+        dot_chain = 0.0
+        comp_area = min(comp_area, RESIDUAL_COMPONENT_AREA_MAX)
 
     # Waive the improvement ratio only when the original carried essentially
     # NO watermark structure at the measured locations (nothing to remove).
