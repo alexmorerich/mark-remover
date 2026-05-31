@@ -40,6 +40,43 @@ import v15_patch
 
 
 # ---------------------------------------------------------------------------
+# Gate tiers (V16.1).
+#
+# HARD SAFETY gates — must pass to publish. The watermark must be verifiably
+# GONE (detector re-detect + template/dot residual) and the PRODUCT must be
+# undamaged (no product-damage, no silhouette break, no protected-text loss).
+# Leaving the mark, or damaging the product, is never publishable.
+#
+# COSMETIC gates — a visible band / patch where the watermark used to be. These
+# are tracked and reported, but on a verifiably-removed, product-safe output
+# they do NOT block publishing: a faint seam on the background is far better
+# than shipping the watermark or auto-rejecting a cleanable image. (This is the
+# V16.1 reconciliation of "zero dirty publish" with the standing product rule
+# that the mark MUST be removed without damaging the product.)
+# ---------------------------------------------------------------------------
+HARD_SAFETY_GATES = ("residual_ocr_pass", "template_residual_pass",
+                     "dot_chain_pass", "product_damage_pass",
+                     "silhouette_pass", "protected_text_pass")
+COSMETIC_GATES = ("visible_patch_pass", "visible_band_pass")
+
+
+def _is_strict(gates: dict) -> bool:
+    return all(gates.get(k, True) for k in (HARD_SAFETY_GATES + COSMETIC_GATES))
+
+
+def _is_safe(gates: dict) -> bool:
+    # Watermark verifiably gone AND product undamaged (cosmetic may fail).
+    return all(gates.get(k, True) for k in HARD_SAFETY_GATES)
+
+
+def _cosmetic_score(verdict) -> float:
+    sc = getattr(verdict, "scores", {}) or {}
+    return (float(sc.get("visible_patch_shape", 0.0)) +
+            float(sc.get("visible_band", 0.0)) +
+            float(sc.get("hard_boundary", 0.0)))
+
+
+# ---------------------------------------------------------------------------
 # P0 gate dictionary built from a FinalVisualVerdict + a post-clean re-detect.
 # ---------------------------------------------------------------------------
 def _p0_gates_from(verdict, still_present: bool) -> dict:
@@ -65,6 +102,7 @@ class V16Result:
     verdict: object                   # FinalVisualVerdict of the chosen / best attempt
     p0_gates: dict = field(default_factory=dict)
     publish_ok: bool = False
+    cosmetic_seam: bool = False        # published, mark gone + product-safe, soft seam
     candidate_publish_failures: int = 0
     reject_reasons: list = field(default_factory=list)
     best_repair_image: object = None
@@ -90,16 +128,18 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
 
     def _p0(image, repaired):
         # Fresh per-candidate watermark-hiding verdict for the template/dot
-        # residual gate, then the V13 visual gate, then — only if the visual
-        # gate passes (cheap-first) — the expensive post-clean detector
-        # re-check. A candidate that already fails the visual gate is rejected
-        # without paying for re-detection.
+        # residual gate, then the V13 visual gate, then the post-clean detector
+        # re-check. The detector re-check is the AUTHORITATIVE residual signal
+        # (template correlation false-passes on bright metal), so it always runs.
+        # Returns (strict_ok, safe_ok, verdict, gates, still_present).
         hides = v14_patch.cover_hides_watermark(img, image, bbox, watermark_mask)
         verdict = gate_fn(image, repaired, hides)
-        if not verdict.publish_ok:
-            return False, verdict, _p0_gates_from(verdict, False), False
-        still, _info = recheck_fn(image)
-        return (not still), verdict, _p0_gates_from(verdict, still), still
+        still, info = recheck_fn(image)
+        gates = _p0_gates_from(verdict, still)
+        # The V13 visual gate's own residual_pass is folded into template_residual;
+        # the detector re-check is residual_ocr. Both feed the hard tier.
+        return _is_strict(gates) and verdict.publish_ok, _is_safe(gates), \
+            verdict, gates, still
 
     uniform = None
     if v15_patch.is_uniform_local_background(img, bbox, product_mask):
@@ -108,10 +148,18 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         except Exception:
             uniform = None
 
+    # safe_pool collects mark-removed + product-safe candidates that only trip a
+    # COSMETIC gate, so we can publish the least-seamy one if nothing passes
+    # strictly (V16.1 — never auto-reject a cleanable, product-safe image).
+    safe_pool = []   # (cosmetic_score, status, name, image, verdict, gates, kind)
+
+    def _consider_safe(strict_ok, safe_ok, verdict, gates, name, image, status,
+                       kind):
+        if safe_ok and not strict_ok:
+            safe_pool.append((_cosmetic_score(verdict), status, name, image,
+                              verdict, gates, kind))
+
     # ---------------- REPAIR PATH ----------------
-    # Repair candidates, strongest-first: a uniform-background neighbour fill,
-    # the beam's chosen repair, then its best near-miss repair (if the loop fell
-    # to cover). Each must pass the full P0 gate to publish as clean_repaired.
     repair_cands = []
     if uniform is not None:
         repair_cands.append(("v16_uniform_background_fill", uniform))
@@ -122,17 +170,17 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
 
     best_repair = repair_cands[0][1] if repair_cands else None
     for name, rimg in repair_cands:
-        ok, verdict, gates, _still = _p0(rimg, True)
-        if ok:
+        strict_ok, safe_ok, verdict, gates, _still = _p0(rimg, True)
+        if strict_ok:
             return V16Result(
                 status="clean_repaired", image=rimg, method=name,
                 verdict=verdict, p0_gates=gates, publish_ok=True,
                 candidate_publish_failures=state["candidate_failures"],
-                best_repair_image=rimg,
-                telemetry={"v16_path": "repair"})
+                best_repair_image=rimg, telemetry={"v16_path": "repair"})
+        _consider_safe(strict_ok, safe_ok, verdict, gates, name, rimg,
+                       "clean_repaired", "repair")
         state["candidate_failures"] += 1
         reject_reasons.append("repair_failed_final_gate")
-        # Residual micro-cleanup / near-miss rescue, only on a soft fail.
         if v14_patch.classify_failure(verdict) == "soft_fail":
             try:
                 rescued = v14_patch.near_miss_rescue(
@@ -140,15 +188,18 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
             except Exception:
                 rescued = None
             if rescued is not None:
-                ok2, verdict2, gates2, _s2 = _p0(rescued, True)
-                if ok2:
+                s_ok, sf_ok, v2, g2, _s2 = _p0(rescued, True)
+                if s_ok:
                     return V16Result(
                         status="clean_repaired", image=rescued,
-                        method=name + "+v16_micro_cleanup", verdict=verdict2,
-                        p0_gates=gates2, publish_ok=True,
+                        method=name + "+v16_micro_cleanup", verdict=v2,
+                        p0_gates=g2, publish_ok=True,
                         candidate_publish_failures=state["candidate_failures"],
                         best_repair_image=rescued,
                         telemetry={"v16_path": "repair_rescued"})
+                _consider_safe(s_ok, sf_ok, v2, g2,
+                               name + "+v16_micro_cleanup", rescued,
+                               "clean_repaired", "repair")
                 state["candidate_failures"] += 1
 
     # ---------------- COVER BEAM ----------------
@@ -159,8 +210,6 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         cover_cands = [(n, im) for (n, im, _full, _s) in mc.ranked]
     except Exception:
         cover_cands = []
-    # A uniform-background fill is also a valid cover; a forced full-text-band
-    # removal is the last-resort cover (Fix 4 cover beam).
     if uniform is not None:
         cover_cands.insert(0, ("v16_uniform_background_fill", uniform))
     try:
@@ -174,40 +223,72 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     last_verdict = None
     last_gates = {}
     for name, cimg in cover_cands:
-        ok, verdict, gates, _still = _p0(cimg, False)
+        strict_ok, safe_ok, verdict, gates, _still = _p0(cimg, False)
         last_verdict, last_gates = verdict, gates
-        if ok:
+        if strict_ok:
             return V16Result(
                 status="clean_covered", image=cimg, method=name,
                 verdict=verdict, p0_gates=gates, publish_ok=True,
                 candidate_publish_failures=state["candidate_failures"],
                 best_repair_image=best_repair, best_cover_image=cimg,
                 telemetry={"v16_path": "cover"})
+        _consider_safe(strict_ok, safe_ok, verdict, gates, name, cimg,
+                       "clean_covered", "cover")
         state["candidate_failures"] += 1
         for r in verdict.reject_reasons:
             reject_reasons.append("cover_failed_" + r)
         if best_cover is None:
             best_cover = cimg
 
-    # ---------------- AUTO REJECTED ----------------
-    # Repair AND cover both failed the P0 gate. Final automated decision — not a
-    # manual review, not published. Keep the best attempt for diagnostics.
-    final_img = best_cover if best_cover is not None else best_repair
+    # ---------------- SAFE TIER (mark gone + product-safe, soft seam) --------
+    # No candidate passed strictly, but the watermark IS removed and the product
+    # is undamaged on one or more — publish the least-seamy as clean_covered with
+    # a tracked cosmetic_seam flag. A faint seam beats shipping the mark or
+    # auto-rejecting a cleanable, product-safe image.
+    if safe_pool:
+        safe_pool.sort(key=lambda c: c[0])
+        _score, status, name, image, verdict, gates, kind = safe_pool[0]
+        return V16Result(
+            status="clean_covered", image=image,
+            method=name + "+cosmetic_seam", verdict=verdict, p0_gates=gates,
+            publish_ok=True, cosmetic_seam=True,
+            candidate_publish_failures=state["candidate_failures"],
+            best_repair_image=best_repair, best_cover_image=image,
+            telemetry={"v16_path": "safe_cosmetic_seam", "v16_seam_kind": kind})
+
+    # ---------------- AUTO REJECTED -----------------------------------------
+    # The watermark could not be removed without damaging the product (or could
+    # not be removed at all). Final automated decision — not published, not
+    # manual review. The saved best attempt is the MOST watermark-removed,
+    # product-safest candidate (lowest re-detect confidence), so the diagnostic
+    # never shows the mark when removal was actually possible.
+    best_removed = None
+    best_conf = 2.0
+    for name, cimg in cover_cands:
+        try:
+            still, info = recheck_fn(cimg)
+        except Exception:
+            still, info = True, {"confidence": 1.0}
+        conf = float(info.get("confidence", 1.0))
+        if conf < best_conf:
+            best_conf = conf
+            best_removed = cimg
+    final_img = best_removed if best_removed is not None else \
+        (best_cover if best_cover is not None else best_repair)
     if final_img is None:
         final_img = img
     verdict = last_verdict
     gates = last_gates
     if verdict is None:
-        # No cover candidate ran at all — re-evaluate the best repair attempt so
-        # the diagnostics record real gate verdicts.
-        _ok, verdict, gates, _s = _p0(final_img, False)
-    # de-dup reasons, preserve order
+        _s1, _s2, verdict, gates, _s = _p0(final_img, False)
     seen = set()
     reasons = [r for r in reject_reasons if not (r in seen or seen.add(r))]
+    best_cover_diag = best_removed if best_removed is not None else best_cover
     return V16Result(
         status="auto_rejected", image=final_img, method="auto_rejected",
         verdict=verdict, p0_gates=gates, publish_ok=False,
         candidate_publish_failures=state["candidate_failures"],
         reject_reasons=reasons or ["repair_and_cover_failed_final_gate"],
-        best_repair_image=best_repair, best_cover_image=best_cover,
-        telemetry={"v16_path": "auto_rejected"})
+        best_repair_image=best_repair, best_cover_image=best_cover_diag,
+        telemetry={"v16_path": "auto_rejected",
+                   "v16_best_removed_conf": round(best_conf, 4)})

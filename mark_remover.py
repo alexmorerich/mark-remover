@@ -4096,10 +4096,13 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["final_gate_version"] = "v16"
     rec["final_gate_pass"] = bool(v13_verdict.publish_ok) if v13_verdict else False
     rec["candidate_publish_failures"] = int(v16.candidate_publish_failures)
-    # A published output that failed the gate would be a fatal invariant break.
-    # By construction this is always False (clean_* only set when P0 passed).
+    rec["cosmetic_seam"] = bool(v16.cosmetic_seam)
+    # A published output that fails a HARD SAFETY gate (watermark still present
+    # or product damaged) would be a fatal invariant break. By construction this
+    # is always False — clean_* is only assigned when every hard-safety gate
+    # passes (a published cosmetic_seam still has all hard gates green).
     rec["final_output_publish_failure"] = bool(
-        publishable and not (v13_verdict and v13_verdict.publish_ok))
+        publishable and not v16_pipeline._is_safe(v16.p0_gates))
     rec["reject_reasons"] = list(v16.reject_reasons)
     rec["p0_gates"] = dict(v16.p0_gates)
     rec["v16_path"] = v16.telemetry.get("v16_path")

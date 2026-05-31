@@ -44,6 +44,16 @@ def FAIL_HARD():
     return _Verdict(False, ["product_damage"], product_damage_pass=False)
 
 
+def FAIL_COSMETIC():
+    # only a cosmetic gate fails (visible band/patch) — watermark gone, product
+    # safe ⇒ V16.1 publishes as clean_covered with cosmetic_seam=True.
+    return _Verdict(False, ["visible_band"], residual_pass=True,
+                    dot_chain_pass=True, product_damage_pass=True,
+                    silhouette_pass=True, protected_text_pass=True,
+                    visible_patch_pass=False, rectangular_band_pass=False,
+                    polygon_patch_pass=True)
+
+
 class GateStub:
     """Returns queued verdicts, then a default for everything after."""
     def __init__(self, queue, default):
@@ -137,6 +147,31 @@ def test_passing_repair_becomes_clean_repaired():
 
 
 # --------------------------------------------------------------------------
+# V16.1 — mark removed + product-safe but a cosmetic seam -> clean_covered
+# (published with cosmetic_seam flag), NOT auto_rejected and NOT mark-present.
+# --------------------------------------------------------------------------
+def test_cosmetic_seam_publishes_as_clean_covered():
+    res = _decide(GateStub([], FAIL_COSMETIC))
+    assert res.status == "clean_covered"
+    assert res.publish_ok is True
+    assert res.cosmetic_seam is True
+    # hard-safety gates all green; only the cosmetic gates fail
+    p0 = res.p0_gates
+    assert p0["residual_ocr_pass"] and p0["product_damage_pass"]
+    assert p0["silhouette_pass"] and p0["protected_text_pass"]
+    assert p0["visible_band_pass"] is False
+
+
+def test_mark_still_present_is_not_published():
+    # gate would pass cosmetically, but the detector says the mark is STILL
+    # there ⇒ residual_ocr fails ⇒ not safe ⇒ auto_rejected (never published).
+    res = _decide(GateStub([], FAIL_COSMETIC),
+                  recheck=lambda im: (True, {"confidence": 0.7}))
+    assert res.status == "auto_rejected"
+    assert res.publish_ok is False
+
+
+# --------------------------------------------------------------------------
 # 3 — report CI fails when a published output violates a P0 gate
 # --------------------------------------------------------------------------
 def _write_rec(root, stem, status, p0, **extra):
@@ -169,12 +204,33 @@ def test_report_ci_passes_for_clean_published_and_auto_rejected():
     assert rep["candidate_publish_failures"] == 2
 
 
+def test_report_ci_allows_cosmetic_seam_published():
+    # A published output with a visible band/patch but all hard-safety gates
+    # green is a cosmetic seam — allowed, CI passes.
+    tmp = Path(tempfile.mkdtemp())
+    seam = dict(_ALL_PASS)
+    seam["visible_patch_pass"] = False
+    seam["visible_band_pass"] = False
+    d = tmp / "clean_covered" / "a"
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"status": "clean_covered", "product_id": "a", "image": "a.jpg",
+           "p0_gates": seam, "publish_ok": True, "cosmetic_seam": True,
+           "final_output_publish_failure": False}
+    (d / "qa.json").write_text(json.dumps(rec))
+    rep = v13_report.build_report(tmp)
+    assert rep["all_clean"] is True
+    assert rep["cosmetic"]["published_with_visible_patch"] == 1
+    assert rep["published_with_cosmetic_seam"] == 1
+    assert v13_report.main(["x", str(tmp)]) == 0
+
+
 def test_report_ci_fails_for_dirty_published_output():
+    # A HARD-safety failure on a published output (mark still present) must fail.
     tmp = Path(tempfile.mkdtemp())
     dirty = dict(_ALL_PASS)
-    dirty["visible_patch_pass"] = False     # a published output with a patch
-    _write_rec(tmp, "a", "clean_covered", dirty)
+    dirty["residual_ocr_pass"] = False     # watermark still detectable
+    _write_rec(tmp, "a", "clean_covered", dirty, fop=True)
     rep = v13_report.build_report(tmp)
     assert rep["all_clean"] is False
-    assert rep["must_be_zero"]["published_with_visible_patch"] == 1
+    assert rep["must_be_zero"]["published_with_residual_ocr"] == 1
     assert v13_report.main(["x", str(tmp)]) == 1

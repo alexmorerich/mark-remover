@@ -22,18 +22,25 @@ from pathlib import Path
 
 PUBLISHED = ("clean_repaired", "clean_covered")
 
-# Patch plan Fix 3/6 — published outputs must have ZERO P0 failures. The CI
-# gate fails if any of these are non-zero.
+# V16.1 — HARD SAFETY published-output counters that MUST be zero. A published
+# output must have the watermark verifiably gone AND the product undamaged.
+# Visible band / patch are COSMETIC (tracked below, allowed): a faint seam on
+# the background is acceptable, leaving the mark or damaging the product is not.
 MUST_BE_ZERO = [
     "published_with_residual_ocr",
     "published_with_template_residual",
     "published_with_dot_chain",
-    "published_with_visible_patch",
-    "published_with_visible_band",
     "published_with_product_damage",
     "published_with_silhouette_damage",
     "published_with_protected_text_damage",
     "final_output_publish_failures",
+]
+
+# Cosmetic counters — reported, allowed to be > 0 (a soft seam on a verifiably
+# mark-removed, product-safe output).
+COSMETIC_COUNTERS = [
+    "published_with_visible_patch",
+    "published_with_visible_band",
 ]
 
 # p0_gates key -> published_with_* counter it feeds when False.
@@ -65,13 +72,15 @@ def build_report(out_root: Path) -> dict:
     candidate_failures = 0
     auto_rejected_after_cover_fail = 0
     auto_rejected_after_repair_fail = 0
+    cosmetic_seam_published = 0
     tools_reachable = tools_tried = candidates_passed = 0
 
     for rec in _iter_records(out_root):
         status = rec.get("status")
         status_counts[status] += 1
         candidate_failures += int(rec.get("candidate_publish_failures", 0) or 0)
-        tel = rec
+        if status in PUBLISHED and rec.get("cosmetic_seam"):
+            cosmetic_seam_published += 1
         tools_reachable = max(tools_reachable,
                               int((rec.get("v11_tools_reachable") or 0)))
         tools_tried += int(rec.get("v11_tools_tried") or 0)
@@ -97,6 +106,7 @@ def build_report(out_root: Path) -> dict:
                 auto_rejected_after_repair_fail += 1
 
     must_zero_d = {k: int(must_zero.get(k, 0)) for k in MUST_BE_ZERO}
+    cosmetic_d = {k: int(must_zero.get(k, 0)) for k in COSMETIC_COUNTERS}
     all_clean = all(v == 0 for v in must_zero_d.values())
 
     report = {
@@ -115,8 +125,12 @@ def build_report(out_root: Path) -> dict:
         "n_published": (status_counts.get("clean_repaired", 0) +
                         status_counts.get("clean_covered", 0)),
         "unique_final_methods": len(methods),
-        # Must-be-zero published-output counters.
+        # Must-be-zero published-output HARD-SAFETY counters.
         "must_be_zero": must_zero_d,
+        # Cosmetic counters (allowed > 0): a soft seam on a mark-removed,
+        # product-safe published output.
+        "cosmetic": cosmetic_d,
+        "published_with_cosmetic_seam": cosmetic_seam_published,
         # Allowed rejected-candidate counters.
         "candidate_publish_failures": candidate_failures,
         "auto_rejected_after_repair_fail": auto_rejected_after_repair_fail,
