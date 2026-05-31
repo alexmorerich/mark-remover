@@ -231,6 +231,16 @@ class QAResult:
     product_gate_pass: bool = True
     product_gate_reason: str = ""
     changed_area_ratio: float = 0.0
+    # V12 additions — rectangular band visibility + unified publish verdict.
+    visible_band_score: float = 0.0
+    band_luma_delta: float = 0.0
+    band_edge_box_score: float = 0.0
+    band_texture_drop: float = 0.0
+    band_rectangularity: float = 0.0
+    product_contour_break_score: float = 0.0
+    publish_ok: bool = True
+    publish_status: str = "clean_repaired"
+    publish_reject_reasons: list = field(default_factory=list)
 
 
 @dataclass
@@ -263,6 +273,20 @@ STRICT_CLASSES = {"complex_product_detail", "thin_flex_cable",
 LOOSE_CLASSES = {"plain_white", "near_white", "low_texture_background"}
 
 PLAIN_BG_CLASSES = {"plain_white", "near_white", "low_texture_background"}
+
+# V12 — schema versions surfaced in every report so a run can never claim a
+# different version than the code that produced it.
+QA_SCHEMA_VERSION = "v12"
+STRATEGY_SCHEMA_VERSION = "v12"
+
+# V12 Phase F — tool families that must NEVER fire on a dark product surface
+# or a thin flex cable (a white/median/plain fill there leaves a bright block).
+WHITE_FILL_BANNED_TOOLS = {
+    "white_median_fill", "plain_white_fast_path", "hard_paste_white_clone",
+    "seam_scored_white_clone", "plain_white_direct_neighbor_clone_v2",
+    "white_patch_with_noise", "ring_mean_fill", "ring_mode_fill",
+}
+WHITE_FILL_BAN_CLASSES = {"dark_product_surface", "thin_flex_cable"}
 
 
 # ---------------------------------------------------------------------------
@@ -642,10 +666,17 @@ class ResidualResult:
     failure_reason: str = ""
 
 
-# V11 Phase 2 — residual component thresholds (fail if exceeded).
-RESIDUAL_DOT_CHAIN_MAX = 0.35
+# V11 Phase 2 / V12 Phase B — residual component thresholds (fail if exceeded).
+# V12 tightens the dot-chain ceiling (0.35 → 0.28) and adds a count-based rule
+# so a row of faint glyph fragments — readable as a line to the human eye even
+# when no single letter survives — can never pass as clean_repaired.
+RESIDUAL_DOT_CHAIN_MAX = 0.28
 RESIDUAL_COMPONENT_AREA_MAX = 0.08
 RESIDUAL_COMPONENT_SPAN_MAX = 0.25
+# V12 Phase B count-based dot-chain reject (all three must hold to reject).
+RESIDUAL_DOTCHAIN_COUNT_MIN = 4
+RESIDUAL_DOTCHAIN_SPAN_MIN = 0.22
+RESIDUAL_DOTCHAIN_AREA_MIN = 0.035
 
 
 def detect_residual_components(clean_gray, sel_mask, base_mean, base_std):
@@ -728,6 +759,32 @@ def cleanup_residual_components_with_ring_fill(cleaned, bbox, comp_mask,
     esel = edge > 0
     out[esel] = blurred[esel]
     return out
+
+
+def _residual_component_mask(ctx, repaired):
+    """V12 Phase C — build a full-frame mask of the leftover dot/glyph
+    fragments inside the (horizontally expanded) watermark footprint, so a
+    precise second-pass cleanup can paint just those pixels instead of
+    escalating straight to a full-bbox cover."""
+    bx, by, bw, bh = ctx.watermark_bbox
+    H, W = repaired.shape[:2]
+    src = (ctx.logo_mask if (ctx.logo_mask is not None and
+                             np.any(ctx.logo_mask > 0)) else ctx.stroke_mask)
+    if src is None or src.shape[:2] != (H, W):
+        return None
+    kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 9))
+    footprint = cv2.dilate(src, kd, iterations=1) > 0
+    gray = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    hp = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=2.0))
+    # Surface baseline from a padded ring crop around the bbox.
+    rpad = max(12, max(bw, bh) // 3)
+    rc = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)[
+        max(0, by - rpad):min(H, by + bh + rpad),
+        max(0, bx - rpad):min(W, bx + bw + rpad)].astype(np.float32)
+    rhp = np.abs(rc - cv2.GaussianBlur(rc, (0, 0), sigmaX=2.0))
+    thr = max(8.0, float(rhp.mean()) + 2.0 * float(rhp.std()))
+    mask = ((hp > thr) & footprint).astype(np.uint8) * 255
+    return mask if int(mask.sum()) > 0 else None
 
 
 _CANONICAL_TEMPLATE = None
@@ -932,6 +989,12 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
         failure_reason = "residual_text_component_too_high"
     elif dot_chain > RESIDUAL_DOT_CHAIN_MAX:
         failure_reason = "residual_dot_chain_visible"
+    elif (comp_count >= RESIDUAL_DOTCHAIN_COUNT_MIN and
+          comp_span > RESIDUAL_DOTCHAIN_SPAN_MIN and
+          comp_area > RESIDUAL_DOTCHAIN_AREA_MIN):
+        # V12 Phase B — several aligned fragments spread across the band: a
+        # human still reads the line even though no full letter remains.
+        failure_reason = "residual_dot_chain_visible"
     elif (comp_area > RESIDUAL_COMPONENT_AREA_MAX and
           comp_span > RESIDUAL_COMPONENT_SPAN_MAX):
         failure_reason = "broken_glyph_residual_visible"
@@ -1117,6 +1180,137 @@ def cover_passes_rect_gate(metrics):
             metrics["cover_luma_delta"] <= COVER_LUMA_DELTA_MAX and
             metrics["cover_texture_drop"] <= COVER_TEXTURE_DROP_MAX and
             metrics["cover_edge_box_score"] <= COVER_EDGE_BOX_MAX)
+
+
+# ---------------------------------------------------------------------------
+# V12 Phase D — rectangular band visibility (run on EVERY candidate) and
+# V12 Phase A — the single, unified publish gate (clean_repaired authority).
+# ---------------------------------------------------------------------------
+
+# Hard gate for clean_repaired; looser gate for an honest clean_covered.
+BAND_VISIBLE_REPAIRED_MAX = 0.18
+BAND_RECT_REPAIRED_MAX = 0.20
+BAND_LUMA_DELTA_REPAIRED_MAX = 6.0
+BAND_EDGE_BOX_REPAIRED_MAX = 0.16
+
+BAND_VISIBLE_COVERED_MAX = 0.28
+BAND_RECT_COVERED_MAX = 0.28
+BAND_LUMA_DELTA_COVERED_MAX = 10.0
+BAND_EDGE_BOX_COVERED_MAX = 0.22
+
+
+def detect_rectangular_band_visibility(repaired, bbox):
+    """V12 Phase D — detect a human-visible horizontal rectangle / pale band
+    left by a cover or an over-smoothed repair. Run on EVERY accepted
+    candidate, not only adaptive covers.
+
+    The band SIGNATURE is a sharp-edged, luma-offset rectangle: straight box
+    edges on the bbox perimeter plus a luma offset of the interior vs its
+    surround. A smooth inpaint on a textured surface (high texture drop but no
+    edges and no luma offset) is NOT a band, so texture drop is weighted
+    lightly — it cannot, by itself, push a clean repair over the gate. Luma is
+    measured with medians so a few residual stroke pixels do not skew it.
+    """
+    bx, by, bw, bh = bbox
+    H, W = repaired.shape[:2]
+    zero = {"visible_band_score": 0.0, "band_luma_delta": 0.0,
+            "band_edge_box_score": 0.0, "band_texture_drop": 0.0,
+            "band_rectangularity": 0.0}
+    if bw <= 1 or bh <= 1:
+        return zero
+    gray = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+    inner = gray[by:by + bh, bx:bx + bw]
+    rmask, _ = _get_ring(repaired, bbox, 0.4)
+    ring = gray[rmask]
+    if inner.size == 0 or ring.size == 0:
+        return zero
+    luma_delta = abs(float(np.median(inner)) - float(np.median(ring)))
+    edge_box = _border_edge_box_score(gray, bbox)
+    tex_inner = float(cv2.Laplacian(inner, cv2.CV_64F).var())
+    pad = max(12, max(bw, bh) // 3)
+    rr = gray[max(0, by - pad):min(H, by + bh + pad),
+              max(0, bx - pad):min(W, bx + bw + pad)]
+    tex_ring = float(cv2.Laplacian(rr, cv2.CV_64F).var())
+    texture_drop = (0.0 if tex_ring < 25.0
+                    else max(0.0, 1.0 - tex_inner / max(tex_ring, 1e-6)))
+    # A rectangle is only VISIBLE when it has a border edge or a luma offset.
+    # A smooth inner region with neither (the inpaint itself on a plain/noisy
+    # surface) blends in and is NOT a band — so texture drop only counts when
+    # a real boundary is present. This prevents demoting clean repairs.
+    edge_present = min(1.0, edge_box / 0.10)
+    luma_present = min(1.0, luma_delta / 6.0)
+    boundary = max(edge_present, luma_present)
+    eff_tex = texture_drop * boundary
+    rectangularity = _clamp01(0.45 * edge_box +
+                              0.35 * min(1.0, luma_delta / 12.0) +
+                              0.20 * eff_tex)
+    visible = _clamp01(0.50 * edge_box +
+                       0.35 * min(1.0, luma_delta / 12.0) +
+                       0.15 * eff_tex)
+    return {"visible_band_score": round(visible, 4),
+            "band_luma_delta": round(luma_delta, 3),
+            "band_edge_box_score": round(edge_box, 4),
+            "band_texture_drop": round(texture_drop, 4),
+            "band_rectangularity": round(rectangularity, 4)}
+
+
+def band_gate(metrics, *, repaired=True):
+    """V12 Phase D — visible-band gate. Stricter for clean_repaired."""
+    if repaired:
+        return (metrics["visible_band_score"] <= BAND_VISIBLE_REPAIRED_MAX and
+                metrics["band_rectangularity"] <= BAND_RECT_REPAIRED_MAX and
+                metrics["band_luma_delta"] <= BAND_LUMA_DELTA_REPAIRED_MAX and
+                metrics["band_edge_box_score"] <= BAND_EDGE_BOX_REPAIRED_MAX)
+    return (metrics["visible_band_score"] <= BAND_VISIBLE_COVERED_MAX and
+            metrics["band_rectangularity"] <= BAND_RECT_COVERED_MAX and
+            metrics["band_luma_delta"] <= BAND_LUMA_DELTA_COVERED_MAX and
+            metrics["band_edge_box_score"] <= BAND_EDGE_BOX_COVERED_MAX)
+
+
+def final_publish_gate(qa: dict, roi_class: str = "") -> dict:
+    """V12 Phase A — the ONE source of truth for clean_repaired vs
+    clean_covered. Never trust the method family alone: a candidate may be
+    published AS A REPAIR only when every visual gate passes simultaneously —
+    QA metrics valid, no readable/dotted residual, no product damage, and no
+    visible rectangular band. Anything short of that is, at best, an honest
+    clean_covered.
+
+    Returns {publish_ok, status, reject_reasons, residual_gate, product_gate,
+    band_gate, metrics_valid}.
+    """
+    reasons = []
+    metrics_valid = bool(qa.get("metrics_valid", False))
+    if not metrics_valid:
+        reasons.append("qa_metrics_invalid")
+    residual_ok = bool(qa.get("residual_pass", False))
+    if not residual_ok:
+        reasons.append("readable_or_dotted_residual")
+    if qa.get("residual_dot_chain_score", 0.0) > RESIDUAL_DOT_CHAIN_MAX:
+        reasons.append("dot_chain_residual")
+    product_ok = bool(qa.get("product_gate_pass", True))
+    if not product_ok:
+        reasons.append("product_damage")
+    band_m = {
+        "visible_band_score": qa.get("visible_band_score", 0.0),
+        "band_rectangularity": qa.get(
+            "band_rectangularity", qa.get("cover_rectangularity", 0.0)),
+        "band_luma_delta": qa.get("band_luma_delta", 0.0),
+        "band_edge_box_score": qa.get("band_edge_box_score", 0.0),
+    }
+    band_ok = band_gate(band_m, repaired=True)
+    if not band_ok:
+        reasons.append("visible_rectangular_band")
+    publish_ok = len(reasons) == 0
+    return {
+        "publish_ok": publish_ok,
+        "status": "clean_repaired" if publish_ok else "clean_covered",
+        "reject_reasons": reasons,
+        "residual_gate": {"pass": residual_ok,
+                          "dot_chain": qa.get("residual_dot_chain_score", 0.0)},
+        "product_gate": {"pass": product_ok},
+        "band_gate": {"pass": band_ok, **band_m},
+        "metrics_valid": metrics_valid,
+    }
 
 
 def _detect_alpha_halo(image, core_mask, bbox, delta_min=4, delta_max=35):
@@ -1529,6 +1723,10 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
     # 10. Cover rectangularity (V10 Patch 4) — never a visible band.
     cover_m = compute_cover_metrics(repaired, bbox)
 
+    # 10b. V12 Phase D — rectangular band visibility, computed for EVERY
+    # candidate (repairs included), not only adaptive covers.
+    band_m = detect_rectangular_band_visibility(repaired, bbox)
+
     # 11. SSIM + raw boundary jump (V11 — real, named QA metrics).
     if roi_o.size > 0 and roi_r.size > 0:
         ssim_score = _ssim_local(roi_o, roi_r)
@@ -1541,13 +1739,24 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
                                             ctx.product_mask)
     product_gate_pass, product_gate_reason = product_gate(prod_m)
 
+    # V12 Phase H — beam-selection penalties so a candidate with good
+    # seam/colour metrics but visible dot residue, a pale band, or a bright
+    # patch on a dark product can never out-rank a genuinely clean one.
+    contour_break = _clamp01(1.0 - prod_m["product_edge_retention"])
+
     # Final composite score (lower = better)
     final = (2.0 * wm_residual + 2.0 * cover_vis + 2.5 * seam +
              1.5 * prod_damage + 0.5 * (1.0 - tex_consist) +
              1.0 * color_d / max(COLOR_DELTA_MAX, 1) + 1.0 * edge_dmg +
              1.5 * rpv + 2.0 * residual.template_corr +
              1.5 * residual.text_component_score +
-             1.0 * (1.0 - residual.improvement_ratio))
+             1.0 * (1.0 - residual.improvement_ratio) +
+             # V12 Phase H penalties
+             4.0 * residual.dot_chain_score +
+             3.0 * band_m["visible_band_score"] +
+             3.0 * prod_m["product_new_bright_blob_score"] +
+             2.5 * contour_break +
+             2.0 * band_m["band_rectangularity"])
 
     # Acceptance thresholds
     wm_max = WATERMARK_RESIDUAL_MAX
@@ -1620,6 +1829,24 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
     passed = (metrics_valid and residual.passed and product_gate_pass and
               geometry_pass)
 
+    # V12 Phase A — unified publish verdict. A candidate is publishable AS A
+    # REPAIR only when it clears the base QA AND every strict visual gate
+    # (band, dot-chain). This is the single authority for clean_repaired.
+    _publish_qa = {
+        "metrics_valid": metrics_valid,
+        "residual_pass": residual.passed,
+        "residual_dot_chain_score": residual.dot_chain_score,
+        "product_gate_pass": product_gate_pass,
+        "visible_band_score": band_m["visible_band_score"],
+        "band_rectangularity": band_m["band_rectangularity"],
+        "band_luma_delta": band_m["band_luma_delta"],
+        "band_edge_box_score": band_m["band_edge_box_score"],
+    }
+    _verdict = final_publish_gate(_publish_qa, roi.roi_class)
+    publish_ok = bool(passed and _verdict["publish_ok"])
+    publish_status = "clean_repaired" if publish_ok else "clean_covered"
+    publish_reject_reasons = list(_verdict["reject_reasons"])
+
     if not metrics_valid:
         reason = (metrics_invalid_reasons[0] if metrics_invalid_reasons
                   else "qa_metrics_probably_not_computed")
@@ -1669,7 +1896,15 @@ def run_local_qa(ctx: RepairContext, candidate: RepairCandidate) -> QAResult:
         product_edge_retention=round(prod_m["product_edge_retention"], 4),
         product_gate_pass=product_gate_pass,
         product_gate_reason=product_gate_reason,
-        changed_area_ratio=round(prod_m["changed_area_ratio"], 4))
+        changed_area_ratio=round(prod_m["changed_area_ratio"], 4),
+        visible_band_score=band_m["visible_band_score"],
+        band_luma_delta=band_m["band_luma_delta"],
+        band_edge_box_score=band_m["band_edge_box_score"],
+        band_texture_drop=band_m["band_texture_drop"],
+        band_rectangularity=band_m["band_rectangularity"],
+        product_contour_break_score=round(contour_break, 4),
+        publish_ok=publish_ok, publish_status=publish_status,
+        publish_reject_reasons=publish_reject_reasons)
 
 
 def _qa_fail_reason(wm, wm_max, cv, cv_max, sd, sd_max, pd, pd_max,
@@ -4280,8 +4515,15 @@ def select_tools_for_roi(ctx: RepairContext) -> list[RepairTool]:
     roi_class = ctx.roi_analysis.roi_class
     tool_names = STRATEGY_BANK_BY_CLASS.get(
         roi_class, STRATEGY_BANK_BY_CLASS["unknown"])
+    # V12 Phase F — hard rule: on a dark product surface or a thin flex cable,
+    # white/median/plain fills are banned outright. A bright fill there always
+    # reads as a light block on a black surface, never a clean repair.
+    ban = (WHITE_FILL_BANNED_TOOLS
+           if roi_class in WHITE_FILL_BAN_CLASSES else set())
     tools = []
     for name in tool_names:
+        if name in ban:
+            continue
         tool = _TOOL_INDEX.get(name)
         if tool is not None:
             tools.append(tool)
@@ -4373,6 +4615,20 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
     tools_attempted = 0
     qa_reject_reasons = {}
 
+    # V12 — publish-gate rejection counters + micro-cleanup telemetry.
+    pub_counts = {"dot_chain_rejections": 0, "band_rejections": 0,
+                  "product_damage_rejections": 0,
+                  "micro_cleanup_attempts": 0, "micro_cleanup_successes": 0}
+
+    def _count_publish_rejections(reasons):
+        for rr in reasons:
+            if rr in ("dot_chain_residual", "readable_or_dotted_residual"):
+                pub_counts["dot_chain_rejections"] += 1
+            elif rr == "visible_rectangular_band":
+                pub_counts["band_rejections"] += 1
+            elif rr == "product_damage":
+                pub_counts["product_damage_rejections"] += 1
+
     # V11 Phase 7 — beam selection. Do NOT stop at the first passing
     # candidate on risky classes; try a bounded set of tools, keep every
     # candidate that clears the hard gates, and pick the best by composite
@@ -4427,7 +4683,37 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
             "method_family": family.value,
             "runtime_s": dt})
 
-        if qa.passed:
+        # V12 Phase A/C — a candidate may only become a clean_repaired
+        # candidate when it clears the unified publish gate (band + dot-chain
+        # included). When the ONLY thing standing in the way is leftover dot
+        # residue on a low-overlap surface, attempt a precise micro-cleanup of
+        # just those fragments before giving up on the repair.
+        if qa.passed and not qa.publish_ok:
+            only_dots = set(qa.publish_reject_reasons) <= {
+                "dot_chain_residual", "readable_or_dotted_residual"}
+            if (only_dots and qa.publish_reject_reasons and
+                    qa.product_overlap <= 0.15):
+                comp_mask = _residual_component_mask(
+                    ctx, candidate.repaired_image)
+                if comp_mask is not None:
+                    pub_counts["micro_cleanup_attempts"] += 1
+                    ring_med, _ = _ring_stats(candidate.repaired_image,
+                                              ctx.watermark_bbox)
+                    cleaned_img = cleanup_residual_components_with_ring_fill(
+                        candidate.repaired_image, ctx.watermark_bbox,
+                        comp_mask, ring_med)
+                    cleaned_cand = RepairCandidate(
+                        tool.name, cleaned_img,
+                        dict(candidate.metadata,
+                             cleaned_residual="micro_cleanup"))
+                    cqa = run_local_qa(ctx, cleaned_cand)
+                    if cqa.passed and cqa.publish_ok:
+                        pub_counts["micro_cleanup_successes"] += 1
+                        candidate, qa = cleaned_cand, cqa
+                        trace[-1]["qa"] = asdict(qa)
+                        trace[-1]["micro_cleanup"] = "success"
+
+        if qa.passed and qa.publish_ok:
             candidate.metadata["qa"] = asdict(qa)
             passed_candidates.append(
                 (qa.final_score, len(passed_candidates), tool.name,
@@ -4439,7 +4725,13 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
             if excellent:
                 break
         else:
-            qa_reject_reasons[tool.name] = qa.reason
+            # A candidate that cleared base QA but failed only the stricter
+            # publish gate is recorded with its publish reasons so the run
+            # can prove honesty (no false clean_repaired).
+            reasons = (qa.publish_reject_reasons if (qa.passed and
+                       not qa.publish_ok) else [qa.reason])
+            qa_reject_reasons[tool.name] = "|".join(reasons)
+            _count_publish_rejections(reasons)
             if qa.final_score < best_failed_score:
                 best_failed_score = qa.final_score
                 best_failed_candidate = candidate
@@ -4470,6 +4762,9 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
             "families_attempted": sorted(families_attempted),
             "final_method": win_name,
             "qa_reject_reasons": qa_reject_reasons,
+            "publish_status": "clean_repaired",
+            "forced_cover": False,
+            **pub_counts,
         }
         return win_cand, trace
 
@@ -4515,6 +4810,17 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
         "families_attempted": sorted(families_attempted),
         "final_method": "final_adaptive_cover",
         "qa_reject_reasons": qa_reject_reasons,
+        # V12 — every cover that follows ≥1 rejected repair is a forced,
+        # honest best-effort cover (Phase I status semantics).
+        "publish_status": "clean_covered",
+        "forced_cover": True,
+        "cover_band_pass": band_gate({
+            "visible_band_score": fallback_qa.visible_band_score,
+            "band_rectangularity": fallback_qa.band_rectangularity,
+            "band_luma_delta": fallback_qa.band_luma_delta,
+            "band_edge_box_score": fallback_qa.band_edge_box_score,
+        }, repaired=False),
+        **pub_counts,
     }
     fallback_candidate.metadata = cover_meta
     return fallback_candidate, trace
@@ -4530,7 +4836,8 @@ def save_debug_trace(debug_dir: str | Path, filename: str,
                      method_family: str = "",
                      roi_features: dict | None = None,
                      telemetry: dict | None = None,
-                     qa: dict | None = None):
+                     qa: dict | None = None,
+                     pipeline_version: str = ""):
     debug_path = Path(debug_dir) / filename.replace(".", "_")
     debug_path.mkdir(parents=True, exist_ok=True)
 
@@ -4543,6 +4850,9 @@ def save_debug_trace(debug_dir: str | Path, filename: str,
 
     trace_data = {
         "filename": filename,
+        "pipeline_version": pipeline_version or "V12_VISUAL_TRUTHFULNESS",
+        "qa_schema_version": QA_SCHEMA_VERSION,
+        "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
         "roi_class": roi_class,
         "watermark_bbox": list(bbox),
         "final_method": final_method,

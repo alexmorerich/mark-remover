@@ -41,6 +41,10 @@ from progressive_repair import (
     RepairContext,
     get_method_family,
     MethodFamily,
+    QA_SCHEMA_VERSION,
+    STRATEGY_SCHEMA_VERSION,
+    RESIDUAL_DOT_CHAIN_MAX,
+    BAND_VISIBLE_REPAIRED_MAX,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -50,10 +54,34 @@ DEFAULT_OUT = Path("output")
 
 
 # ---------------------------------------------------------------------------
-# V5 — Version constant and assertion.
+# V12 — Version constant and run metadata. The PDF / HTML / JSONL / trace must
+# all carry this exact string so a run can never claim a version other than
+# the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V10_QUALITY_PATCH"
-assert PIPELINE_VERSION == "V10_QUALITY_PATCH"
+PIPELINE_VERSION = "V12_VISUAL_TRUTHFULNESS"
+assert PIPELINE_VERSION == "V12_VISUAL_TRUTHFULNESS"
+
+
+def _git_commit() -> str:
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(SCRIPT_DIR), capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def run_metadata(seed: int) -> dict:
+    """V12 Phase J — run provenance embedded in every report."""
+    return {
+        "version": PIPELINE_VERSION,
+        "git_commit": _git_commit(),
+        "run_seed": seed,
+        "qa_schema_version": QA_SCHEMA_VERSION,
+        "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
+    }
 
 # ---------------------------------------------------------------------------
 # V5 — Four-state model. manual-review is eliminated.
@@ -3846,7 +3874,8 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                          bbox_tuple, trace, final_method,
                          method_family=method_family,
                          roi_features=roi_features,
-                         telemetry=telemetry, qa=qa_info)
+                         telemetry=telemetry, qa=qa_info,
+                         pipeline_version=PIPELINE_VERSION)
 
     is_cover = method_family == MethodFamily.ADAPTIVE_COVER.value
     status = ST_CLEAN_COVERED if is_cover else ST_CLEAN_REPAIRED
@@ -3930,8 +3959,27 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["v11_tools_reachable"] = telemetry.get("tools_reachable")
     rec["v11_tools_tried"] = telemetry.get("tools_tried")
     rec["v11_candidates_passed"] = telemetry.get("candidates_passed")
+    # V12 — visual-truthfulness verdicts + provenance.
+    rec["v12_publish_ok"] = qa_info.get("publish_ok")
+    rec["v12_publish_status"] = qa_info.get("publish_status")
+    rec["v12_publish_reject_reasons"] = qa_info.get("publish_reject_reasons")
+    rec["v12_visible_band_score"] = qa_info.get("visible_band_score")
+    rec["v12_band_luma_delta"] = qa_info.get("band_luma_delta")
+    rec["v12_band_edge_box_score"] = qa_info.get("band_edge_box_score")
+    rec["v12_band_rectangularity"] = qa_info.get("band_rectangularity")
+    rec["v12_product_contour_break_score"] = qa_info.get(
+        "product_contour_break_score")
+    rec["v12_forced_cover"] = telemetry.get("forced_cover")
+    rec["v12_dot_chain_rejections"] = telemetry.get("dot_chain_rejections")
+    rec["v12_band_rejections"] = telemetry.get("band_rejections")
+    rec["v12_product_damage_rejections"] = telemetry.get(
+        "product_damage_rejections")
+    rec["v12_micro_cleanup_attempts"] = telemetry.get("micro_cleanup_attempts")
+    rec["v12_micro_cleanup_successes"] = telemetry.get(
+        "micro_cleanup_successes")
+    rec["pipeline_version"] = PIPELINE_VERSION
     rec["repair_qa_pass"] = (not is_cover) and bool(qa_info.get("residual_pass")) \
-        and bool(qa_info.get("metrics_valid"))
+        and bool(qa_info.get("metrics_valid")) and bool(qa_info.get("publish_ok"))
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
@@ -4153,6 +4201,16 @@ def write_summary_jsonl(out_root, records):
             row["v9_roi_class"] = r.get("v9_roi_class")
             row["v9_tools_tried"] = r.get("v9_tools_tried")
             row["v9_rect_patch_visibility"] = r.get("v9_rect_patch_visibility")
+            # V12 — provenance + visual-truthfulness verdicts in every row.
+            row["pipeline_version"] = r.get("pipeline_version") or PIPELINE_VERSION
+            row["v12_publish_status"] = r.get("v12_publish_status")
+            row["v12_publish_reject_reasons"] = r.get(
+                "v12_publish_reject_reasons")
+            row["v12_visible_band_score"] = r.get("v12_visible_band_score")
+            row["v12_band_rectangularity"] = r.get("v12_band_rectangularity")
+            row["v11_residual_dot_chain_score"] = r.get(
+                "v11_residual_dot_chain_score")
+            row["v12_forced_cover"] = r.get("v12_forced_cover")
             f.write(json.dumps(row, default=str) + "\n")
 
 
@@ -4490,8 +4548,27 @@ def write_compare_pdf(out_root, records) -> Path:
            font=font_lg, fill="black")
     d.text((pad, pad + 28),
            "States: clean_repaired / clean_covered / no_watermark / "
-           "failed_io. V5 eliminates manual-review via auto-cover.",
+           "failed_io. Auto-cover eliminates manual-review.",
            font=font_md, fill="#555")
+    # V12 Phase J — provenance + honesty counters on the cover page.
+    rep_recs = [r for r in records if r["status"] == ST_CLEAN_REPAIRED]
+    cr_dot = sum(1 for r in rep_recs
+                 if (r.get("v11_residual_dot_chain_score") or 0.0)
+                 > RESIDUAL_DOT_CHAIN_MAX)
+    cr_band = sum(1 for r in rep_recs
+                  if (r.get("v12_visible_band_score") or 0.0)
+                  > BAND_VISIBLE_REPAIRED_MAX)
+    cr_prod = sum(1 for r in rep_recs if r.get("v11_product_gate_pass") is False)
+    meta = run_metadata(0)
+    d.text((pad, pad + 46),
+           f"git {meta['git_commit']} · qa_schema {meta['qa_schema_version']} "
+           f"· strategy_schema {meta['strategy_schema_version']}",
+           font=font_sm, fill="#777")
+    d.text((pad, pad + 60),
+           f"clean_repaired w/ dot-chain={cr_dot}  visible-band={cr_band}  "
+           f"product-damage={cr_prod}  (all must be 0)",
+           font=font_sm,
+           fill=("#0a4" if (cr_dot == cr_band == cr_prod == 0) else "#a00"))
 
     y = pad + 80
     d.text((pad, y), f"total images:   {len(records)}",
@@ -4947,6 +5024,40 @@ def main():
     real_repair = sum(1 for r in records if r.get("v9_is_real_repair"))
     cover_count = sum(1 for r in records if r.get("v9_is_cover"))
 
+    # V12 Phase J — visual-truthfulness summary counters. The three "*_in_*"
+    # counters are the honesty guarantee and must always be zero.
+    def _sum(key):
+        return sum(int(r.get(key) or 0) for r in records)
+
+    repaired_recs = [r for r in records if r["status"] == ST_CLEAN_REPAIRED]
+    cr_dot = sum(1 for r in repaired_recs
+                 if (r.get("v11_residual_dot_chain_score") or 0.0)
+                 > RESIDUAL_DOT_CHAIN_MAX)
+    cr_band = sum(1 for r in repaired_recs
+                  if (r.get("v12_visible_band_score") or 0.0)
+                  > BAND_VISIBLE_REPAIRED_MAX)
+    cr_prod = sum(1 for r in repaired_recs
+                  if r.get("v11_product_gate_pass") is False)
+    v12_counters = {
+        "dot_chain_rejections": _sum("v12_dot_chain_rejections"),
+        "band_rejections": _sum("v12_band_rejections"),
+        "product_damage_rejections": _sum("v12_product_damage_rejections"),
+        "micro_cleanup_attempts": _sum("v12_micro_cleanup_attempts"),
+        "micro_cleanup_successes": _sum("v12_micro_cleanup_successes"),
+        "forced_cover_count": sum(1 for r in records
+                                  if r.get("v12_forced_cover")),
+        "clean_repaired_with_visible_band": cr_band,
+        "clean_repaired_with_dot_chain": cr_dot,
+        "clean_repaired_with_product_damage": cr_prod,
+    }
+    zero_metric_passes = sum(
+        1 for r in repaired_recs if r.get("v10_metrics_valid") is False)
+    meta = run_metadata(args.seed)
+    meta["summary_counters"] = v12_counters
+    meta["status_counts"] = {s: counts.get(s, 0) for s in STATUS_ORDER}
+    meta["zero_metric_passes"] = zero_metric_passes
+    (out_root / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+
     print()
     print(f"=== {PIPELINE_VERSION} complete ===")
     print(f"total:            {len(records)}")
@@ -4982,12 +5093,36 @@ def main():
     for k, v in sorted(pg_counts.items()):
         print(f"  {k}: {v}")
     print()
-    print("V5 acceptance criteria:")
+    print("V12 visual-truthfulness counters:")
+    print(f"  dot_chain_rejections:                   "
+          f"{v12_counters['dot_chain_rejections']}")
+    print(f"  band_rejections:                        "
+          f"{v12_counters['band_rejections']}")
+    print(f"  product_damage_rejections:              "
+          f"{v12_counters['product_damage_rejections']}")
+    print(f"  micro_cleanup (attempts/successes):     "
+          f"{v12_counters['micro_cleanup_attempts']}/"
+          f"{v12_counters['micro_cleanup_successes']}")
+    print(f"  forced_cover_count:                     "
+          f"{v12_counters['forced_cover_count']}")
+    print()
+    print("V12 acceptance criteria (must all hold):")
     print(f"  manual-review count = 0:                {manual_review_count == 0}")
+    print(f"  failed_io = 0:                          "
+          f"{counts.get(ST_FAILED_IO, 0) == 0}")
+    print(f"  zero_metric_passes = 0:                 {zero_metric_passes == 0}")
+    print(f"  clean_repaired_with_dot_chain = 0:      "
+          f"{v12_counters['clean_repaired_with_dot_chain'] == 0}")
+    print(f"  clean_repaired_with_visible_band = 0:   "
+          f"{v12_counters['clean_repaired_with_visible_band'] == 0}")
+    print(f"  clean_repaired_with_product_damage = 0: "
+          f"{v12_counters['clean_repaired_with_product_damage'] == 0}")
     print(f"  every image has terminal status:        {every_has_status}")
     print(f"  every image has qa.json:                {every_has_qa}")
     print(f"  no false clean_repaired:                {no_false_clean_repaired}")
     print(f"  no-watermark images untouched:          {no_wm_untouched}")
+    print(f"  git_commit={meta['git_commit']} seed={meta['run_seed']} "
+          f"qa_schema={meta['qa_schema_version']}")
     print(f"  report title = {PIPELINE_VERSION}")
     print()
     print(f"compare html:    {out_root / 'compare.html'}")

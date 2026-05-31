@@ -2,6 +2,80 @@
 
 Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort.
 
+## V12 — Visual Truthfulness (unified publish gate, band detector, residual cleanup)
+
+V12 does **not** add a new tool bank. It makes visual acceptance match human
+inspection: the V11 compare PDF still passed dot-chain residue, pale
+rectangular bands, and bright patches on dark product surfaces as
+`clean_repaired`, and the report still said `V10_QUALITY_PATCH`. V12 closes
+those holes and makes the status describe **publish quality, not method
+family**.
+
+- **`final_publish_gate()` — the single source of truth (Phase A).** No
+  candidate becomes `clean_repaired` from its method family alone. After every
+  candidate, one unified verdict requires *all* of: `metrics_valid`,
+  `residual_pass` (incl. dot-chain), `product_gate_pass`, **and** the band
+  gate. Anything short is, at best, an honest `clean_covered`. Returns
+  `{publish_ok, status, reject_reasons, residual_gate, product_gate, band_gate}`.
+- **Stronger dot-chain / broken-glyph detector (Phase B).** The ceiling drops
+  `0.35 → 0.28`, plus a count-based rule: reject when `component_count ≥ 4`
+  **and** `horizontal_span > 0.22` **and** `component_area_ratio > 0.035` — a
+  row of aligned fragments a human still reads as a line, even when no whole
+  letter survives.
+- **Residual micro-cleanup before cover escalation (Phase C).** When the only
+  thing blocking a repair is leftover dots on a low-overlap surface,
+  `cleanup_residual_components_with_ring_fill` paints **just those component
+  pixels** (ring-median + feather), re-runs the full QA, and accepts if it now
+  clears every gate — instead of escalating to a larger visible cover.
+- **Rectangular-band gate on *every* candidate (Phase D).**
+  `detect_rectangular_band_visibility` runs on repairs too, not only covers. A
+  band is only flagged when it has a real signature — straight box edges or a
+  luma offset — so a smooth inpaint on a textured surface is **not**
+  mis-demoted. `clean_repaired` requires `visible_band_score ≤ 0.18`,
+  `rectangularity ≤ 0.20`, `band_luma_delta ≤ 6`, `edge_box ≤ 0.16`; covers use
+  looser ceilings but still reject obvious bands.
+- **Product damage over the full changed region (Phase E).** The product gate
+  measures `product_mask ∩ changed_region` inside a padded window, scoring
+  colour delta, new bright/dark blob, edge retention, **contour break**
+  (`1 − edge_retention`), and changed-area ratio. Bright fill on a black
+  surface is essentially never allowed.
+- **Dark-product / thin-flex routing (Phase F).** White / median / plain fills
+  are **banned outright** on `dark_product_surface` and `thin_flex_cable`
+  (`WHITE_FILL_BANNED_TOOLS`); those classes lead with stroke-mask,
+  dark-surface clone, gamma/contrast match, and segmented repair.
+- **Beam penalties for visual residue (Phase H).** The composite score adds
+  `4·dot_chain + 3·visible_band + 3·bright_blob + 2.5·contour_break +
+  2·rectangularity`, so a candidate with good seam/colour but bad visual
+  residue can never out-rank a genuinely clean one.
+- **Honest status semantics + provenance (Phase I/J).** A cover after ≥1
+  rejected repair is reported as a forced best-effort cover (`forced_cover`).
+  Every report — PDF title, HTML, `summary.jsonl`, `run_metadata.json`, and
+  each `trace.json` — carries `V12_VISUAL_TRUTHFULNESS` with
+  `qa_schema_version = strategy_schema_version = v12`, the git commit and run
+  seed. The cover page prints the three honesty counters
+  (`clean_repaired_with_{dot_chain,visible_band,product_damage}`), which must
+  all be 0.
+
+### V12 results (50-image benchmark, seed 2026)
+
+| Metric | Result | Target |
+|--------|--------|--------|
+| total / failed_io | 50 / 0 | 0 |
+| clean_repaired / clean_covered | 28 / 22 | 28–34 / ≤ 22 |
+| manual_review | 0 | 0 |
+| zero-metric passes | 0 | 0 |
+| `clean_repaired_with_dot_chain` | 0 | 0 |
+| `clean_repaired_with_visible_band` | 0 | 0 |
+| `clean_repaired_with_product_damage` | 0 | 0 |
+| band rejections (demoted to cover) | 21 | — |
+| unique final methods | 10 | ≥ 10 |
+
+The band gate alone demoted **21** would-be-false `clean_repaired` outputs to
+honest covers — exactly the V12 goal. Per the plan, V12 is **not** optimised
+for `clean_repaired` percentage: honest `clean_covered` outranks dishonest
+`clean_repaired`. `test_v12_visual_truthfulness.py` locks every guarantee
+above (16 cases).
+
 ## V11 — Honest QA (no zero-metric passes, dot-chain & product-damage gates)
 
 V11 does **not** add repair methods. It makes the existing ones *honest*: the
@@ -671,10 +745,11 @@ output/
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mark_remover.py` | ~4,900 | Main pipeline: detection, masks, QA, orchestration |
-| `progressive_repair.py` | ~3,600 | Strategy bank: 100 tools, ROI classifier, V10 truthful QA + residual gate + honest covers |
+| `mark_remover.py` | ~5,000 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + provenance/counters |
+| `progressive_repair.py` | ~4,700 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
+| `test_v12_visual_truthfulness.py` | ~260 | V12 lock: publish gate authority, dot-chain 0.28, band gate, dark-product ban, version/schema consistency (16 cases) |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -703,7 +778,8 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | V8 | Progressive repair strategy bank | 100 tools, 11 ROI classes, per-class strategy ordering, local QA gate |
 | V9 | Method families + RPV gate | Truthful status via method family, product-overlap guard, rectangular-patch-visibility gate |
 | V10 | Quality patch: truthful QA + honest covers | Fail-closed QA, mask-aware residual watermark gate, 3-layer mask, inpaint-based covers (no gray bands), strategy reorder, diversity telemetry, regression lock |
-| **V11** | **Honest QA enforcement** | **Mandatory `validate_qa_metrics` (real ssim/boundary_jump, no zero-metric passes), dot-chain/broken-glyph residual gate, product-overlap damage gate (bright-blob/colour/edge/area), plain-white fast path, beam selection over first-pass, honesty telemetry + regression lock** |
+| V11 | Honest QA enforcement | Mandatory `validate_qa_metrics` (real ssim/boundary_jump, no zero-metric passes), dot-chain/broken-glyph residual gate, product-overlap damage gate (bright-blob/colour/edge/area), plain-white fast path, beam selection over first-pass, honesty telemetry + regression lock |
+| **V12** | **Visual truthfulness** | **Unified `final_publish_gate` as the only `clean_repaired` authority, dot-chain ceiling 0.35→0.28 + count rule, residual micro-cleanup before cover, rectangular-band gate on every candidate, full-changed-region product gate + contour-break, dark-product/thin-flex white-fill ban, beam visual-residue penalties, forced-cover semantics, version/schema provenance in PDF/HTML/JSONL/trace + three must-be-zero counters** |
 
 ## License
 
