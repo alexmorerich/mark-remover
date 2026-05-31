@@ -53,6 +53,15 @@ except Exception:  # pragma: no cover
     _pr_detect_residual = None
     _HAVE_PR = False
 
+# V15 — optional cover-quality patch (mask widening / ghost-aware residual /
+# dark-stroke inpaint). Imported softly so V14 still runs if it is absent.
+try:  # pragma: no cover
+    import v15_patch
+    _HAVE_V15 = True
+except Exception:  # pragma: no cover
+    v15_patch = None
+    _HAVE_V15 = False
+
 
 # ---------------------------------------------------------------------------
 # Failure classification (Section 3.3).
@@ -499,16 +508,26 @@ def cover_hides_watermark(original, cover, bbox, watermark_mask) -> bool:
         kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 9))
         mask_roi = cv2.dilate((watermark_mask > 0).astype(np.uint8) * 255, kd,
                               iterations=1)[by:by + bh, bx:bx + bw]
+    hidden = True
     if _pr_detect_residual is not None:
         try:
-            return bool(_pr_detect_residual(o, c, ring_gray=ring,
-                                            mask_roi=mask_roi).passed)
+            hidden = bool(_pr_detect_residual(o, c, ring_gray=ring,
+                                              mask_roi=mask_roi).passed)
         except Exception:
-            return True
-    # Fallback: no readable dot-chain residue ⇒ hidden.
-    dc = v13_gates.detect_residual_dot_chain_v2(original, cover, bbox,
-                                                watermark_mask)
-    return dc["passed"]
+            hidden = True
+    else:
+        # Fallback: no readable dot-chain residue ⇒ hidden.
+        hidden = v13_gates.detect_residual_dot_chain_v2(
+            original, cover, bbox, watermark_mask)["passed"]
+    # V15 — also require the FULL text region to be ghost-free, so a faint
+    # trailing glyph the mask-relative check missed still counts as "not hidden".
+    if hidden and _HAVE_V15:
+        try:
+            hidden = v15_patch.full_region_residual_ok(
+                original, cover, bbox, watermark_mask)
+        except Exception:
+            pass
+    return hidden
 
 
 def polish_cover(original, cover, bbox, context: Optional[SoftContext] = None):
@@ -550,14 +569,31 @@ def segmented_micro_cover(image, bbox, watermark_mask=None, product_mask=None,
                                                  watermark_mask, context)
     cands = []  # (name, image, used_full_bbox)
 
-    seg = _segmented_fragment_fill(image, bbox, watermark_mask, product_mask)
+    # V15 — widen the stroke mask to the full watermark text line so clipped
+    # trailing glyphs are covered too, and add a dark-stroke inpaint candidate
+    # on dark surfaces (no light/median fill there).
+    wide_mask = watermark_mask
+    if _HAVE_V15 and watermark_mask is not None:
+        try:
+            wide_mask = v15_patch.widen_text_mask(image, bbox, watermark_mask,
+                                                  product_mask)
+        except Exception:
+            wide_mask = watermark_mask
+        if v15_patch.is_dark_surface(image, bbox) or \
+                (context is not None and (context.dark_surface or
+                                          context.thin_flex_cable)):
+            ds = v15_patch.dark_stroke_cover(image, bbox, wide_mask)
+            if ds is not None:
+                cands.append(("dark_stroke_micro_cover", ds, False))
+
+    seg = _segmented_fragment_fill(image, bbox, wide_mask, product_mask)
     if seg is not None:
         cands.append(("segmented_micro_cover", seg, False))
-    so = _stroke_only_fill(image, bbox, watermark_mask)
+    so = _stroke_only_fill(image, bbox, wide_mask)
     if so is not None:
         cands.append(("stroke_only_micro_cover", so, False))
     for r in (2, 3):
-        sb = _stroke_band_fill(image, bbox, watermark_mask, radius=r)
+        sb = _stroke_band_fill(image, bbox, wide_mask, radius=r)
         if sb is not None:
             cands.append((f"stroke_band_micro_cover_r{r}", sb, False))
     if not banned:

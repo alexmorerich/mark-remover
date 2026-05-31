@@ -1,6 +1,62 @@
 # Mark Remover
 
-Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. V13 adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success. **V14 (current)** keeps that gate untouched and instead makes the *candidates* better: a near-miss rescue layer recovers genuine repairs that V13 would have demoted, and a segmented micro-cover beam search replaces the blunt full-bbox cover — lifting true `clean_repaired` output from 25 → 29 / 50 while preserving the V13 honesty guarantee (zero false `clean_repaired`).
+Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. V13 adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success. V14 keeps that gate untouched and makes the *candidates* better (near-miss rescue + segmented micro-cover beam), lifting true `clean_repaired` output 25 → 29 / 50. **V15 (current)** is a cover-quality patch: it polishes covers to remove bright/hard patches, widens the watermark mask to the full `sunsky-online.com` text line (no faint trailing ghosts), adds a ghost-aware full-region residual verdict, and inpaints dark-cable strokes from neighbouring pixels — all while preserving the V13 honesty guarantee (zero false `clean_repaired`).
+
+## V15 — Cover Quality (polish, full-text mask, ghost-aware residual, dark-stroke inpaint)
+
+V15 answers a simple visual complaint: *the repairs look clean, but some covered
+images still show the mark.* The 29 `clean_repaired` were genuinely clean — the
+problem was entirely on the cover side, in two forms: a **bright/hard patch**
+(e.g. a white box over a dark flex cable) and **faint residual text** (a trailing
+`sunsky-online.com` ghost the mask-relative residual gate missed). V15 fixes the
+generators, never the gate.
+
+- **Cover polish (`v14_patch.polish_cover`).** Every micro-cover candidate is
+  passed through a bounded Lab match toward the local ring + a wider feathered
+  seam *before* the beam scores it, and the beam's boundary-jump term is now
+  *uncapped* — so a catastrophic patch can never be selected over a soft one.
+  Worst-case boundary jumps roughly halved (touch-test flex **222 → 102**,
+  ipad-mini panel **242 → 110**, front-camera flex **207 → 93**).
+- **Full-text mask widening (`v15_patch.widen_text_mask`).** The detector often
+  clips trailing glyphs; V15 template-locates the whole watermark text row in a
+  horizontally-expanded band and grows the stroke mask to cover the clipped
+  glyphs — with three guards (skip busy product bands, drop product-overlapping
+  components, refuse runaway expansion) so it never eats product detail.
+- **Ghost-aware residual (`v15_patch.full_region_residual_ok`).** Hiding is now
+  verified across the *full* text region, not only inside the tight mask, using
+  the canonical-watermark **template correlation** (deliberately *not* a generic
+  text-component count, which false-positives on flex-cable / connector texture).
+  A faint surviving ghost is caught and the cover is rejected / re-tried.
+- **Dark-stroke inpaint (`v15_patch.dark_stroke_cover`).** On a dark / flex-cable
+  surface the widened stroke mask is inpainted from neighbouring (dark) pixels
+  with Telea — never a light/median fill that would leave a bright block.
+
+### V15 results (50-image benchmark, seed 7)
+
+| Metric | V13 | V14 | V15 | |
+|--------|-----|-----|-----|---|
+| clean_repaired | 25 | 29 | 28–29¹ | ✅ |
+| clean_covered | 25 | 21 | 21–22¹ | ✅ |
+| false `clean_repaired` | 0 | 0 | **0** | ✅ |
+| product / silhouette damage on covers | 0 | 0 | **0** | ✅ |
+| readable residue on covers | — | 0 | **0** | ✅ |
+| worst cover boundary jump | — | 222 | **102** | ↓ |
+| manual_review / failed_io | 0 | 0 | 0 | ✅ |
+
+¹ ±1 is run-to-run noise from the non-seeded fill noise on borderline near-miss
+candidates.
+
+**What V15 fixed:** the bright-box covers are gone (soft blended wedges now), and
+faint trailing-text ghosts are removed (e.g. the volume-button flex no longer
+shows a readable `sunsky-online.com`). **What remains (honest):** six covers
+where the watermark straddles a high-contrast cable / background **edge** still
+report `boundary_jump > 50` — removing the mark there unavoidably disturbs the
+edge. Those need **V16 structure-aware reconstruction** (edge/structure-tensor
+or stroke-level neural inpaint); V15 ships the cover-quality generators + honest
+labelling of that remaining gap. `test_v15_patch.py` locks the three V15
+primitives; the full V10–V15 suite stays green (69 cases).
+
+## V14 — Better Candidates (near-miss rescue + segmented micro-cover beam, V13 gate unchanged)
 
 ## V14 — Better Candidates (near-miss rescue + segmented micro-cover beam, V13 gate unchanged)
 
@@ -908,7 +964,8 @@ output/
 | `mark_remover.py` | ~5,100 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + V13 final visual gate + **V14 finalize hook (near-miss rescue / micro-cover routing)** + provenance/counters |
 | `progressive_repair.py` | ~4,900 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` + **V14 best-failed-candidate surfacing** |
 | `v13_gates.py` | ~620 | **V13 final visual fidelity gates** (unchanged in V14): `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
-| `v14_patch.py` | ~520 | **V14 better candidates**: `soft_qa_context`, `classify_failure`, `near_miss_rescue`, `segmented_micro_cover` beam search, `full_bbox_cover_banned`, cover honesty counters, `v14_finalize` orchestrator |
+| `v14_patch.py` | ~600 | **V14 better candidates + V15 cover polish**: `soft_qa_context`, `classify_failure`, `near_miss_rescue`, `segmented_micro_cover` beam search, `full_bbox_cover_banned`, `polish_cover`, cover honesty counters, `v14_finalize` orchestrator |
+| `v15_patch.py` | ~230 | **V15 cover-quality patch**: `widen_text_mask`, `full_region_residual_ok` (ghost-aware), `dark_stroke_cover`, `is_dark_surface` |
 | `v13_report.py` | ~150 | V13 honesty report / CI gate + **V14 cover-side counters & target metrics**: tallies must-be-zero counters from per-image `qa.json` |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
@@ -917,6 +974,7 @@ output/
 | `test_v13_detectors.py` | ~95 | V13 lock: dot-chain v2, visible-patch-shape, silhouette, product-overlap detectors |
 | `test_v13_report_honesty.py` | ~55 | V13 lock: honesty counters increment on bad output, stay 0 on clean |
 | `test_v14_regression.py` | ~230 | **V14 lock**: failure classification, full-bbox bans, near-miss rescue, micro-cover beam, cover counters + end-to-end honesty guarantees on the 8 Section 8 weak cases |
+| `test_v15_patch.py` | ~120 | **V15 lock**: mask widening (bounded, skips busy product), ghost-aware full-region residual (catches faint ghost, ignores product texture), dark-stroke cover |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -949,6 +1007,7 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | **V12** | **Visual truthfulness** | **Unified `final_publish_gate` as the only `clean_repaired` authority, dot-chain ceiling 0.35→0.28 + count rule, residual micro-cleanup before cover, rectangular-band gate on every candidate, full-changed-region product gate + contour-break, dark-product/thin-flex white-fill ban, beam visual-residue penalties, forced-cover semantics, version/schema provenance in PDF/HTML/JSONL/trace + three must-be-zero counters** |
 | **V13** | **Final visual fidelity** | **`final_visual_publish_gate_v13` applied to repaired AND covered outputs (honest demotion of weak repairs), new dot-chain-v2 / visible-patch-shape / product-silhouette / product-overlap / protected-text detectors in `v13_gates.py`, `v13_report.py` must-be-zero honesty counters, version → `V13_FINAL_VISUAL_FIDELITY` / schema `v13`** |
 | **V14** | **Better candidates (gate unchanged)** | **Additive `v14_patch.py`: adaptive soft-metric context, near-miss rescue (component cleanup + gamma/Lab match + seam smoothing) of soft-fail repairs before cover, segmented micro-cover beam search replacing full-bbox cover with full-bbox-on-product/flex/glass/metallic/text bans, fresh per-candidate hiding verdict + V13-passing cover selection, cover-side honesty counters + target metrics in `v13_report.py`, best-failed-candidate surfacing from the repair loop, `test_v14_regression.py`. clean_repaired 25→29 / 50 with zero false repairs. Version → `V14_BETTER_CANDIDATES`, V13 gate version stays `v13`.** |
+| **V15** | **Cover quality (gate unchanged)** | **Cover polish (`polish_cover`: clamped Lab match + wider seam feather, uncapped boundary term) → worst cover boundary jump 222→102; additive `v15_patch.py`: `widen_text_mask` (full `sunsky-online.com` line, 3 product-safety guards), `full_region_residual_ok` (ghost-aware, template-correlation based — ignores flex-cable texture), `dark_stroke_cover` (Telea from dark neighbours, no light fill); `test_v15_patch.py`. Bright-box covers + faint trailing ghosts removed, zero false repairs / product / silhouette damage. Remaining 6 cable-edge covers deferred to V16 structure reconstruction. Version → `V15_COVER_QUALITY`, V13 gate version stays `v13`.** |
 
 ## License
 

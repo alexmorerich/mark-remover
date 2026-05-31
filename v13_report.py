@@ -109,7 +109,7 @@ def build_report(out_root: Path) -> dict:
     final_adaptive_cover = method_use.get("final_adaptive_cover", 0)
     opencv_telea = method_use.get("opencv_telea_inpaint", 0)
     report = {
-        "version": "V14_BETTER_CANDIDATES",
+        "version": "V15_COVER_QUALITY",
         "qa_schema_version": "v13",
         "final_visual_gate_version": "v13",
         "n_published": n,

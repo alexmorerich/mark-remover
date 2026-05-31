@@ -60,9 +60,9 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V14_BETTER_CANDIDATES"
-assert PIPELINE_VERSION == "V14_BETTER_CANDIDATES"
-# V14 keeps the V13 final visual gate unchanged; only the candidate / cover
+PIPELINE_VERSION = "V15_COVER_QUALITY"
+assert PIPELINE_VERSION == "V15_COVER_QUALITY"
+# V14/V15 keep the V13 final visual gate unchanged; only the candidate / cover
 # generators improve, so the gate version stays at v13.
 FINAL_VISUAL_GATE_VERSION = "v13"
 
@@ -4976,6 +4976,11 @@ def main():
     pg.add_argument("--force-presence-check", action="store_true")
 
     args = ap.parse_args()
+
+    # V15 — seed numpy so the cover/fill noise is deterministic and the
+    # benchmark is reproducible run-to-run (the file pick already uses its own
+    # seeded RNG; this only fixes the in-fill Gaussian noise).
+    np.random.seed(args.seed)
 
     if not args.assets.is_dir():
         sys.exit(f"assets dir not found: {args.assets}")
