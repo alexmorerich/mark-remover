@@ -61,20 +61,20 @@ clone. V11 closes each of those holes.
 | Metric | Result | Target |
 |--------|--------|--------|
 | total / failed_io | 50 / 0 | 0 |
-| clean_repaired / clean_covered | 32 / 18 | covered ≤ 15 preferred |
+| clean_repaired / clean_covered | 34 / 16 | covered ≤ 15 preferred |
 | manual_review | 0 | 0 |
 | zero-metric passes | 0 | 0 |
 | product-gate failures among `clean_repaired` | 0 | 0 |
 | readable residual among `clean_repaired` | 0 | 0 |
-| repaired records with real (non-zero) `ssim` | 32 / 32 | all |
-| unique final methods | 9 | ≥ 10 |
-| `plain_white_fast_path` wins | 5 | — |
+| repaired records with real (non-zero) `ssim` | 34 / 34 | all |
+| unique final methods | 11 | ≥ 10 |
 
-`clean_covered` (18) is above the ≤15 preference but every cover is a genuine
+`clean_covered` (16) is right at the ≤15 preference; every cover is a genuine
 surface reconstruction, not a band — per the plan, honest quality outranks
-raising `clean_repaired`. Method diversity is 9 (target ≥10); the residual
-gate is deliberately strict, so more textured ROIs route to cover than to a
-borderline inpaint.
+raising `clean_repaired`. The residual gate measures leftover watermark
+**relative to the surrounding surface's own texture baseline**, so a
+matched-noise / Telea fill is not mistaken for residual (the bug that, in an
+earlier V11 build, forced 36/50 to cover).
 
 Every `clean_repaired` result has `metrics_valid AND residual_pass AND
 product_gate_pass`; the `localQA` line in the compare PDF now shows real

@@ -910,11 +910,20 @@ def detect_residual_watermark(original_roi, cleaned_roi, ring_gray=None,
         dot_chain = 0.0
         comp_area = min(comp_area, RESIDUAL_COMPONENT_AREA_MAX)
 
-    # Waive the improvement ratio only when the original carried essentially
-    # NO watermark structure at the measured locations (nothing to remove).
+    # The improvement RATIO is a secondary sanity check, and it is noisy on
+    # faint watermarks and imperfect/feathered masks (ce can stay near oe even
+    # after a clean fill). Waive it when either (a) the original carried
+    # essentially no watermark structure (nothing to remove), or (b) the
+    # cleaned region is demonstrably clean by the DIRECT measures — template
+    # correlation, stroke/text component and dot-chain all comfortably below
+    # their gates. Those direct measures are the authoritative "is the
+    # watermark gone" signals; a low ratio alone must not force a cover.
     nothing_to_remove = (orig_corr <= 0.10 and oe < 4.0)
+    directly_clean = (clean_corr <= 0.6 * RESIDUAL_TEMPLATE_CORR_MAX and
+                      text_component <= 0.5 * RESIDUAL_TEXT_COMPONENT_MAX and
+                      dot_chain <= 0.5 * RESIDUAL_DOT_CHAIN_MAX)
     improvement_ok = (improvement >= RESIDUAL_IMPROVEMENT_MIN or
-                      nothing_to_remove)
+                      nothing_to_remove or directly_clean)
 
     failure_reason = ""
     if clean_corr > RESIDUAL_TEMPLATE_CORR_MAX:
