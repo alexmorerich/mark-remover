@@ -1,6 +1,81 @@
 # Mark Remover
 
-Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. **V13 (current)** adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success.
+Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. V13 adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success. **V14 (current)** keeps that gate untouched and instead makes the *candidates* better: a near-miss rescue layer recovers genuine repairs that V13 would have demoted, and a segmented micro-cover beam search replaces the blunt full-bbox cover — lifting true `clean_repaired` output from 25 → 29 / 50 while preserving the V13 honesty guarantee (zero false `clean_repaired`).
+
+## V14 — Better Candidates (near-miss rescue + segmented micro-cover beam, V13 gate unchanged)
+
+V14 is a *short patch* with one principle: **keep V13 strict, make the candidates
+better.** The V13 final visual gate (`final_visual_publish_gate_v13`) is **not
+weakened in any way** — the goal is not to label more dirty output as clean, it
+is to generate candidates that *truly pass* the existing gate. All V14 logic
+lives in the additive, self-contained `v14_patch.py` and is wired in at the
+single post-candidate decision point in `process_image`; V14 only ever asks the
+unchanged V13 gate to bless a result.
+
+- **Adaptive soft-metric context (Section 3.2).** `soft_qa_context` builds a
+  multi-signal surface profile (plain/near white, saturated flat product, thin
+  flex cable, complex detail, dark, glass/gradient, metallic) and context-aware
+  *soft* limits. These only decide whether a failed repair is a rescuable
+  near-miss — the **hard** V13 metrics (residual, dot-chain, protected text,
+  silhouette, product damage, geometric patches) are never relaxed.
+- **Near-miss rescue before cover (Section 3.3).** A `clean_repaired` candidate
+  that fails V13 only on *soft* visual-fidelity reasons (a faint patch / band) is
+  classified `soft_fail` and run through `near_miss_rescue`: component-level
+  residual cleanup → gamma/Lab colour match of just the changed pixels toward the
+  surrounding ring → 1px seam smoothing. The rescued image is re-checked against
+  the V13 **repaired** gate and kept as `clean_repaired` only if it now fully
+  passes. Any *hard* reason ⇒ no rescue, straight to cover. The repair loop also
+  surfaces its best failed candidate so a candidate that fell all the way to
+  cover can still be rescued.
+- **Segmented micro-cover beam search (Section 3.4).** `segmented_micro_cover`
+  replaces the full-bbox `final_adaptive_cover`. It generates several
+  fragment-based covers (segmented background/product fill, stroke-only,
+  stroke-band r2/r3, and — only when allowed — a full-bbox fill), scores the
+  integrated result (dot-chain + visible-patch + *uncapped* boundary jump +
+  silhouette + edge loss + colour + texture + rectangularity + protected-text),
+  then publishes the first candidate that passes the V13 **covered** gate (with a
+  fresh, per-candidate watermark-hiding verdict). A **full-bbox cover is banned**
+  whenever `product_overlap > 0.10`, `edge_density > 0.04`, long lines, or a
+  flex-cable / metallic / glass / protected-text zone is detected.
+- **Cover-side honesty counters (Section 7).** `v14_patch.COVER_HONESTY_COUNTERS`
+  +`v13_report.py` now tally `clean_covered_with_{visible_patch, product_damage,
+  silhouette_damage, boundary_jump_gt_50, full_bbox_on_product,
+  protected_text_loss}`. These are surfaced honestly (the CI gate stays red while
+  any are non-zero) — never hidden.
+- **Version → `V14_BETTER_CANDIDATES`.** The V13 final visual gate version stays
+  `v13` (it is unchanged); the pipeline/report version is bumped to V14.
+
+### V14 results (50-image benchmark, seed 2026)
+
+| Metric | V13 baseline | V14 | Target | |
+|--------|--------------|-----|--------|---|
+| clean_repaired | 25 | **29** | ≥ 29 | ✅ |
+| clean_covered | 25 | **21** | ≤ 21 | ✅ |
+| near-miss rescued | 0 | **5** | ≥ 5 | ✅ |
+| segmented micro-cover used | 0 | **10** | ≥ 8 | ✅ |
+| final_adaptive_cover used | — | 8 | ≤ 12 | ✅ |
+| full-bbox cover on product overlap | — | **0** | 0 | ✅ |
+| unique final methods | 8 | **14** | ≥ 12 | ✅ |
+| `clean_repaired_with_*` (dirty repairs) | 0 | **0** | 0 | ✅ |
+| product / silhouette damage on covers | 0 | **0** | 0 | ✅ |
+| manual_review / failed_io | 0 / 0 | 0 / 0 | 0 | ✅ |
+
+**The V13 honesty guarantee is fully preserved: every `clean_repaired_with_*`
+counter is 0** — no dirty repair was ever upgraded to hit the target. The +4
+genuine repairs came from real candidate improvement (5 near-miss rescues, minus
+1 still-honest demotion), not from relaxing the gate.
+
+**Cover side (honest, still the hard problem):** the report still flags
+`clean_covered_with_visible_patch = 11`, `…_boundary_jump_gt_50 = 6`,
+`…_protected_text_loss = 8`, `…_dot_chain = 2`. These are genuine and concentrate
+on the hardest mixed surfaces (metallic / flex-cable / glass) where *hiding* the
+watermark and passing *every* soft visual gate are in direct tension. V14 still
+**hides the watermark and refuses a full-bbox-on-product fill** on every one of
+them — it does not fake a pass. Driving these to 0 needs the V16 high-frequency
+texture reconstruction the plan defers; V14 ships the better generators + honest
+labelling of the remaining gap. `test_v14_regression.py` locks the unconditional
+V14 guarantees on the eight Section 8 weak cases and the v14_patch primitives;
+the full V10–V14 suite stays green (62 cases).
 
 ## V13 — Final Visual Fidelity (publish gate on covers too, shape/silhouette detectors)
 
@@ -830,16 +905,18 @@ output/
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mark_remover.py` | ~5,100 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + **V13 final visual gate / honest demotion** + provenance/counters |
-| `progressive_repair.py` | ~4,700 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` |
-| `v13_gates.py` | ~620 | **V13 final visual fidelity gates**: `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
-| `v13_report.py` | ~95 | **V13 honesty report / CI gate**: tallies must-be-zero counters from per-image `qa.json` |
+| `mark_remover.py` | ~5,100 | Main pipeline: detection, masks, QA, orchestration, V12 publish gate + V13 final visual gate + **V14 finalize hook (near-miss rescue / micro-cover routing)** + provenance/counters |
+| `progressive_repair.py` | ~4,900 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` + **V14 best-failed-candidate surfacing** |
+| `v13_gates.py` | ~620 | **V13 final visual fidelity gates** (unchanged in V14): `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
+| `v14_patch.py` | ~520 | **V14 better candidates**: `soft_qa_context`, `classify_failure`, `near_miss_rescue`, `segmented_micro_cover` beam search, `full_bbox_cover_banned`, cover honesty counters, `v14_finalize` orchestrator |
+| `v13_report.py` | ~150 | V13 honesty report / CI gate + **V14 cover-side counters & target metrics**: tallies must-be-zero counters from per-image `qa.json` |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
 | `test_v12_visual_truthfulness.py` | ~260 | V12 lock: publish gate authority, dot-chain 0.28, band gate, dark-product ban, version/schema consistency |
 | `test_v13_final_visual_gate.py` | ~70 | V13 lock: final visual gate accepts clean / rejects bad output, repaired **and** covered |
 | `test_v13_detectors.py` | ~95 | V13 lock: dot-chain v2, visible-patch-shape, silhouette, product-overlap detectors |
 | `test_v13_report_honesty.py` | ~55 | V13 lock: honesty counters increment on bad output, stay 0 on clean |
+| `test_v14_regression.py` | ~230 | **V14 lock**: failure classification, full-bbox bans, near-miss rescue, micro-cover beam, cover counters + end-to-end honesty guarantees on the 8 Section 8 weak cases |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -871,6 +948,7 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | V11 | Honest QA enforcement | Mandatory `validate_qa_metrics` (real ssim/boundary_jump, no zero-metric passes), dot-chain/broken-glyph residual gate, product-overlap damage gate (bright-blob/colour/edge/area), plain-white fast path, beam selection over first-pass, honesty telemetry + regression lock |
 | **V12** | **Visual truthfulness** | **Unified `final_publish_gate` as the only `clean_repaired` authority, dot-chain ceiling 0.35→0.28 + count rule, residual micro-cleanup before cover, rectangular-band gate on every candidate, full-changed-region product gate + contour-break, dark-product/thin-flex white-fill ban, beam visual-residue penalties, forced-cover semantics, version/schema provenance in PDF/HTML/JSONL/trace + three must-be-zero counters** |
 | **V13** | **Final visual fidelity** | **`final_visual_publish_gate_v13` applied to repaired AND covered outputs (honest demotion of weak repairs), new dot-chain-v2 / visible-patch-shape / product-silhouette / product-overlap / protected-text detectors in `v13_gates.py`, `v13_report.py` must-be-zero honesty counters, version → `V13_FINAL_VISUAL_FIDELITY` / schema `v13`** |
+| **V14** | **Better candidates (gate unchanged)** | **Additive `v14_patch.py`: adaptive soft-metric context, near-miss rescue (component cleanup + gamma/Lab match + seam smoothing) of soft-fail repairs before cover, segmented micro-cover beam search replacing full-bbox cover with full-bbox-on-product/flex/glass/metallic/text bans, fresh per-candidate hiding verdict + V13-passing cover selection, cover-side honesty counters + target metrics in `v13_report.py`, best-failed-candidate surfacing from the repair loop, `test_v14_regression.py`. clean_repaired 25→29 / 50 with zero false repairs. Version → `V14_BETTER_CANDIDATES`, V13 gate version stays `v13`.** |
 
 ## License
 

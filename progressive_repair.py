@@ -4803,6 +4803,15 @@ def repair_image_progressively(ctx: RepairContext) -> tuple[RepairCandidate, lis
     cover_meta["final_method"] = "final_adaptive_cover"
     cover_meta["method_family"] = MethodFamily.ADAPTIVE_COVER.value
     cover_meta["is_real_repair"] = False
+    # V14 — surface the best repair that *almost* passed (cleared base QA but
+    # failed only the stricter publish/visual gate) so the V14 near-miss rescue
+    # can target the real repaired candidate instead of the blunt cover.
+    if best_failed_candidate is not None:
+        bfq = best_failed_candidate.metadata.get("qa", {})
+        cover_meta["best_failed_image"] = best_failed_candidate.repaired_image
+        cover_meta["best_failed_tool"] = best_failed_tool
+        cover_meta["best_failed_publish_reasons"] = list(
+            bfq.get("publish_reject_reasons", []) or [])
     cover_meta["telemetry"] = {
         "roi_class": ctx.roi_analysis.roi_class,
         "strategy_list": strategy_list,

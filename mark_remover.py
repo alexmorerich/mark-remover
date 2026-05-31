@@ -47,6 +47,7 @@ from progressive_repair import (
     BAND_VISIBLE_REPAIRED_MAX,
 )
 import v13_gates
+import v14_patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -59,8 +60,10 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V13_FINAL_VISUAL_FIDELITY"
-assert PIPELINE_VERSION == "V13_FINAL_VISUAL_FIDELITY"
+PIPELINE_VERSION = "V14_BETTER_CANDIDATES"
+assert PIPELINE_VERSION == "V14_BETTER_CANDIDATES"
+# V14 keeps the V13 final visual gate unchanged; only the candidate / cover
+# generators improve, so the gate version stays at v13.
 FINAL_VISUAL_GATE_VERSION = "v13"
 
 
@@ -3986,27 +3989,57 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
 
     # --- V13 Final Visual Fidelity gate — applies to BOTH repaired and ---
     # covered outputs (patch plan section 2 / P0). It never relaxes a V12 gate;
-    # it adds shape / silhouette / dot-chain / protected-text checks. A
-    # clean_repaired that fails any visual gate is honestly demoted to
-    # clean_covered (we never silently upgrade a cover).
-    v13_verdict = v13_gates.final_visual_publish_gate_v13(
+    # it adds shape / silhouette / dot-chain / protected-text checks.
+    #
+    # V14 — instead of bluntly demoting a failing clean_repaired into the V13
+    # cover, route the result through v14_finalize. It (a) rescues a SOFT-fail
+    # repaired candidate (component cleanup + gamma/Lab match + seam smoothing)
+    # and keeps it clean_repaired only if the rescue fully re-passes the V13
+    # repaired gate, and (b) otherwise builds a segmented micro-cover beam
+    # search that is banned from a full-bbox fill on product / flex-cable /
+    # long-line / glass / metallic / protected-text zones. The V13 gate itself
+    # is never weakened — v14_finalize only ever asks it to bless a result.
+    final_image = candidate.repaired_image
+
+    def _v14_gate(image, repaired, residual_pass=None):
+        # residual_pass override lets V14 feed a FRESH watermark-hiding verdict
+        # for a newly-built cover image (the stale qa_info reflects the
+        # candidate it replaced). The hard residual gate is still enforced —
+        # only the source of the verdict is corrected, never relaxed.
+        qa = qa_info
+        if residual_pass is not None:
+            qa = dict(qa_info, residual_pass=bool(residual_pass))
+        return v13_gates.final_visual_publish_gate_v13(
+            img, image, bbox_tuple, protect_combined, qa,
+            repaired=repaired, watermark_mask=masks.get("stroke"))
+
+    v13_verdict = _v14_gate(candidate.repaired_image, repaired=(not is_cover))
+    pre_v14_repaired = (not is_cover)
+
+    outcome = v14_patch.v14_finalize(
         img, candidate.repaired_image, bbox_tuple, protect_combined,
-        qa_info, repaired=(not is_cover),
-        watermark_mask=masks.get("stroke"))
-    if (not is_cover) and (not v13_verdict.publish_ok):
-        is_cover = True
-        status = ST_CLEAN_COVERED
-        rec["status"] = ST_CLEAN_COVERED
-        rec["v13_demoted_from_repaired"] = True
-        # Re-evaluate under the (looser, but still real) covered thresholds so
-        # the recorded verdict + honesty counters reflect what was published.
-        v13_verdict = v13_gates.final_visual_publish_gate_v13(
-            img, candidate.repaired_image, bbox_tuple, protect_combined,
-            qa_info, repaired=False, watermark_mask=masks.get("stroke"))
-    else:
-        rec.setdefault("v13_demoted_from_repaired", False)
+        masks.get("stroke"), _v14_gate,
+        is_cover=is_cover, v13_verdict=v13_verdict,
+        roi_class=pr_roi.roi_class,
+        base_cover_image=(candidate.repaired_image if is_cover else None),
+        pre_cover_repaired_image=candidate.metadata.get("best_failed_image"))
+
+    final_image = outcome.image
+    candidate.repaired_image = final_image
+    v13_verdict = outcome.verdict
+    is_cover = (outcome.status == ST_CLEAN_COVERED)
+    status = outcome.status
+    rec["status"] = status
+    rec["v13_demoted_from_repaired"] = bool(pre_v14_repaired and is_cover)
+    rec.update(outcome.telemetry)
+    if outcome.telemetry.get("v14_near_miss_rescued"):
+        rec["v9_final_method"] = (final_method + "+v14_near_miss_rescue")
+    elif is_cover and outcome.telemetry.get("v14_cover_method"):
+        rec["v9_final_method"] = outcome.telemetry["v14_cover_method"]
+        rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
     rec.update(v13_verdict.to_record())
-    rec["repair_qa_pass"] = rec["repair_qa_pass"] and v13_verdict.publish_ok
+    rec["repair_qa_pass"] = (not is_cover) and bool(v13_verdict.publish_ok) \
+        and bool(qa_info.get("residual_pass")) and bool(qa_info.get("metrics_valid"))
     rec["v9_is_cover"] = is_cover
     rec["v9_is_real_repair"] = not is_cover
 
