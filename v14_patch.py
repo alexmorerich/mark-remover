@@ -511,6 +511,23 @@ def cover_hides_watermark(original, cover, bbox, watermark_mask) -> bool:
     return dc["passed"]
 
 
+def polish_cover(original, cover, bbox, context: Optional[SoftContext] = None):
+    """V15 fast-win — soften a cover so it does not read as a bright/hard patch.
+
+    Two bounded corrections on the covered footprint only:
+      * a clamped Lab match pulling the fill toward the surrounding ring (kills a
+        fill that is brighter / off-colour vs the local background — the white
+        box on a dark cable);
+      * a wider feathered seam so the rectangle edge is broken up (drops the
+        boundary jump that makes a cover look pasted-on).
+    Covers tolerate a larger correction than a repair, so the shift cap is
+    higher here than in near_miss_rescue."""
+    out = _gamma_lab_match(original, cover, bbox, context, max_shift=14.0,
+                           damp=0.8)
+    out = _seam_smooth(original, out, bbox, band_px=5)
+    return out
+
+
 @dataclass
 class MicroCoverResult:
     image: np.ndarray
@@ -554,6 +571,12 @@ def segmented_micro_cover(image, bbox, watermark_mask=None, product_mask=None,
     if not cands:
         return MicroCoverResult(image=image, method="passthrough",
                                 used_full_bbox=False, score=float("inf"))
+
+    # V15 fast-win — polish every candidate (luma match + seam feather) so a
+    # bright/hard patch is softened before scoring; the uncapped boundary term
+    # then naturally prefers the softened version.
+    cands = [(name, polish_cover(image, img, bbox, context), full)
+             for name, img, full in cands]
 
     scored = []
     for name, img, full in cands:
