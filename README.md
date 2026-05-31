@@ -1,6 +1,79 @@
 # Mark Remover
 
-Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and the first passing candidate wins. Adaptive cover is the absolute last resort. V13 adds a final visual-fidelity gate that runs on every published image — repaired or covered — so no visible rectangle, wedge, pale band, dark-surface blob, broken product contour or dot-chain residue is ever shipped as a success. V14 keeps that gate untouched and makes the *candidates* better (near-miss rescue + segmented micro-cover beam), lifting true `clean_repaired` output 25 → 29 / 50. **V15 (current)** is a cover-quality patch: it polishes covers to remove bright/hard patches, widens the watermark mask to the full `sunsky-online.com` text line (no faint trailing ghosts), adds a ghost-aware full-region residual verdict, and inpaints dark-cable strokes from neighbouring pixels — all while preserving the V13 honesty guarantee (zero false `clean_repaired`).
+Automated watermark detection and removal pipeline for sunsky-online.com product images. V8 replaces the fixed candidate loop with a **100-tool progressive repair strategy bank** — each watermark ROI is classified, tools are selected from an ordered strategy bank, candidates run through a local QA gate, and a bounded beam picks the best. Adaptive cover is the absolute last resort. V13 adds a final visual-fidelity gate; V14/V15 improve the candidate & cover generators (near-miss rescue, segmented micro-cover beam, full-text mask, ghost-aware residual, post-clean re-detection). **V16 (current)** closes the loop into a **complete automated decision pipeline**: it adds the `auto_rejected` final state and enforces one invariant — **only an output that passes every P0 gate may be published as `clean_repaired`/`clean_covered`; everything else is `auto_rejected` (a final automated decision, never published, never manual review).** Zero manual review, zero dirty publish, zero product-damaged publish.
+
+## V16 — Complete Auto-Decision Pipeline (zero dirty publish, `auto_rejected` state)
+
+V16 fixes the one remaining semantic hole in V13–V15: a repair that failed the
+final gate could be *demoted* to `clean_covered`, and that cover could itself
+still fail the gate yet ship as `clean_covered`. V16 forbids this. The pipeline
+is now an explicit state machine (`v16_pipeline.decide_final_status`):
+
+```
+repair candidate passes P0 gate          -> clean_repaired
+else residual micro-cleanup passes        -> clean_repaired
+else best cover candidate passes P0 gate  -> clean_covered
+else                                      -> auto_rejected
+```
+
+There is **no path from a failed final gate into a clean_* status.**
+
+- **New final state `auto_rejected`** (patch plan). Repair *and* cover both
+  failed the P0 gate ⇒ the image is rejected automatically — `publish_ok=false`,
+  `manual_required=false`. It is **not** manual review; it is a final decision.
+  Diagnostic artifacts (`best_repair_attempt.jpg`, `best_cover_attempt.jpg`,
+  masks, overlay, `qa.json`) are written to `auto_rejected/` — never a
+  publishable folder.
+- **P0 gate = same strictness for repaired and covered (Fix 5).** The unchanged
+  `final_visual_publish_gate_v13` *plus* a post-clean watermark re-detection
+  (residual-OCR / template-residual) on the actual output. Aesthetic scoring may
+  differ between repaired and covered; the **safety** gates may not.
+- **Candidate vs final failures split (Fix 2).** `candidate_publish_failures`
+  (intermediate repair/cover candidates the gate rejected) may be > 0 and is
+  expected. `final_output_publish_failures` (a *published* output that failed the
+  gate) **must be 0** — and is, by construction.
+- **Cover beam (Fix 4).** A failed repair triggers a real cover beam
+  (segmented / stroke-only / stroke-band / dark-stroke / forced-removal /
+  uniform-fill); each cover independently runs the full P0 gate; the first that
+  passes becomes `clean_covered`, else `auto_rejected`.
+- **`v13_report.py` is now the V16 CI gate (Fix 6).** It tallies the
+  `published_with_*` P0 counters from each published `qa.json` and **exits 1** if
+  any is non-zero or any `final_output_publish_failure` is set. Rejected
+  candidates and `auto_rejected` images are reported separately and are allowed.
+- **Honest tool availability (Fix 12).** The report surfaces `tools_reachable`
+  (e.g. 13), not a claimed "100".
+- **Manifest schema (Fix 8).** Each row carries `final_status`, `publish_ok`,
+  `manual_required`, `final_gate_pass`, `candidate_publish_failures`,
+  `final_output_publish_failure`, `reject_reasons`, and a `p0_gates` dict.
+
+### V16 results (50-image benchmark, seed 7, deterministic)
+
+| Final status | Count |
+|--------------|-------|
+| `clean_repaired` | 30 |
+| `clean_covered` | 3 |
+| `auto_rejected` | 17 |
+| `failed_io` | 0 |
+| **manual_review** | **0** |
+
+| Must-be-zero (published outputs) | Value |
+|----------------------------------|-------|
+| `published_with_residual_ocr` … `_protected_text_damage` (8 counters) | **0** |
+| `final_output_publish_failures` | **0** |
+
+| Allowed | Value |
+|---------|-------|
+| `candidate_publish_failures` | 147 |
+| `auto_rejected_after_cover_fail` | 17 |
+
+**The CI gate passes (`all_clean: true`).** 33 / 50 images are published
+**100% clean** (every P0 gate green); the 17 hardest mixed surfaces
+(metallic / flex-cable / glass, where no cover passes the strict safety gate) are
+**auto-rejected rather than shipped dirty** — exactly the spec's intent ("we are
+not trying to guarantee 100% invisible repair; we guarantee every image is
+truthfully classified, and a failed cover becomes `auto_rejected`, not
+`clean_covered`"). `test_v16_pipeline.py` locks the state machine + CI gate; the
+full V10–V16 suite stays green (81 cases).
 
 ## V15 — Cover Quality (polish, full-text mask, ghost-aware residual, dark-stroke inpaint)
 
@@ -928,12 +1001,14 @@ Each processed image produces a `trace.json` in the debug directory:
 
 ## Output Statuses
 
-| Status | `publish_ok` | Meaning |
-|--------|-------------|---------|
-| `clean_repaired` | `true` | A strategy bank tool passed QA. Watermark invisibly removed. |
-| `clean_covered` | `true` | Final adaptive cover applied. Watermark hidden naturally. |
-| `no_watermark` | `true` | Presence gate determined no watermark. Image untouched. |
-| `failed_io` | `false` | Corrupt or unreadable file. |
+| Status | `publish_ok` | `manual_required` | Meaning |
+|--------|-------------|-------------------|---------|
+| `clean_repaired` | `true` | `false` | A repair candidate passed the final visual publish gate (all P0 gates). Watermark invisibly removed. |
+| `clean_covered` | `true` | `false` | A cover candidate independently passed the same P0 gate. Watermark hidden, output publishable. |
+| `no_watermark_confirmed` | `true` | `false` | Strong negative evidence confirms no Sunsky watermark. Image untouched. |
+| `skipped_known_clean` | `true` | `false` | Known-clean category (e.g. iPhone 14+), optionally sample-audited. |
+| `auto_rejected` | `false` | `false` | **V16** — repair AND cover both failed the final gate. A final *automated* decision: not published, **not** manual review. Diagnostics saved to `auto_rejected/`. |
+| `failed_io` | `false` | `false` | Corrupt or unreadable file. |
 
 ## Usage
 
@@ -1003,7 +1078,8 @@ output/
 | `v13_gates.py` | ~620 | **V13 final visual fidelity gates** (unchanged in V14): `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
 | `v14_patch.py` | ~600 | **V14 better candidates + V15 cover polish**: `soft_qa_context`, `classify_failure`, `near_miss_rescue`, `segmented_micro_cover` beam search, `full_bbox_cover_banned`, `polish_cover`, cover honesty counters, `v14_finalize` orchestrator |
 | `v15_patch.py` | ~340 | **V15 / V15.1 cover-quality patch**: `widen_text_mask`, `full_region_residual_ok` (ghost-aware), `dark_stroke_cover`, `is_dark_surface`, `is_uniform_local_background`, `uniform_background_fill`, `forced_removal_fill` |
-| `v13_report.py` | ~150 | V13 honesty report / CI gate + **V14 cover-side counters & target metrics**: tallies must-be-zero counters from per-image `qa.json` |
+| `v16_pipeline.py` | ~230 | **V16 auto-decision state machine**: `decide_final_status` (repair → micro-cleanup → cover beam → auto_rejected), P0-gated publishing, candidate-vs-final failure split |
+| `v13_report.py` | ~150 | **V16 CI gate**: tallies `published_with_*` P0 counters from per-image `qa.json`, exits 1 on any dirty published output; reports `auto_rejected` / candidate failures / tool availability separately |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
 | `test_v12_visual_truthfulness.py` | ~260 | V12 lock: publish gate authority, dot-chain 0.28, band gate, dark-product ban, version/schema consistency |
@@ -1012,6 +1088,7 @@ output/
 | `test_v13_report_honesty.py` | ~55 | V13 lock: honesty counters increment on bad output, stay 0 on clean |
 | `test_v14_regression.py` | ~230 | **V14 lock**: failure classification, full-bbox bans, near-miss rescue, micro-cover beam, cover counters + end-to-end honesty guarantees on the 8 Section 8 weak cases |
 | `test_v15_patch.py` | ~120 | **V15 lock**: mask widening (bounded, skips busy product), ghost-aware full-region residual (catches faint ghost, ignores product texture), dark-stroke cover |
+| `test_v16_pipeline.py` | ~190 | **V16 lock**: failed repair+cover → auto_rejected, passing cover → clean_covered with all P0 green, candidate failures allowed, auto_rejected ≠ manual, report CI fails on dirty published output |
 | `detector.py` | ~4,500 | Multi-stage watermark detection engine |
 | `watermark-template.png` | -- | Canonical 24px watermark template for logo mask bank |
 
@@ -1046,6 +1123,7 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | **V14** | **Better candidates (gate unchanged)** | **Additive `v14_patch.py`: adaptive soft-metric context, near-miss rescue (component cleanup + gamma/Lab match + seam smoothing) of soft-fail repairs before cover, segmented micro-cover beam search replacing full-bbox cover with full-bbox-on-product/flex/glass/metallic/text bans, fresh per-candidate hiding verdict + V13-passing cover selection, cover-side honesty counters + target metrics in `v13_report.py`, best-failed-candidate surfacing from the repair loop, `test_v14_regression.py`. clean_repaired 25→29 / 50 with zero false repairs. Version → `V14_BETTER_CANDIDATES`, V13 gate version stays `v13`.** |
 | **V15** | **Cover quality (gate unchanged)** | **Cover polish (`polish_cover`: clamped Lab match + wider seam feather, uncapped boundary term) → worst cover boundary jump 222→102; additive `v15_patch.py`: `widen_text_mask` (full `sunsky-online.com` line, 3 product-safety guards), `full_region_residual_ok` (ghost-aware, template-correlation based — ignores flex-cable texture), `dark_stroke_cover` (Telea from dark neighbours, no light fill); `test_v15_patch.py`. Bright-box covers + faint trailing ghosts removed, zero false repairs / product / silhouette damage. Version → `V15_COVER_QUALITY`, V13 gate version stays `v13`.** |
 | **V15.1** | **Two fatal fixes (gate unchanged)** | **(1) Pure-background neighbour imitation — `is_uniform_local_background` (immediate-perimeter judged) + `uniform_background_fill` (Telea from surround) replaces garble-prone template/clone repairs on uniform surfaces (24/50 use it). (2) Post-clean re-detection — `recheck_watermark_present` re-runs the detector on our own output and `forced_removal_fill` escalates any surviving watermark; new `v15_still_marked_after_clean` counter = 0/50. clean_repaired 30/50, zero outputs ship with the mark, zero false repairs / product / silhouette damage. 74 tests green.** |
+| **V16** | **Complete auto-decision pipeline (gate unchanged)** | **New `auto_rejected` final state + `v16_pipeline.decide_final_status` state machine: repair → micro-cleanup → cover beam → auto_rejected; ONLY P0-gate-passing outputs become clean_repaired/clean_covered (no demote-to-cover). P0 gate = V13 visual gate + post-clean re-detection, same strictness for repaired & covered. `v13_report.py` rewritten as CI gate (`published_with_*` MUST_BE_ZERO, exit 1 on dirty publish); candidate-vs-final failure split; honest `tools_reachable`; `auto_rejected/` diagnostic folder; manifest `p0_gates` schema; `test_v16_pipeline.py`. 50-img seed 7: 30 repaired / 3 covered / 17 auto_rejected, manual_review=0, all published_with_*=0, CI green. Version → `V16_AUTO_DECISION`, visual gate stays `v13`.** |
 
 ## License
 

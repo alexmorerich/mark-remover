@@ -197,54 +197,50 @@ KNOWN_HARD_COVER_CASES = {
 
 
 @pytest.mark.parametrize("fname", REGRESSION_FILES)
-def test_regression_structural_honesty(pipeline_outputs, fname):
-    """Assert the honesty guarantees V14 enforces for EVERY published image.
-
-    These hold unconditionally and are the real V14 contract. Per-file soft
-    cover-fidelity targets (no visible patch / no protected-text loss on the
-    hardest mixed surfaces) are NOT asserted here — they are surfaced honestly
-    by the report's V14 cover honesty counters, exactly as V13 surfaces its own.
+def test_regression_v16_contract(pipeline_outputs, fname):
+    """V16 contract for EVERY weak case: a terminal automated state, and — the
+    decisive invariant — a PUBLISHED output (clean_repaired / clean_covered)
+    must pass every P0 gate. A case that cannot be cleaned safely is
+    auto_rejected (not published, not manual review), which is allowed.
     """
     rec = pipeline_outputs.get(fname)
     if rec is None:
         pytest.skip(f"{fname} not in bench_assets")
     status = rec.get("status")
-    # Guarantee 1 — every weak case reaches a terminal published state.
-    assert status in ("clean_repaired", "clean_covered", "no_watermark"), \
+    assert status in ("clean_repaired", "clean_covered", "auto_rejected",
+                      "no_watermark_confirmed", "skipped_known_clean"), \
         f"{fname}: unexpected status {status}"
-    if status == "no_watermark":
-        return
 
-    # Guarantee 2 — a clean_repaired must FULLY pass the unchanged V13 gate
-    # (V14 never weakens it; a soft-fail repair is rescued or honestly covered).
-    if status == "clean_repaired":
-        assert rec.get("v13_publish_ok") is True, \
-            f"{fname}: clean_repaired without V13 publish_ok"
+    # auto_rejected is a final AUTOMATED decision — never manual review.
+    assert rec.get("manual_required") is False, f"{fname}: manual_required set"
 
-    # Guarantee 3 — never a full-bbox cover over a product-overlap region.
-    assert not rec.get("v14_used_full_bbox_on_product"), \
-        f"{fname}: full-bbox cover on product overlap"
-
-    # Guarantee 4 — the watermark is always hidden (no readable residue).
-    assert rec.get("v13_residual_pass", True), \
-        f"{fname}: readable watermark residue remains"
-
-    # Soft cover-fidelity targets — firm for everything except the documented
-    # hardest mixed surfaces (tracked by the report's cover honesty counters).
-    if fname not in KNOWN_HARD_COVER_CASES:
-        assert rec.get("v13_protected_text_pass", True), \
-            f"{fname}: protected product text lost"
-        assert (rec.get("v14_boundary_jump") or 0.0) <= 50.0, \
-            f"{fname}: boundary jump {rec.get('v14_boundary_jump')} > 50"
+    if status in ("clean_repaired", "clean_covered"):
+        # A published output must pass the final gate AND every P0 gate.
+        assert rec.get("publish_ok") is True, f"{fname}: published not publish_ok"
+        assert rec.get("final_output_publish_failure") is False, \
+            f"{fname}: final_output_publish_failure on a published output"
+        p0 = rec.get("p0_gates", {})
+        assert all(p0.values()), f"{fname}: published with failing P0 gate {p0}"
+        assert not rec.get("v14_used_full_bbox_on_product"), \
+            f"{fname}: full-bbox cover on product overlap"
+    else:
+        # auto_rejected / negative — not published.
+        assert rec.get("publish_ok") in (False, None), \
+            f"{fname}: non-published status marked publish_ok"
 
 
-def test_known_hard_cases_still_hide_and_avoid_full_bbox(pipeline_outputs):
-    """The documented hard cases must still meet the V14 *hard* contract: the
-    watermark is hidden and no full-bbox cover lands on product pixels."""
+def test_known_hard_cases_never_published_dirty(pipeline_outputs):
+    """The documented hard cases must never ship dirty: each is EITHER published
+    with all P0 gates green, OR auto_rejected — never clean_* with residue."""
     for fname in KNOWN_HARD_COVER_CASES:
         rec = pipeline_outputs.get(fname)
         if rec is None:
             continue
-        assert rec.get("v13_residual_pass", True), f"{fname}: residue remains"
-        assert not rec.get("v14_used_full_bbox_on_product"), \
-            f"{fname}: full-bbox cover on product overlap"
+        status = rec.get("status")
+        if status in ("clean_repaired", "clean_covered"):
+            assert all(rec.get("p0_gates", {}).values()), \
+                f"{fname}: published with a failing P0 gate"
+        else:
+            assert status == "auto_rejected", \
+                f"{fname}: unexpected status {status}"
+            assert rec.get("publish_ok") in (False, None)

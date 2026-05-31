@@ -49,6 +49,7 @@ from progressive_repair import (
 import v13_gates
 import v14_patch
 import v15_patch
+import v16_pipeline
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -61,10 +62,12 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V15_COVER_QUALITY"
-assert PIPELINE_VERSION == "V15_COVER_QUALITY"
-# V14/V15 keep the V13 final visual gate unchanged; only the candidate / cover
-# generators improve, so the gate version stays at v13.
+PIPELINE_VERSION = "V16_AUTO_DECISION"
+assert PIPELINE_VERSION == "V16_AUTO_DECISION"
+# V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
+# auto_rejected final state + a post-clean re-detection P0 gate around it, so
+# only gate-passing outputs are ever published. The visual gate version is v13;
+# the final-decision/state-machine version is v16.
 FINAL_VISUAL_GATE_VERSION = "v13"
 
 
@@ -95,8 +98,14 @@ def run_metadata(seed: int) -> dict:
 # ---------------------------------------------------------------------------
 ST_CLEAN_REPAIRED = "clean_repaired"
 ST_CLEAN_COVERED = "clean_covered"
-ST_NO_WATERMARK = "no_watermark"
+ST_NO_WATERMARK = "no_watermark_confirmed"
+ST_AUTO_REJECTED = "auto_rejected"          # V16 — repair AND cover both failed
+ST_SKIPPED_KNOWN_CLEAN = "skipped_known_clean"
 ST_FAILED_IO = "failed_io"
+
+# V16 — the only publishable final states (publish_ok=true, manual_required=false).
+PUBLISHABLE_STATUSES = (ST_CLEAN_REPAIRED, ST_CLEAN_COVERED, ST_NO_WATERMARK,
+                        ST_SKIPPED_KNOWN_CLEAN)
 
 # Legacy aliases — mapped internally for backward compat.
 ST_CLEAN = ST_CLEAN_REPAIRED
@@ -4035,26 +4044,17 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     rec["repair_qa_pass"] = (not is_cover) and bool(qa_info.get("residual_pass")) \
         and bool(qa_info.get("metrics_valid")) and bool(qa_info.get("publish_ok"))
 
-    # --- V13 Final Visual Fidelity gate — applies to BOTH repaired and ---
-    # covered outputs (patch plan section 2 / P0). It never relaxes a V12 gate;
-    # it adds shape / silhouette / dot-chain / protected-text checks.
-    #
-    # V14 — instead of bluntly demoting a failing clean_repaired into the V13
-    # cover, route the result through v14_finalize. It (a) rescues a SOFT-fail
-    # repaired candidate (component cleanup + gamma/Lab match + seam smoothing)
-    # and keeps it clean_repaired only if the rescue fully re-passes the V13
-    # repaired gate, and (b) otherwise builds a segmented micro-cover beam
-    # search that is banned from a full-bbox fill on product / flex-cable /
-    # long-line / glass / metallic / protected-text zones. The V13 gate itself
-    # is never weakened — v14_finalize only ever asks it to bless a result.
-    final_image = candidate.repaired_image
+    # --- V16 — Complete auto-decision state machine. ------------------------
+    # The unchanged V13 final visual gate + a post-clean watermark re-detection
+    # together form the P0 publish gate (SAME strictness for repaired and
+    # covered). decide_final_status runs: repair candidate -> residual cleanup
+    # -> cover beam -> auto_rejected. ONLY a candidate that passes every P0 gate
+    # is labelled clean_repaired / clean_covered; everything else becomes
+    # auto_rejected — a final automated decision, never published, never manual
+    # review. There is no path from a failed final gate into a clean_* status.
     stroke_mask = masks.get("stroke")
 
-    def _v14_gate(image, repaired, residual_pass=None):
-        # residual_pass override lets V14 feed a FRESH watermark-hiding verdict
-        # for a newly-built cover image (the stale qa_info reflects the
-        # candidate it replaced). The hard residual gate is still enforced —
-        # only the source of the verdict is corrected, never relaxed.
+    def _v16_gate(image, repaired, residual_pass=None):
         qa = qa_info
         if residual_pass is not None:
             qa = dict(qa_info, residual_pass=bool(residual_pass))
@@ -4062,95 +4062,61 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             img, image, bbox_tuple, protect_combined, qa,
             repaired=repaired, watermark_mask=stroke_mask)
 
-    pre_v14_repaired = (not is_cover)
+    def _v16_recheck(image):
+        return recheck_watermark_present(rwm, image, bbox_tuple)
 
-    # --- V15.1 Fix 1 — pure / near-uniform background: just imitate the ---
-    # neighbour. On a uniform local background the only correct repair is to
-    # copy the surrounding background over the footprint; the clever
-    # template-logo / clone methods can leave a garbled doubled-glyph smear that
-    # the faint-tolerant metric QA misses (the iPhone-11 touch-panel case). So
-    # when the surround is uniform we fill from it directly and prefer that.
-    rec["v15_uniform_background_fill"] = False
-    uniform_handled = False
-    if v15_patch.is_uniform_local_background(img, bbox_tuple, protect_combined):
-        clean_fill = v15_patch.uniform_background_fill(img, bbox_tuple, stroke_mask)
-        fv = _v14_gate(clean_fill, True, True)
-        if fv.publish_ok:
-            candidate.repaired_image = final_image = clean_fill
-            v13_verdict = fv
-            is_cover = False
-            status = ST_CLEAN_REPAIRED
-            rec["v9_final_method"] = "v15_uniform_background_fill"
-            rec["v9_method_family"] = MethodFamily.REAL_PIXEL_CLONE.value
-            rec["v15_uniform_background_fill"] = True
-            uniform_handled = True
+    v16 = v16_pipeline.decide_final_status(
+        img, bbox_tuple, protect_combined, stroke_mask, qa_info,
+        loop_repair_image=(None if is_cover else candidate.repaired_image),
+        loop_repair_method=final_method,
+        best_failed_image=candidate.metadata.get("best_failed_image"),
+        loop_cover_image=(candidate.repaired_image if is_cover else None),
+        roi_class=pr_roi.roi_class,
+        gate_fn=_v16_gate, recheck_fn=_v16_recheck)
 
-    if not uniform_handled:
-        v13_verdict = _v14_gate(candidate.repaired_image, repaired=(not is_cover))
-        outcome = v14_patch.v14_finalize(
-            img, candidate.repaired_image, bbox_tuple, protect_combined,
-            stroke_mask, _v14_gate,
-            is_cover=is_cover, v13_verdict=v13_verdict,
-            roi_class=pr_roi.roi_class,
-            base_cover_image=(candidate.repaired_image if is_cover else None),
-            pre_cover_repaired_image=candidate.metadata.get("best_failed_image"))
-        final_image = candidate.repaired_image = outcome.image
-        v13_verdict = outcome.verdict
-        is_cover = (outcome.status == ST_CLEAN_COVERED)
-        status = outcome.status
-        rec.update(outcome.telemetry)
-        if outcome.telemetry.get("v14_near_miss_rescued"):
-            rec["v9_final_method"] = (final_method + "+v14_near_miss_rescue")
-        elif is_cover and outcome.telemetry.get("v14_cover_method"):
-            rec["v9_final_method"] = outcome.telemetry["v14_cover_method"]
-            rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
+    status = v16.status
+    final_image = candidate.repaired_image = v16.image
+    v13_verdict = v16.verdict
+    is_cover = (status == ST_CLEAN_COVERED)
+    publishable = status in (ST_CLEAN_REPAIRED, ST_CLEAN_COVERED)
 
     rec["status"] = status
-    rec["v13_demoted_from_repaired"] = bool(pre_v14_repaired and is_cover)
-
-    # --- V15.1 Fix 2 — post-clean watermark re-detection (double-check). ---
-    # Run the detector back over our own output. If it still confirms the
-    # watermark at the original location, the clean FAILED — escalate to a
-    # forced removal of the full text band and re-check. The watermark must go.
-    still, rinfo = recheck_watermark_present(rwm, final_image, bbox_tuple)
-    rec["v15_recheck_status"] = rinfo.get("status")
-    rec["v15_recheck_confidence"] = rinfo.get("confidence")
-    rec["v15_escalated"] = False
-    if still:
-        if v15_patch.is_uniform_local_background(img, bbox_tuple, protect_combined):
-            esc = v15_patch.uniform_background_fill(img, bbox_tuple, stroke_mask)
-        else:
-            esc = v15_patch.forced_removal_fill(img, bbox_tuple, stroke_mask)
-        still2, rinfo2 = recheck_watermark_present(rwm, esc, bbox_tuple)
-        rec["v15_escalated"] = True
-        if not still2:
-            final_image = candidate.repaired_image = esc
-            v13_verdict = _v14_gate(esc, False, True)
-            is_cover = True
-            status = ST_CLEAN_COVERED
-            rec["status"] = status
-            rec["v9_final_method"] = "v15_forced_removal"
-            rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
-        still, rinfo = still2, rinfo2
-        rec["v15_recheck_status"] = rinfo.get("status")
-        rec["v15_recheck_confidence"] = rinfo.get("confidence")
-    rec["v15_still_marked_after_clean"] = bool(still)
-
-    rec.update(v13_verdict.to_record())
-    # A clean_repaired is honest iff it passed the (unchanged) V13 gate AND the
-    # post-clean detector re-check found no surviving watermark. publish_ok
-    # already incorporates residual_pass / metrics_valid for the normal path;
-    # the fresh-gated uniform-fill / forced-removal paths are covered by the
-    # not-still-marked term (no stale qa_info dependency).
-    rec["repair_qa_pass"] = (not is_cover) and bool(v13_verdict.publish_ok) \
-        and not rec.get("v15_still_marked_after_clean", False)
+    rec["v9_final_method"] = v16.method
+    rec["v9_method_family"] = (
+        MethodFamily.ADAPTIVE_COVER.value if is_cover else
+        MethodFamily.REAL_PIXEL_CLONE.value if status == ST_CLEAN_REPAIRED else
+        "auto_rejected")
     rec["v9_is_cover"] = is_cover
-    rec["v9_is_real_repair"] = not is_cover
+    rec["v9_is_real_repair"] = (status == ST_CLEAN_REPAIRED)
+
+    # --- V16 manifest schema (patch plan Fix 8). ----------------------------
+    rec["final_status"] = status
+    rec["publish_ok"] = bool(v16.publish_ok)
+    rec["manual_required"] = False           # auto_rejected is NOT manual review
+    rec["final_gate_version"] = "v16"
+    rec["final_gate_pass"] = bool(v13_verdict.publish_ok) if v13_verdict else False
+    rec["candidate_publish_failures"] = int(v16.candidate_publish_failures)
+    # A published output that failed the gate would be a fatal invariant break.
+    # By construction this is always False (clean_* only set when P0 passed).
+    rec["final_output_publish_failure"] = bool(
+        publishable and not (v13_verdict and v13_verdict.publish_ok))
+    rec["reject_reasons"] = list(v16.reject_reasons)
+    rec["p0_gates"] = dict(v16.p0_gates)
+    rec["v16_path"] = v16.telemetry.get("v16_path")
+    rec.update(v16.telemetry)
+    if v13_verdict is not None:
+        rec.update(v13_verdict.to_record())
+
+    # repair_qa_pass / no_false_clean_repaired: a clean_repaired is honest only
+    # when the full P0 gate passed (it did — clean_repaired is gate-gated).
+    rec["repair_qa_pass"] = (status == ST_CLEAN_REPAIRED) and bool(v16.publish_ok)
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
                     candidate.repaired_image, best_attempt_stub,
-                    protect, overlap)
+                    protect, overlap,
+                    best_repair=v16.best_repair_image,
+                    best_cover=v16.best_cover_image)
     return rec
 
 
@@ -4171,7 +4137,8 @@ def _rel(out_root, p):
 
 
 def _write_terminal(out_root, debug_root, rec, img, masks_dict,
-                    cleaned, last_attempt, protect_layers, overlap):
+                    cleaned, last_attempt, protect_layers, overlap,
+                    best_repair=None, best_cover=None):
     base = out_root / rec["status"] / rec["product_id"]
     base.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -4185,6 +4152,21 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
         cv2.imwrite(str(base / "cleaned.jpg"), cleaned,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 92])
         paths["cleaned"] = _rel(out_root, base / "cleaned.jpg")
+
+    # V16 — auto_rejected diagnostic artifacts: keep the best repair and cover
+    # attempts so a rejected image is debuggable (patch plan Fix 7). These live
+    # only in the auto_rejected/ tree — never a publishable folder.
+    if rec.get("status") == ST_AUTO_REJECTED:
+        if best_repair is not None:
+            cv2.imwrite(str(base / "best_repair_attempt.jpg"), best_repair,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            paths["best_repair_attempt"] = _rel(
+                out_root, base / "best_repair_attempt.jpg")
+        if best_cover is not None:
+            cv2.imwrite(str(base / "best_cover_attempt.jpg"), best_cover,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            paths["best_cover_attempt"] = _rel(
+                out_root, base / "best_cover_attempt.jpg")
 
     if masks_dict is not None:
         for name in ("core", "soft", "stroke", "stroke_capped", "final",
@@ -4320,8 +4302,8 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
 # Reporting — JSONL / CSV / HTML / PDF.
 # ---------------------------------------------------------------------------
 
-STATUS_ORDER = [ST_FAILED_IO, ST_CLEAN_COVERED, ST_CLEAN_REPAIRED,
-                ST_NO_WATERMARK]
+STATUS_ORDER = [ST_FAILED_IO, ST_AUTO_REJECTED, ST_CLEAN_COVERED,
+                ST_CLEAN_REPAIRED, ST_NO_WATERMARK, ST_SKIPPED_KNOWN_CLEAN]
 
 
 def write_summary_jsonl(out_root, records):
@@ -4741,10 +4723,12 @@ def write_compare_pdf(out_root, records) -> Path:
            font=font_md, fill="black"); y += 22
     for st, color in [(ST_CLEAN_REPAIRED, "#0a4"),
                       (ST_CLEAN_COVERED, "#b60"),
+                      (ST_AUTO_REJECTED, "#a00"),
                       (ST_NO_WATERMARK, "#06a"),
+                      (ST_SKIPPED_KNOWN_CLEAN, "#888"),
                       (ST_FAILED_IO, "#a00")]:
         n = counts.get(st, 0)
-        d.text((pad + 16, y), f"{st:14s}{n:>4d}",
+        d.text((pad + 16, y), f"{st:22s}{n:>4d}",
                font=font_md, fill=color); y += 20
     y += 8
     d.text((pad, y), "ROI-class distribution:", font=font_md, fill="black"); y += 22
@@ -4783,7 +4767,9 @@ def write_compare_pdf(out_root, records) -> Path:
         d = ImageDraw.Draw(page)
         d.text((pad, 12), r["image"], font=font_md, fill="black")
         st_color = {"clean_repaired": "#0a4", "clean_covered": "#b60",
-                    "no_watermark": "#06a",
+                    "auto_rejected": "#a00",
+                    "no_watermark_confirmed": "#06a",
+                    "skipped_known_clean": "#888",
                     "failed_io": "#a00"}.get(r["status"], "#888")
         v9_roi = r.get("v9_roi_class") or r.get("roi_class") or "?"
         v9_fm = r.get("v9_final_method") or "?"
@@ -5091,7 +5077,8 @@ def main():
     out_root = args.out
     debug_root = out_root / "debug"
     for sub in (ST_CLEAN_REPAIRED, ST_CLEAN_COVERED, ST_NO_WATERMARK,
-                ST_FAILED_IO, "debug"):
+                ST_AUTO_REJECTED, ST_SKIPPED_KNOWN_CLEAN, ST_FAILED_IO,
+                "debug"):
         (out_root / sub).mkdir(parents=True, exist_ok=True)
 
     pg_config = {
@@ -5234,9 +5221,11 @@ def main():
     print(f"total:            {len(records)}")
     print(f"clean_repaired:   {counts.get(ST_CLEAN_REPAIRED, 0)}")
     print(f"clean_covered:    {counts.get(ST_CLEAN_COVERED, 0)}")
-    print(f"no_watermark:     {counts.get(ST_NO_WATERMARK, 0)}")
+    print(f"auto_rejected:    {counts.get(ST_AUTO_REJECTED, 0)}")
+    print(f"no_watermark_confirmed: {counts.get(ST_NO_WATERMARK, 0)}")
+    print(f"skipped_known_clean:    {counts.get(ST_SKIPPED_KNOWN_CLEAN, 0)}")
     print(f"failed_io:        {counts.get(ST_FAILED_IO, 0)}")
-    print(f"manual-review:    0")
+    print(f"manual-review:    0   (auto_rejected is a final automated decision, not manual review)")
     print(f"real_repair_rate: {real_repair}/{len(records)}")
     print(f"cover_rate:       {cover_count}/{len(records)}")
     print(f"unique_methods:   {len(v9_method_dist)}")

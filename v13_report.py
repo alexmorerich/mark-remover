@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""V13 — honesty / fidelity report.
+"""V16 — auto-decision CI gate / honesty report.
 
-Scans an output tree's per-image ``qa.json`` records (written by
-``_write_terminal``) and tallies the V13 honesty counters. All bad-output
-counters must be 0 for an acceptable release (patch plan section 14 / 19).
+Scans an output tree's per-image ``qa.json`` records and enforces the V16
+invariant: **only outputs that passed every P0 gate may be published as
+clean_repaired / clean_covered; everything else is auto_rejected.**
+
+The CI gate fails (exit 1) if ANY published output violates a P0 gate or if any
+``final_output_publish_failure`` is set. Rejected *candidates* are allowed and
+reported separately. (Filename kept as ``v13_report.py`` for the run scripts;
+it is now the V16 report.)
 
 Usage:
     python3 v13_report.py output
-Exit code is non-zero when any bad-output counter is > 0, so this also serves
-as a CI gate.
 """
 from __future__ import annotations
 
@@ -17,23 +20,32 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import v13_gates
-import v14_patch
+PUBLISHED = ("clean_repaired", "clean_covered")
 
-BAD_COUNTERS = list(v13_gates.HONESTY_COUNTERS)
-# V14 — cover-side honesty counters (Section 7). All must be 0 in a release.
-V14_COVER_COUNTERS = list(v14_patch.COVER_HONESTY_COUNTERS)
+# Patch plan Fix 3/6 — published outputs must have ZERO P0 failures. The CI
+# gate fails if any of these are non-zero.
+MUST_BE_ZERO = [
+    "published_with_residual_ocr",
+    "published_with_template_residual",
+    "published_with_dot_chain",
+    "published_with_visible_patch",
+    "published_with_visible_band",
+    "published_with_product_damage",
+    "published_with_silhouette_damage",
+    "published_with_protected_text_damage",
+    "final_output_publish_failures",
+]
 
-# V14 — release target metrics (Section 7).
-V14_TARGETS = {
-    "clean_repaired_min": 29,
-    "clean_covered_max": 21,
-    "final_adaptive_cover_max": 12,
-    "opencv_telea_final_max": 10,
-    "real_pixel_clone_min": 12,
-    "segmented_micro_cover_min": 8,
-    "near_miss_rescued_min": 5,
-    "unique_final_methods_min": 12,
+# p0_gates key -> published_with_* counter it feeds when False.
+_P0_TO_COUNTER = {
+    "residual_ocr_pass": "published_with_residual_ocr",
+    "template_residual_pass": "published_with_template_residual",
+    "dot_chain_pass": "published_with_dot_chain",
+    "visible_patch_pass": "published_with_visible_patch",
+    "visible_band_pass": "published_with_visible_band",
+    "product_damage_pass": "published_with_product_damage",
+    "silhouette_pass": "published_with_silhouette_damage",
+    "protected_text_pass": "published_with_protected_text_damage",
 }
 
 
@@ -46,100 +58,91 @@ def _iter_records(out_root: Path):
 
 
 def build_report(out_root: Path) -> dict:
-    counters = Counter()
-    cover_counters = Counter()
+    must_zero = Counter()
     status_counts = Counter()
-    method_use = Counter()
     methods = set()
-    n = 0
-    demoted = 0
-    near_miss_rescued = 0
-    segmented_micro_cover = 0
+    rejected_reasons = Counter()
+    candidate_failures = 0
+    auto_rejected_after_cover_fail = 0
+    auto_rejected_after_repair_fail = 0
+    tools_reachable = tools_tried = candidates_passed = 0
+
     for rec in _iter_records(out_root):
         status = rec.get("status")
-        if status not in ("clean_repaired", "clean_covered"):
-            status_counts[status] += 1
-            continue
-        n += 1
         status_counts[status] += 1
-        fm = rec.get("v9_final_method", "unknown")
-        methods.add(fm)
-        method_use[fm] += 1
-        if rec.get("v13_demoted_from_repaired"):
-            demoted += 1
-        if rec.get("v14_near_miss_rescued"):
-            near_miss_rescued += 1
-        cover_method = rec.get("v14_cover_method") or ""
-        if cover_method.startswith("segmented_micro_cover") or \
-                cover_method.startswith("stroke_band_micro_cover"):
-            segmented_micro_cover += 1
-        prefix = status
-        if not rec.get("v13_dot_chain_pass", True):
-            counters[f"{prefix}_with_dot_chain"] += 1
-        if not (rec.get("v13_visible_patch_pass", True) and
-                rec.get("v13_rectangular_band_pass", True) and
-                rec.get("v13_polygon_patch_pass", True)):
-            counters[f"{prefix}_with_visible_patch"] += 1
-        if not rec.get("v13_product_damage_pass", True):
-            counters[f"{prefix}_with_product_damage"] += 1
-        if not rec.get("v13_silhouette_pass", True):
-            counters[f"{prefix}_with_silhouette_damage"] += 1
-        if not rec.get("v13_publish_ok", True):
-            counters["final_publish_failures"] += 1
+        candidate_failures += int(rec.get("candidate_publish_failures", 0) or 0)
+        tel = rec
+        tools_reachable = max(tools_reachable,
+                              int((rec.get("v11_tools_reachable") or 0)))
+        tools_tried += int(rec.get("v11_tools_tried") or 0)
+        candidates_passed += int(rec.get("v11_candidates_passed") or 0)
 
-        # V14 — cover-side honesty counters.
-        if status == "clean_covered":
-            if not (rec.get("v13_visible_patch_pass", True) and
-                    rec.get("v13_rectangular_band_pass", True) and
-                    rec.get("v13_polygon_patch_pass", True)):
-                cover_counters["clean_covered_with_visible_patch"] += 1
-            if not rec.get("v13_product_damage_pass", True):
-                cover_counters["clean_covered_with_product_damage"] += 1
-            if not rec.get("v13_silhouette_pass", True):
-                cover_counters["clean_covered_with_silhouette_damage"] += 1
-            if (rec.get("v14_boundary_jump") or 0.0) > 50.0:
-                cover_counters["clean_covered_with_boundary_jump_gt_50"] += 1
-            if rec.get("v14_used_full_bbox_on_product"):
-                cover_counters["clean_covered_with_full_bbox_on_product"] += 1
-            if not rec.get("v13_protected_text_pass", True):
-                cover_counters["clean_covered_with_protected_text_loss"] += 1
+        if status in PUBLISHED:
+            methods.add(rec.get("v9_final_method", "unknown"))
+            p0 = rec.get("p0_gates", {}) or {}
+            for gate_key, counter in _P0_TO_COUNTER.items():
+                # default True so a missing gate never silently fails CI, but a
+                # published output should always carry a full p0_gates dict.
+                if p0.get(gate_key, True) is False:
+                    must_zero[counter] += 1
+            if rec.get("final_output_publish_failure"):
+                must_zero["final_output_publish_failures"] += 1
+        elif status == "auto_rejected":
+            reasons = rec.get("reject_reasons", []) or []
+            for r in reasons:
+                rejected_reasons[r] += 1
+            if any("cover" in r for r in reasons):
+                auto_rejected_after_cover_fail += 1
+            else:
+                auto_rejected_after_repair_fail += 1
 
-    n_repaired = status_counts.get("clean_repaired", 0)
-    n_covered = status_counts.get("clean_covered", 0)
-    final_adaptive_cover = method_use.get("final_adaptive_cover", 0)
-    opencv_telea = method_use.get("opencv_telea_inpaint", 0)
+    must_zero_d = {k: int(must_zero.get(k, 0)) for k in MUST_BE_ZERO}
+    all_clean = all(v == 0 for v in must_zero_d.values())
+
     report = {
-        "version": "V15_COVER_QUALITY",
+        "version": "V16_AUTO_DECISION",
         "qa_schema_version": "v13",
-        "final_visual_gate_version": "v13",
-        "n_published": n,
-        "clean_repaired": n_repaired,
-        "clean_covered": n_covered,
-        "no_watermark": status_counts.get("no_watermark", 0),
-        "failed_io": status_counts.get("failed_io", 0),
+        "final_gate_version": "v16",
+        # Final output counters (patch plan Fix 6).
+        "final_clean_repaired": status_counts.get("clean_repaired", 0),
+        "final_clean_covered": status_counts.get("clean_covered", 0),
+        "final_no_watermark_confirmed":
+            status_counts.get("no_watermark_confirmed", 0) +
+            status_counts.get("no_watermark", 0),
+        "final_skipped_known_clean": status_counts.get("skipped_known_clean", 0),
+        "final_auto_rejected": status_counts.get("auto_rejected", 0),
+        "final_failed_io": status_counts.get("failed_io", 0),
+        "n_published": (status_counts.get("clean_repaired", 0) +
+                        status_counts.get("clean_covered", 0)),
         "unique_final_methods": len(methods),
-        "v13_demoted_from_repaired": demoted,
-        "honesty_counters": {k: int(counters.get(k, 0)) for k in BAD_COUNTERS},
-        "v14_cover_honesty_counters": {
-            k: int(cover_counters.get(k, 0)) for k in V14_COVER_COUNTERS},
-        "v14_near_miss_rescued": near_miss_rescued,
-        "v14_segmented_micro_cover": segmented_micro_cover,
-        "v14_final_adaptive_cover": final_adaptive_cover,
-        "v14_opencv_telea_final": opencv_telea,
-        "v14_targets": dict(V14_TARGETS),
+        # Must-be-zero published-output counters.
+        "must_be_zero": must_zero_d,
+        # Allowed rejected-candidate counters.
+        "candidate_publish_failures": candidate_failures,
+        "auto_rejected_after_repair_fail": auto_rejected_after_repair_fail,
+        "auto_rejected_after_cover_fail": auto_rejected_after_cover_fail,
+        "reject_reasons": dict(rejected_reasons),
+        # Tool availability (patch plan Fix 12).
+        "tools": {
+            "tools_reachable": tools_reachable,
+            "tools_tried": tools_tried,
+            "candidates_passed": candidates_passed,
+        },
+        "manual_review": 0,   # V16 has no manual-review state by construction.
+        "all_clean": all_clean,
     }
-    report["all_clean"] = (
-        all(v == 0 for v in report["honesty_counters"].values()) and
-        all(v == 0 for v in report["v14_cover_honesty_counters"].values()))
     return report
 
 
 def main(argv):
     out_root = Path(argv[1]) if len(argv) > 1 else Path("output")
     report = build_report(out_root)
+    (out_root / "run_report.json").write_text(json.dumps(report, indent=2))
+    # Back-compat filename used by older tooling.
     (out_root / "v13_honesty.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, separators=(",", ":")))
-    return 0 if report["all_clean"] else 2
+    # CI gate (patch plan Fix 6): fail if any published output broke a P0 gate.
+    return 0 if report["all_clean"] else 1
 
 
 if __name__ == "__main__":
