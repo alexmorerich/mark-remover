@@ -48,13 +48,50 @@ candidates.
 
 **What V15 fixed:** the bright-box covers are gone (soft blended wedges now), and
 faint trailing-text ghosts are removed (e.g. the volume-button flex no longer
-shows a readable `sunsky-online.com`). **What remains (honest):** six covers
-where the watermark straddles a high-contrast cable / background **edge** still
-report `boundary_jump > 50` — removing the mark there unavoidably disturbs the
-edge. Those need **V16 structure-aware reconstruction** (edge/structure-tensor
-or stroke-level neural inpaint); V15 ships the cover-quality generators + honest
-labelling of that remaining gap. `test_v15_patch.py` locks the three V15
-primitives; the full V10–V15 suite stays green (69 cases).
+shows a readable `sunsky-online.com`).
+
+### V15.1 — two fatal fixes: neighbour-imitation on uniform backgrounds + post-clean re-detection
+
+Two fatal issues surfaced on inspection and are fixed here:
+
+- **Garbled repair on a pure background.** On the iPhone-11 touch-panel the
+  `alpha_template_logo_mask` repair left a **garbled doubled-glyph smear** on
+  pure white — worse than the original — and the faint-tolerant metric QA missed
+  it. **Fix:** `v15_patch.is_uniform_local_background` (judged on the *immediate*
+  perimeter band, so distant product never vetoes a pure-white case) +
+  `uniform_background_fill` (Telea-imitate the surrounding background over the
+  footprint). When the surround is uniform we just copy the neighbour — the
+  lightest, most invisible repair. **24 / 50** images now take this path.
+- **A watermark that survived the "clean".** The earpiece-speaker shipped
+  `clean_covered` with the mark **still fully readable** — no step verified the
+  result. **Fix:** `recheck_watermark_present` re-runs the *same detector* on our
+  own output; if it re-confirms a watermark at the original location, the clean
+  failed and we **escalate** to `forced_removal_fill` (Telea over the full text
+  band) and re-check. On the first 50-image audit this caught **13 outputs that
+  still carried the mark**; after the perimeter-aware uniform fix, **7** now need
+  escalation — and **0 / 50 ship with a surviving watermark** (the new
+  `v15_still_marked_after_clean` counter is 0). A clean_repaired is now honest
+  only if it passed the V13 gate **and** the detector finds no watermark in the
+  output.
+
+### V15.1 results (50-image benchmark, seed 7, deterministic)
+
+| Metric | V15 | V15.1 | |
+|--------|-----|-------|---|
+| clean_repaired | 28–29 | **30** | ✅ |
+| clean_covered | 21–22 | **20** | ✅ |
+| **outputs still carrying the watermark** | (unverified) | **0 / 50** | ✅ |
+| uniform neighbour-imitation fill used | 0 | **24** | — |
+| post-clean escalations (forced removal) | — | 7 | — |
+| false `clean_repaired` | 0 | **0** | ✅ |
+| product / silhouette damage | 0 | **0** | ✅ |
+| cover boundary_jump > 50 | 6 | **4** | ↓ |
+| cover protected-text loss | 8 | **6** | ↓ |
+
+Those need **V16 structure-aware reconstruction** (edge/structure-tensor or
+stroke-level neural inpaint) only for the few remaining soft cable-edge seams;
+every output is now verified watermark-free. `test_v15_patch.py` locks the V15 +
+V15.1 primitives; the full V10–V15 suite stays green (74 cases).
 
 ## V14 — Better Candidates (near-miss rescue + segmented micro-cover beam, V13 gate unchanged)
 
@@ -965,7 +1002,7 @@ output/
 | `progressive_repair.py` | ~4,900 | Strategy bank: 100 tools, ROI classifier, V12 truthful QA + residual/band/product gates + `final_publish_gate` + **V14 best-failed-candidate surfacing** |
 | `v13_gates.py` | ~620 | **V13 final visual fidelity gates** (unchanged in V14): `final_visual_publish_gate_v13` + dot-chain v2, visible-patch-shape, product-silhouette, product-overlap, protected-text detectors + honesty counters |
 | `v14_patch.py` | ~600 | **V14 better candidates + V15 cover polish**: `soft_qa_context`, `classify_failure`, `near_miss_rescue`, `segmented_micro_cover` beam search, `full_bbox_cover_banned`, `polish_cover`, cover honesty counters, `v14_finalize` orchestrator |
-| `v15_patch.py` | ~230 | **V15 cover-quality patch**: `widen_text_mask`, `full_region_residual_ok` (ghost-aware), `dark_stroke_cover`, `is_dark_surface` |
+| `v15_patch.py` | ~340 | **V15 / V15.1 cover-quality patch**: `widen_text_mask`, `full_region_residual_ok` (ghost-aware), `dark_stroke_cover`, `is_dark_surface`, `is_uniform_local_background`, `uniform_background_fill`, `forced_removal_fill` |
 | `v13_report.py` | ~150 | V13 honesty report / CI gate + **V14 cover-side counters & target metrics**: tallies must-be-zero counters from per-image `qa.json` |
 | `test_v10_regression.py` | ~190 | V10 visual regression lock (no readable watermark / no product damage) |
 | `test_v11_regression.py` | ~270 | V11 honesty lock (zero-metric/dot-chain/product-damage gates, plain-white routing) |
@@ -1007,7 +1044,8 @@ torch>=1.10            # LaMA, DeepFill, MAT
 | **V12** | **Visual truthfulness** | **Unified `final_publish_gate` as the only `clean_repaired` authority, dot-chain ceiling 0.35→0.28 + count rule, residual micro-cleanup before cover, rectangular-band gate on every candidate, full-changed-region product gate + contour-break, dark-product/thin-flex white-fill ban, beam visual-residue penalties, forced-cover semantics, version/schema provenance in PDF/HTML/JSONL/trace + three must-be-zero counters** |
 | **V13** | **Final visual fidelity** | **`final_visual_publish_gate_v13` applied to repaired AND covered outputs (honest demotion of weak repairs), new dot-chain-v2 / visible-patch-shape / product-silhouette / product-overlap / protected-text detectors in `v13_gates.py`, `v13_report.py` must-be-zero honesty counters, version → `V13_FINAL_VISUAL_FIDELITY` / schema `v13`** |
 | **V14** | **Better candidates (gate unchanged)** | **Additive `v14_patch.py`: adaptive soft-metric context, near-miss rescue (component cleanup + gamma/Lab match + seam smoothing) of soft-fail repairs before cover, segmented micro-cover beam search replacing full-bbox cover with full-bbox-on-product/flex/glass/metallic/text bans, fresh per-candidate hiding verdict + V13-passing cover selection, cover-side honesty counters + target metrics in `v13_report.py`, best-failed-candidate surfacing from the repair loop, `test_v14_regression.py`. clean_repaired 25→29 / 50 with zero false repairs. Version → `V14_BETTER_CANDIDATES`, V13 gate version stays `v13`.** |
-| **V15** | **Cover quality (gate unchanged)** | **Cover polish (`polish_cover`: clamped Lab match + wider seam feather, uncapped boundary term) → worst cover boundary jump 222→102; additive `v15_patch.py`: `widen_text_mask` (full `sunsky-online.com` line, 3 product-safety guards), `full_region_residual_ok` (ghost-aware, template-correlation based — ignores flex-cable texture), `dark_stroke_cover` (Telea from dark neighbours, no light fill); `test_v15_patch.py`. Bright-box covers + faint trailing ghosts removed, zero false repairs / product / silhouette damage. Remaining 6 cable-edge covers deferred to V16 structure reconstruction. Version → `V15_COVER_QUALITY`, V13 gate version stays `v13`.** |
+| **V15** | **Cover quality (gate unchanged)** | **Cover polish (`polish_cover`: clamped Lab match + wider seam feather, uncapped boundary term) → worst cover boundary jump 222→102; additive `v15_patch.py`: `widen_text_mask` (full `sunsky-online.com` line, 3 product-safety guards), `full_region_residual_ok` (ghost-aware, template-correlation based — ignores flex-cable texture), `dark_stroke_cover` (Telea from dark neighbours, no light fill); `test_v15_patch.py`. Bright-box covers + faint trailing ghosts removed, zero false repairs / product / silhouette damage. Version → `V15_COVER_QUALITY`, V13 gate version stays `v13`.** |
+| **V15.1** | **Two fatal fixes (gate unchanged)** | **(1) Pure-background neighbour imitation — `is_uniform_local_background` (immediate-perimeter judged) + `uniform_background_fill` (Telea from surround) replaces garble-prone template/clone repairs on uniform surfaces (24/50 use it). (2) Post-clean re-detection — `recheck_watermark_present` re-runs the detector on our own output and `forced_removal_fill` escalates any surviving watermark; new `v15_still_marked_after_clean` counter = 0/50. clean_repaired 30/50, zero outputs ship with the mark, zero false repairs / product / silhouette damage. 74 tests green.** |
 
 ## License
 

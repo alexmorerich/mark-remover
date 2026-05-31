@@ -101,3 +101,70 @@ def test_dark_stroke_cover_hides_mark_on_dark():
 def test_is_dark_surface():
     assert v15_patch.is_dark_surface(_white(val=20), (10, 10, 80, 40)) is True
     assert v15_patch.is_dark_surface(_white(val=240), (10, 10, 80, 40)) is False
+
+
+# ---------------------------------------------------------------------------
+# V15.1 Fix 1 — uniform background detection + neighbour-imitation fill.
+# ---------------------------------------------------------------------------
+def test_uniform_background_detected_on_plain_white():
+    img = _white()
+    _text(img, "sunsky-online.com", (60, 70))
+    bbox = (60, 48, 240, 34)
+    assert v15_patch.is_uniform_local_background(img, bbox) is True
+
+
+def test_uniform_background_rejected_on_busy_surface():
+    rng = np.random.RandomState(2)
+    img = _white(val=120)
+    img[20:110, 20:380] = rng.randint(0, 255, (90, 360, 3), dtype=np.uint8)
+    bbox = (60, 48, 240, 34)
+    assert v15_patch.is_uniform_local_background(img, bbox) is False
+
+
+def test_uniform_background_fill_removes_text():
+    img = _white()
+    _text(img, "sunsky-online.com", (60, 70))
+    bbox = (60, 48, 240, 34)
+    out = v15_patch.uniform_background_fill(img, bbox)
+    # The filled footprint should be uniform white again (text gone).
+    region = cv2.cvtColor(out[48:82, 56:312], cv2.COLOR_BGR2GRAY)
+    assert float(region.std()) < 6.0
+    assert float(region.mean()) > 230
+
+
+def test_forced_removal_fill_clears_text_band():
+    img = _white(val=200)
+    _text(img, "sunsky-online.com", (60, 70), color=(40, 40, 40))
+    bbox = (60, 48, 240, 34)
+    before = cv2.cvtColor(img[48:82, 56:312], cv2.COLOR_BGR2GRAY).std()
+    out = v15_patch.forced_removal_fill(img, bbox)
+    after = cv2.cvtColor(out[48:82, 56:312], cv2.COLOR_BGR2GRAY).std()
+    assert after < before
+
+
+# ---------------------------------------------------------------------------
+# V15.1 Fix 2 — post-clean re-detection (logic, with a stub detector).
+# ---------------------------------------------------------------------------
+def test_recheck_iou_and_clean_paths():
+    import mark_remover as mr
+
+    # IoU helper.
+    assert mr._bbox_iou((0, 0, 10, 10), (0, 0, 10, 10)) == 1.0
+    assert mr._bbox_iou((0, 0, 10, 10), (100, 100, 10, 10)) == 0.0
+
+    class _NoDet:
+        def detect_watermark_v2(self, g):
+            return []
+
+    class _FarDet:
+        def detect_watermark_v2(self, g):
+            return [{"mark_box": {"x": 0, "y": 0, "w": 4, "h": 4},
+                     "tier": "auto"}]
+
+    img = np.full((200, 300, 3), 240, np.uint8)
+    # No detection ⇒ not still present.
+    still, info = mr.recheck_watermark_present(_NoDet(), img, (120, 90, 80, 24))
+    assert still is False
+    # A detection nowhere near the original bbox ⇒ not still present.
+    still2, _ = mr.recheck_watermark_present(_FarDet(), img, (120, 90, 80, 24))
+    assert still2 is False

@@ -48,6 +48,7 @@ from progressive_repair import (
 )
 import v13_gates
 import v14_patch
+import v15_patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -3769,6 +3770,53 @@ def _collect_failure_reasons(attempts):
     return list(dict.fromkeys(reasons))
 
 
+def _bbox_iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def recheck_watermark_present(rwm, cleaned_bgr, orig_bbox, pg_config=None):
+    """V15.1 Fix 2 — double-check the watermark is actually gone by re-running
+    the SAME detector on the CLEANED output. Returns ``(still_present, info)``.
+
+    ``still_present`` is True only when the detector re-confirms a watermark AT
+    the original location (IoU > 0.05 with the original bbox) — so a clean
+    removal (mark gone) reads False, while a cover that left the mark intact
+    (the earpiece case) is caught honestly. This is the same engine the pipeline
+    trusts to find watermarks in the first place, turned back on its own result.
+    """
+    info = {"status": None, "confidence": 0.0, "iou": 0.0}
+    if cleaned_bgr is None:
+        return False, info
+    cfg = pg_config or {
+        "confirmed_threshold": CONFIRMED_WATERMARK_THRESHOLD,
+        "no_watermark_threshold": NO_WATERMARK_THRESHOLD,
+    }
+    g = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
+    try:
+        dets = rwm.detect_watermark_v2(g)
+    except Exception:
+        return False, info
+    if not dets:
+        return False, info
+    det2 = dets[0]
+    presence = detect_sunsky_presence_fast(g, det2, cfg)
+    info["status"] = presence.get("status")
+    info["confidence"] = round(float(presence.get("confidence", 0.0)), 4)
+    mb = det2.get("mark_box") or {}
+    iou = (_bbox_iou(orig_bbox, (mb["x"], mb["y"], mb["w"], mb["h"]))
+           if mb else 0.0)
+    info["iou"] = round(iou, 4)
+    still = (presence.get("status") == PG_CONFIRMED and iou > 0.05 and
+             det2.get("tier") in ("auto", "manual"))
+    return still, info
+
+
 def process_image(rwm, path: Path, det: dict, out_root: Path,
                   debug_root: Path) -> dict:
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -4000,6 +4048,7 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     # long-line / glass / metallic / protected-text zones. The V13 gate itself
     # is never weakened — v14_finalize only ever asks it to bless a result.
     final_image = candidate.repaired_image
+    stroke_mask = masks.get("stroke")
 
     def _v14_gate(image, repaired, residual_pass=None):
         # residual_pass override lets V14 feed a FRESH watermark-hiding verdict
@@ -4011,35 +4060,90 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             qa = dict(qa_info, residual_pass=bool(residual_pass))
         return v13_gates.final_visual_publish_gate_v13(
             img, image, bbox_tuple, protect_combined, qa,
-            repaired=repaired, watermark_mask=masks.get("stroke"))
+            repaired=repaired, watermark_mask=stroke_mask)
 
-    v13_verdict = _v14_gate(candidate.repaired_image, repaired=(not is_cover))
     pre_v14_repaired = (not is_cover)
 
-    outcome = v14_patch.v14_finalize(
-        img, candidate.repaired_image, bbox_tuple, protect_combined,
-        masks.get("stroke"), _v14_gate,
-        is_cover=is_cover, v13_verdict=v13_verdict,
-        roi_class=pr_roi.roi_class,
-        base_cover_image=(candidate.repaired_image if is_cover else None),
-        pre_cover_repaired_image=candidate.metadata.get("best_failed_image"))
+    # --- V15.1 Fix 1 — pure / near-uniform background: just imitate the ---
+    # neighbour. On a uniform local background the only correct repair is to
+    # copy the surrounding background over the footprint; the clever
+    # template-logo / clone methods can leave a garbled doubled-glyph smear that
+    # the faint-tolerant metric QA misses (the iPhone-11 touch-panel case). So
+    # when the surround is uniform we fill from it directly and prefer that.
+    rec["v15_uniform_background_fill"] = False
+    uniform_handled = False
+    if v15_patch.is_uniform_local_background(img, bbox_tuple, protect_combined):
+        clean_fill = v15_patch.uniform_background_fill(img, bbox_tuple, stroke_mask)
+        fv = _v14_gate(clean_fill, True, True)
+        if fv.publish_ok:
+            candidate.repaired_image = final_image = clean_fill
+            v13_verdict = fv
+            is_cover = False
+            status = ST_CLEAN_REPAIRED
+            rec["v9_final_method"] = "v15_uniform_background_fill"
+            rec["v9_method_family"] = MethodFamily.REAL_PIXEL_CLONE.value
+            rec["v15_uniform_background_fill"] = True
+            uniform_handled = True
 
-    final_image = outcome.image
-    candidate.repaired_image = final_image
-    v13_verdict = outcome.verdict
-    is_cover = (outcome.status == ST_CLEAN_COVERED)
-    status = outcome.status
+    if not uniform_handled:
+        v13_verdict = _v14_gate(candidate.repaired_image, repaired=(not is_cover))
+        outcome = v14_patch.v14_finalize(
+            img, candidate.repaired_image, bbox_tuple, protect_combined,
+            stroke_mask, _v14_gate,
+            is_cover=is_cover, v13_verdict=v13_verdict,
+            roi_class=pr_roi.roi_class,
+            base_cover_image=(candidate.repaired_image if is_cover else None),
+            pre_cover_repaired_image=candidate.metadata.get("best_failed_image"))
+        final_image = candidate.repaired_image = outcome.image
+        v13_verdict = outcome.verdict
+        is_cover = (outcome.status == ST_CLEAN_COVERED)
+        status = outcome.status
+        rec.update(outcome.telemetry)
+        if outcome.telemetry.get("v14_near_miss_rescued"):
+            rec["v9_final_method"] = (final_method + "+v14_near_miss_rescue")
+        elif is_cover and outcome.telemetry.get("v14_cover_method"):
+            rec["v9_final_method"] = outcome.telemetry["v14_cover_method"]
+            rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
+
     rec["status"] = status
     rec["v13_demoted_from_repaired"] = bool(pre_v14_repaired and is_cover)
-    rec.update(outcome.telemetry)
-    if outcome.telemetry.get("v14_near_miss_rescued"):
-        rec["v9_final_method"] = (final_method + "+v14_near_miss_rescue")
-    elif is_cover and outcome.telemetry.get("v14_cover_method"):
-        rec["v9_final_method"] = outcome.telemetry["v14_cover_method"]
-        rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
+
+    # --- V15.1 Fix 2 — post-clean watermark re-detection (double-check). ---
+    # Run the detector back over our own output. If it still confirms the
+    # watermark at the original location, the clean FAILED — escalate to a
+    # forced removal of the full text band and re-check. The watermark must go.
+    still, rinfo = recheck_watermark_present(rwm, final_image, bbox_tuple)
+    rec["v15_recheck_status"] = rinfo.get("status")
+    rec["v15_recheck_confidence"] = rinfo.get("confidence")
+    rec["v15_escalated"] = False
+    if still:
+        if v15_patch.is_uniform_local_background(img, bbox_tuple, protect_combined):
+            esc = v15_patch.uniform_background_fill(img, bbox_tuple, stroke_mask)
+        else:
+            esc = v15_patch.forced_removal_fill(img, bbox_tuple, stroke_mask)
+        still2, rinfo2 = recheck_watermark_present(rwm, esc, bbox_tuple)
+        rec["v15_escalated"] = True
+        if not still2:
+            final_image = candidate.repaired_image = esc
+            v13_verdict = _v14_gate(esc, False, True)
+            is_cover = True
+            status = ST_CLEAN_COVERED
+            rec["status"] = status
+            rec["v9_final_method"] = "v15_forced_removal"
+            rec["v9_method_family"] = MethodFamily.ADAPTIVE_COVER.value
+        still, rinfo = still2, rinfo2
+        rec["v15_recheck_status"] = rinfo.get("status")
+        rec["v15_recheck_confidence"] = rinfo.get("confidence")
+    rec["v15_still_marked_after_clean"] = bool(still)
+
     rec.update(v13_verdict.to_record())
+    # A clean_repaired is honest iff it passed the (unchanged) V13 gate AND the
+    # post-clean detector re-check found no surviving watermark. publish_ok
+    # already incorporates residual_pass / metrics_valid for the normal path;
+    # the fresh-gated uniform-fill / forced-removal paths are covered by the
+    # not-still-marked term (no stale qa_info dependency).
     rec["repair_qa_pass"] = (not is_cover) and bool(v13_verdict.publish_ok) \
-        and bool(qa_info.get("residual_pass")) and bool(qa_info.get("metrics_valid"))
+        and not rec.get("v15_still_marked_after_clean", False)
     rec["v9_is_cover"] = is_cover
     rec["v9_is_real_repair"] = not is_cover
 

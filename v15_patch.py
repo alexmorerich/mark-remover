@@ -221,3 +221,110 @@ def is_dark_surface(image, bbox, thresh=0.30) -> bool:
         return False
     g = cv2.cvtColor(image[by:by + bh, bx:bx + bw], cv2.COLOR_BGR2GRAY)
     return float((g < 80).mean()) > thresh
+
+
+# ---------------------------------------------------------------------------
+# V15.1 Fix 1 — pure / near-uniform background: just imitate the neighbour.
+#
+# On a uniform local background (the screen interior, a plain white sheet, a
+# flat surface) the only correct repair is to copy the surrounding background
+# over the watermark footprint. Anything cleverer (template-logo subtraction,
+# clone-of-clone) risks leaving a garbled doubled-glyph smear that the metric
+# QA misses because it is faint. This is the lightest, safest, most invisible
+# fix — so when the local background is uniform we use it outright.
+# ---------------------------------------------------------------------------
+def is_uniform_local_background(image, bbox, product_mask=None,
+                                std_max=12.0, edge_max=0.06,
+                                overlap_max=0.10, band_px=6) -> bool:
+    """True when the watermark sits on a locally-uniform background, judged by
+    the THIN perimeter band immediately around the footprint (the pixels a
+    neighbour-imitation Telea fill actually copies from) — not a wide padded
+    ring, which would catch unrelated product structure further out (e.g. the
+    flex connector below a screen) and wrongly veto a pure-white case.
+
+    If that immediate perimeter is uniform and low-edge, a fill from it is
+    guaranteed clean. A product edge running through the perimeter raises the
+    std / edge density and correctly vetoes it (no smear onto structure)."""
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    if bw <= 1 or bh <= 1:
+        return False
+    g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    p = max(2, band_px)
+    y1, y2 = max(0, by - p), min(H, by + bh + p)
+    x1, x2 = max(0, bx - p), min(W, bx + bw + p)
+    perim = np.zeros((y2 - y1, x2 - x1), bool)
+    perim[:] = True
+    iy1, iy2 = by - y1, by - y1 + bh
+    ix1, ix2 = bx - x1, bx - x1 + bw
+    perim[max(0, iy1):max(0, iy2), max(0, ix1):max(0, ix2)] = False
+    vals = g[y1:y2, x1:x2][perim]
+    if vals.size < 16:
+        return False
+    # Robust spread (MAD) of the immediate perimeter — uniform surround only.
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med))) * 1.4826
+    if mad > std_max:
+        return False
+    # Low edge density in the perimeter band (no product structure crossing it).
+    edges = cv2.Canny(g[y1:y2, x1:x2], 50, 150)
+    if float((edges[perim] > 0).mean()) > edge_max:
+        return False
+    # The watermark footprint itself must not sit on real product pixels.
+    if product_mask is not None and product_mask.shape[:2] == (H, W):
+        pr = product_mask[by:by + bh, bx:bx + bw]
+        if pr.size and float((pr > 0).mean()) > overlap_max:
+            return False
+    return True
+
+
+def uniform_background_fill(image, bbox, watermark_mask=None, x_expand=0.35,
+                            radius=4):
+    """Imitate the surrounding (uniform) background over the watermark
+    footprint: Telea-propagate the real neighbouring pixels inward, then feather
+    the boundary. On a uniform surface this is exact and invisible. Covers the
+    full bbox widened horizontally so no trailing glyph survives."""
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    fp = np.zeros((H, W), np.uint8)
+    pad_y = max(2, int(round(bh * 0.18)))
+    pad_x = max(8, int(round(bw * x_expand)))
+    fy1, fy2 = max(0, by - pad_y), min(H, by + bh + pad_y)
+    fx1, fx2 = max(0, bx - pad_x), min(W, bx + bw + pad_x)
+    fp[fy1:fy2, fx1:fx2] = 255
+    result = cv2.inpaint(image, fp, radius, cv2.INPAINT_TELEA)
+    alpha = cv2.GaussianBlur(fp.astype(np.float32) / 255.0, (0, 0), sigmaX=2.0)
+    a3 = np.stack([alpha] * 3, axis=-1)
+    return (result.astype(np.float32) * a3 +
+            image.astype(np.float32) * (1 - a3)).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# V15.1 Fix 2 — escalation fill when a watermark survives the first clean.
+# ---------------------------------------------------------------------------
+def forced_removal_fill(image, bbox, watermark_mask=None, x_expand=0.3,
+                        radius=4):
+    """A stronger last-resort removal used only when the post-clean re-detection
+    still finds the watermark. Telea-inpaints the full watermark text band over
+    the bbox (widened mask ∪ central text band). On product surfaces this trades
+    a little local texture for actually removing a mark that would otherwise
+    ship visible — the watermark MUST go."""
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    band = np.zeros((H, W), np.uint8)
+    pad_x = max(6, int(round(bw * x_expand)))
+    # central text band (tight in y, full text width) — where the glyph row is.
+    ty1 = by + int(bh * 0.10)
+    ty2 = by + int(bh * 0.90)
+    tx1, tx2 = max(0, bx - pad_x), min(W, bx + bw + pad_x)
+    band[max(0, ty1):min(H, ty2), tx1:tx2] = 255
+    if watermark_mask is not None and watermark_mask.shape[:2] == (H, W):
+        kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5))
+        wm = cv2.dilate((watermark_mask > 0).astype(np.uint8) * 255, kd,
+                        iterations=1)
+        band = cv2.bitwise_or(band, wm)
+    result = cv2.inpaint(image, band, radius, cv2.INPAINT_TELEA)
+    alpha = cv2.GaussianBlur(band.astype(np.float32) / 255.0, (0, 0), sigmaX=2.0)
+    a3 = np.stack([alpha] * 3, axis=-1)
+    return (result.astype(np.float32) * a3 +
+            image.astype(np.float32) * (1 - a3)).astype(np.uint8)
