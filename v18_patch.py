@@ -44,6 +44,20 @@ try:
 except Exception:  # pragma: no cover - pr is always importable in practice
     pr = None
 
+# V19 — reverse-alpha recovery + product-text protection (patch plan §1.2, §1.7).
+try:
+    import sunsky_reverse_alpha as _sra
+except Exception:  # pragma: no cover
+    _sra = None
+try:
+    import product_text_detector as _ptd
+except Exception:  # pragma: no cover
+    _ptd = None
+try:
+    import lama_onnx_backend as _lama
+except Exception:  # pragma: no cover
+    _lama = None
+
 
 # ---------------------------------------------------------------------------
 # Routing thresholds (patch plan §2). Kept explicit so product-overlap routing
@@ -509,3 +523,83 @@ def rank_candidates(original, candidates, bbox, product_mask, watermark_mask,
         scored.append((p, name, img))
     scored.sort(key=lambda t: t[0])
     return [(name, img) for _p, name, img in scored]
+
+
+# ---------------------------------------------------------------------------
+# V19 — reverse-alpha recovery candidate (patch plan §1.2, §4.3). This is a
+# NON-DESTRUCTIVE real-pixel repair: it subtracts the semi-transparent overlay
+# and keeps the product pixels beneath, so it is allowed even on product overlap
+# and over product text (where covers / inpaint are banned). It is tried FIRST
+# in the candidate bank; it still passes through the unchanged P0 / V17 audit.
+# ---------------------------------------------------------------------------
+def reverse_alpha_candidate(image, bbox, watermark_mask, product_mask,
+                            ctx: ProductContext):
+    """Return ``(name, image, record)``. ``image`` is ``None`` when reverse-alpha
+    is unavailable or its local safety check fails (the caller skips it). The
+    record carries the per-image ``reverse_alpha_*`` manifest fields."""
+    if _sra is None or not _sra.alpha_asset_available():
+        return None, None, {"reverse_alpha_attempted": False,
+                             "reverse_alpha_passed": False,
+                             "reverse_alpha_source": "none",
+                             "reverse_alpha_reject_reason": "alpha_asset_missing"}
+    ptmask = None
+    ptext_overlap = 0.0
+    if _ptd is not None:
+        try:
+            ptm = _ptd.detect_product_text(image, bbox, watermark_mask)
+            ptmask = ptm.mask
+            ptext_overlap = ptm.overlap_in_box(bbox)
+        except Exception:
+            ptmask = None
+    try:
+        res = _sra.repair_sunsky_reverse_alpha(
+            image, bbox, watermark_mask=watermark_mask, product_mask=product_mask,
+            protected_text_mask=ptmask, ctx=ctx, allow_thin_cleanup=True)
+    except Exception:
+        return None, None, {"reverse_alpha_attempted": True,
+                            "reverse_alpha_passed": False,
+                            "reverse_alpha_reject_reason": "exception"}
+    rec = res.to_record()
+    rec["reverse_alpha_over_text"] = bool(ptext_overlap > 0.02)
+    if res.pass_local_safety and res.image is not None:
+        return "v19_sunsky_reverse_alpha", res.image, rec
+    return None, None, rec
+
+
+def lama_stroke_candidate(image, bbox, watermark_mask, product_mask,
+                          ctx: ProductContext):
+    """Optional CPU LaMA-ONNX stroke-only candidate (patch plan §1.6). Returns
+    ``None`` unless the model is present and every precondition holds."""
+    if _lama is None or not _lama.available():
+        return None
+    sm = _stroke_mask(image, bbox, watermark_mask, dilate_px=1)
+    if sm is None:
+        return None
+    conf = stroke_mask_confidence(image, bbox, watermark_mask, product_mask)
+    try:
+        ptext = 0.0
+        if _ptd is not None:
+            ptext = _ptd.detect_product_text(
+                image, bbox, watermark_mask).overlap_in_box(bbox)
+        return _lama.run_lama_crop_paste(
+            image, sm, mask_type=conf.get("mask_type", "logo_fallback"),
+            product_overlap=float(conf.get("product_overlap", 0.0)),
+            protected_text_overlap=ptext)
+    except Exception:
+        return None
+
+
+def manifest_routing_fields(image, bbox, watermark_mask, product_mask,
+                            ctx: ProductContext, ban_destructive: bool) -> dict:
+    """V19 mask-type routing manifest (patch plan §4.5)."""
+    conf = stroke_mask_confidence(image, bbox, watermark_mask, product_mask)
+    alpha_conf = 0.0
+    if _sra is not None and _sra.alpha_asset_available():
+        a = _sra.load_alpha_asset()
+        alpha_conf = float(a["alpha"].max()) if a else 0.0
+    return {
+        "mask_type": conf.get("mask_type", "logo_fallback"),
+        "stroke_mask_confidence": conf.get("stroke_precision", 0.0),
+        "alpha_asset_confidence": round(alpha_conf, 4),
+        "allowed_destructive_generators": bool(not ban_destructive),
+    }

@@ -152,6 +152,31 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     if pctx is not None:
         v18_telem.update(pctx.to_record())
 
+    # --- V19 — reverse-alpha recovery (patch plan §1.2, §4.3). Computed ONCE,
+    # tried FIRST among repair candidates: it subtracts the semi-transparent
+    # Sunsky overlay and keeps the real product pixels, so it is allowed even on
+    # product overlap and over product text where covers / inpaint are banned.
+    # It still passes through the unchanged P0 / V17 audit below. ------------
+    ra_name = ra_img = None
+    try:
+        ra_name, ra_img, ra_rec = v18_patch.reverse_alpha_candidate(
+            img, bbox, watermark_mask, product_mask, pctx)
+        v18_telem.update(ra_rec or {})
+    except Exception:
+        v18_telem["reverse_alpha_attempted"] = False
+    try:
+        v18_telem.update(v18_patch.manifest_routing_fields(
+            img, bbox, watermark_mask, product_mask, pctx, ban_destructive))
+    except Exception:
+        pass
+    # V19 — optional LaMA-ONNX stroke candidate (no-op unless the model exists).
+    lama_img = None
+    try:
+        lama_img = v18_patch.lama_stroke_candidate(
+            img, bbox, watermark_mask, product_mask, pctx)
+    except Exception:
+        lama_img = None
+
     def _p0(image, repaired):
         # Fresh per-candidate watermark-hiding verdict for the template/dot
         # residual gate, then the V13 visual gate, then the post-clean detector
@@ -223,10 +248,16 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     # clean_repaired (the honest classification), and on a product region they
     # are tried BEFORE the destructive uniform fill (which is banned anyway).
     repair_cands = []
+    # V19 — reverse-alpha leads the repair beam (non-destructive real-pixel
+    # recovery). A pass here yields the honest clean_repaired classification.
+    if ra_img is not None:
+        repair_cands.append((ra_name, ra_img))
     if not ban_destructive and uniform is not None:
         repair_cands.append(("v16_uniform_background_fill", uniform))
     for v18_name, v18_img in v18_safe:
         repair_cands.append((v18_name, v18_img))
+    if lama_img is not None:
+        repair_cands.append(("v19_lama_stroke", lama_img))
     if ban_destructive and uniform is not None:
         # Should not occur (uniform is product-overlap<0.03 gated), but if it
         # does, demote it below every product-safe candidate.
@@ -283,6 +314,9 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     # auto-rejecting), and they lead the beam on product regions.
     for v18_name, v18_img in reversed(v18_safe):
         cover_cands.insert(0, (v18_name, v18_img))
+    # V19 — reverse-alpha also leads the cover beam as a non-destructive fallback.
+    if ra_img is not None:
+        cover_cands.insert(0, (ra_name, ra_img))
     # V18 — destructive full-band / forced-removal / uniform fills are BANNED on
     # any product-overlap or silhouette-contact region (patch plan §1.3, §2): on
     # product pixels they paint exactly the bands/blobs the audit rejects, so

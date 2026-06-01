@@ -64,6 +64,16 @@ P0_PRODUCT_REASONS = (
     "changed_metallic_surface_block",
 )
 
+# V19 — cover-shape artifacts on product (patch plan §4.4). A visible cover on
+# product pixels is a HARD failure, not a cosmetic seam. These reasons fire only
+# when final_status == clean_covered AND the changed region lands on product.
+P0_COVER_ARTIFACT_REASONS = (
+    "visible_patch_on_product",
+    "visible_band_on_product",
+    "wedge_or_slab_shape",
+    "changed_dark_surface_blob",
+)
+
 # V18 — tiny low-contrast glyph residue (patch plan §8). A published output may
 # still show faint dot/dash residue aligned along the original watermark
 # baseline; it is too low-contrast for the residual-OCR detector but reads to a
@@ -308,6 +318,19 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
         if _metallic_block(original, output, bbox):
             reasons.append("changed_metallic_surface_block")
 
+    # ----- 7. V19 — stricter cover-shape audit (patch plan §4.4). A visible
+    #          cover on product pixels is a HARD failure, not a cosmetic seam.
+    #          Only runs for clean_covered outputs that land on product. ------
+    if final_status == "clean_covered" and prod_ratio > PRODUCT_OVERLAP_HARD:
+        try:
+            changed = _changed_mask(original, output, bbox)
+            artifact = detect_cover_shape_artifact_v19(
+                original, output, changed, product_mask, bbox)
+            for r in artifact.get("artifact_reasons", []):
+                reasons.append(r)
+        except Exception:
+            pass
+
     # De-dupe while preserving order.
     seen = set()
     res.hard_fail_reasons = [r for r in reasons
@@ -443,6 +466,99 @@ def _dark_surface_blob(original, output, bbox):
     if int(dark.sum()) < 20:
         return 0.0
     return float(np.abs(rg[dark] - og[dark]).mean())
+
+
+def detect_cover_shape_artifact_v19(original, output, changed_mask,
+                                    product_mask, mark_box):
+    """V19 — detect a visible artificial-cover shape on product pixels (patch
+    plan §4.4). Hard-fail shapes: rectangular slab, wedge/notch, pale band, dark
+    blob on dark stock, a straight artificial boundary, or a cover crossing the
+    product silhouette. Returns a dict of flags + the list of artifact reasons.
+
+    A clean_covered output is only valid when the cover sits on PURE background
+    or is shape-conformal and visually matched (no detected artifact)."""
+    bx, by, bw, bh = mark_box
+    reasons: list = []
+    out = {"is_slab": False, "is_wedge": False, "is_band": False,
+           "is_dark_blob": False, "straight_boundary": False,
+           "crosses_silhouette": False, "artifact_reasons": reasons,
+           "has_artifact": False}
+    if bw <= 2 or bh <= 2:
+        return out
+
+    ch = (changed_mask > 0)
+    if product_mask is not None and product_mask.shape[:2] == original.shape[:2]:
+        on_product = ch & (product_mask > 0)
+    else:
+        on_product = ch
+    n_prod = int(on_product.sum())
+    if n_prod < 12:
+        return out
+
+    # Geometry of the changed-on-product region.
+    ys, xs = np.where(on_product)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    rw, rh = (x1 - x0 + 1), (y1 - y0 + 1)
+    fill = n_prod / float(rw * rh)
+
+    # Rectangular slab: the changed-on-product region nearly fills its bbox.
+    if fill > 0.80 and rw >= 8 and rh >= 6:
+        out["is_slab"] = True
+        reasons.append("wedge_or_slab_shape")
+
+    # Pale band: a wide, short, near-uniform horizontal strip.
+    try:
+        band = v13_gates._band_metrics(output, (bx, by, bw, bh))
+        if float(band.get("visible_band_score", 0.0)) > 0.5 and \
+                float(band.get("band_rectangularity", 0.0)) > 0.6:
+            out["is_band"] = True
+            reasons.append("visible_band_on_product")
+    except Exception:
+        pass
+
+    # Visible patch shape with a hard artificial boundary on product.
+    try:
+        patch = v13_gates.detect_visible_patch_shape_v13(
+            original, output, (bx, by, bw, bh))
+        if float(patch.get("visible_patch_score", 0.0)) > 0.5:
+            reasons.append("visible_patch_on_product")
+        if float(patch.get("hard_boundary_score", 0.0)) > \
+                v13_gates.HARD_BOUNDARY_MAX:
+            out["straight_boundary"] = True
+            if "visible_patch_on_product" not in reasons:
+                reasons.append("visible_patch_on_product")
+        # Wedge / notch: a triangular changed region (low fill but one straight
+        # diagonal edge) over product.
+        if 0.35 < fill <= 0.80 and out["straight_boundary"]:
+            out["is_wedge"] = True
+            if "wedge_or_slab_shape" not in reasons:
+                reasons.append("wedge_or_slab_shape")
+    except Exception:
+        pass
+
+    # Dark blob on dark stock.
+    if _dark_surface_blob(original, output, (bx, by, bw, bh)) > NEW_DARK_BLOB_DELTA:
+        out["is_dark_blob"] = True
+        reasons.append("changed_dark_surface_blob")
+
+    # Cover crossing the product silhouette.
+    try:
+        sil = v13_gates.detect_product_silhouette_damage_v13(
+            original, output, product_mask, (bx, by, bw, bh))
+        if not sil.get("passed", True) and \
+                float(sil.get("product_overlap", 0.0)) > SILHOUETTE_PRODUCT_OVERLAP:
+            out["crosses_silhouette"] = True
+            reasons.append("visible_patch_on_product")
+    except Exception:
+        pass
+
+    # De-dupe.
+    seen = set()
+    out["artifact_reasons"] = [r for r in reasons
+                               if not (r in seen or seen.add(r))]
+    out["has_artifact"] = len(out["artifact_reasons"]) > 0
+    return out
 
 
 def _metallic_block(original, output, bbox):

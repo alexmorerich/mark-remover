@@ -64,8 +64,8 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V18_PATCH"
-assert PIPELINE_VERSION == "V18_PATCH"
+PIPELINE_VERSION = "V19_PATCH"
+assert PIPELINE_VERSION == "V19_PATCH"
 # V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
 # auto_rejected final state + a post-clean re-detection P0 gate around it, so
 # only gate-passing outputs are ever published. V17 adds the truthful
