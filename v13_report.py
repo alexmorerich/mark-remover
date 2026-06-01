@@ -55,12 +55,16 @@ V17_MUST_BE_ZERO = [
     "published_visible_band_on_product",
     "published_silhouette_damage",
     "published_protected_text_damage",
+    # V18 (patch plan §8, §11) — faint glyph residue on a published output.
+    "published_low_contrast_glyph_residue",
 ]
 
-# V17 audit hard-fail reason -> published_* counter.
+# V17/V18 audit hard-fail reason -> published_* counter.
 _V17_REASON_TO_COUNTER = {
     "published_residual_watermark": "published_residual_watermark",
     "published_dot_chain": "published_dot_chain",
+    "published_low_contrast_glyph_residue":
+        "published_low_contrast_glyph_residue",
     "visible_patch_on_product": "published_visible_patch_on_product",
     "visible_band_on_product": "published_visible_band_on_product",
     "changed_product_silhouette": "published_silhouette_damage",
@@ -103,6 +107,14 @@ def build_report(out_root: Path) -> dict:
     auto_rejected_after_repair_fail = 0
     cosmetic_seam_published = 0
     tools_reachable = tools_tried = candidates_passed = 0
+    # V18 — reject taxonomy aggregation (patch plan §1).
+    rejected_by_roi_class = Counter()
+    rejected_by_method = Counter()
+    rejected_by_mask_type = Counter()
+    candidate_failures_by_reason = Counter()
+    published_seam_by_roi_class = Counter()
+    v18_ban_destructive_count = 0
+    v18_published_via_safe_candidate = 0
 
     for rec in _iter_records(out_root):
         status = rec.get("status")
@@ -110,6 +122,16 @@ def build_report(out_root: Path) -> dict:
         candidate_failures += int(rec.get("candidate_publish_failures", 0) or 0)
         if status in PUBLISHED and rec.get("cosmetic_seam"):
             cosmetic_seam_published += 1
+        if rec.get("v18_ban_destructive"):
+            v18_ban_destructive_count += 1
+        # A published output whose chosen method is a V18 safe candidate.
+        if status in PUBLISHED and \
+                str(rec.get("v9_final_method", "")).startswith("v18_"):
+            v18_published_via_safe_candidate += 1
+            if rec.get("cosmetic_seam"):
+                published_seam_by_roi_class[
+                    rec.get("v18_roi_class") or rec.get("v9_roi_class") or
+                    "unknown"] += 1
         tools_reachable = max(tools_reachable,
                               int((rec.get("v11_tools_reachable") or 0)))
         tools_tried += int(rec.get("v11_tools_tried") or 0)
@@ -138,6 +160,18 @@ def build_report(out_root: Path) -> dict:
                 auto_rejected_after_cover_fail += 1
             else:
                 auto_rejected_after_repair_fail += 1
+            # V18 — taxonomy aggregation (patch plan §1): which ROI class / best
+            # method / mask type the rejected images cluster around.
+            tax = rec.get("v18_reject_taxonomy", {}) or {}
+            rejected_by_roi_class[
+                tax.get("roi_class") or rec.get("v18_roi_class") or
+                rec.get("v9_roi_class") or "unknown"] += 1
+            rejected_by_method[
+                tax.get("best_repair_method") or
+                rec.get("v9_final_method") or "unknown"] += 1
+            rejected_by_mask_type[tax.get("mask_used") or "unknown"] += 1
+            for r in (tax.get("candidate_fail_reasons") or []):
+                candidate_failures_by_reason[r] += 1
 
     must_zero_d = {k: int(must_zero.get(k, 0)) for k in MUST_BE_ZERO}
     cosmetic_d = {k: int(must_zero.get(k, 0)) for k in COSMETIC_COUNTERS}
@@ -146,7 +180,13 @@ def build_report(out_root: Path) -> dict:
                  all(v == 0 for v in v17_zero_d.values()))
 
     report = {
-        "version": "V16_AUTO_DECISION",
+        "version": "V18_PATCH",
+        # V18 (patch plan §9) — explicit per-layer versions so a regression
+        # comparison can never confuse the state machine, audit and gate.
+        "state_machine_version": "v16",
+        "final_audit_version": "v17",
+        "patch_version": "v18",
+        "gate_version": "v13_frozen",
         "qa_schema_version": "v13",
         "final_gate_version": "v16",
         # Final output counters (patch plan Fix 6).
@@ -174,6 +214,15 @@ def build_report(out_root: Path) -> dict:
         "auto_rejected_after_repair_fail": auto_rejected_after_repair_fail,
         "auto_rejected_after_cover_fail": auto_rejected_after_cover_fail,
         "reject_reasons": dict(rejected_reasons),
+        # V18 — reject taxonomy aggregation (patch plan §1).
+        "auto_rejected_by_reason": dict(rejected_reasons),
+        "auto_rejected_by_roi_class": dict(rejected_by_roi_class),
+        "auto_rejected_by_method": dict(rejected_by_method),
+        "auto_rejected_by_mask_type": dict(rejected_by_mask_type),
+        "candidate_failures_by_reason": dict(candidate_failures_by_reason),
+        "published_cosmetic_seams_by_roi_class": dict(published_seam_by_roi_class),
+        "v18_ban_destructive_count": v18_ban_destructive_count,
+        "v18_published_via_safe_candidate": v18_published_via_safe_candidate,
         # Tool availability (patch plan Fix 12).
         "tools": {
             "tools_reachable": tools_reachable,

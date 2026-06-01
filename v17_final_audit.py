@@ -64,6 +64,21 @@ P0_PRODUCT_REASONS = (
     "changed_metallic_surface_block",
 )
 
+# V18 — tiny low-contrast glyph residue (patch plan §8). A published output may
+# still show faint dot/dash residue aligned along the original watermark
+# baseline; it is too low-contrast for the residual-OCR detector but reads to a
+# human. This is a HARD fail, reported separately so CI can track it.
+P0_RESIDUE_REASONS = (
+    "published_low_contrast_glyph_residue",
+)
+
+# Low-contrast glyph-residue thresholds (patch plan §8).
+GLYPH_RESIDUE_LUMA_MIN = 4.0         # min |luma delta| vs surface to count a dot
+GLYPH_RESIDUE_LUMA_MAX = 60.0        # above this it is real product detail, not residue
+GLYPH_RESIDUE_MIN_COMPONENTS = 4     # a chain needs several aligned dots
+GLYPH_RESIDUE_ALIGN_TOL = 0.18       # vertical spread / band height to read as a line
+GLYPH_RESIDUE_BAND_EXCESS = 1.8      # in-band component density / ring density
+
 
 @dataclass
 class FinalAuditResult:
@@ -80,11 +95,13 @@ class FinalAuditResult:
     changed_product_ratio: float = 0.0
     pure_background_change: bool = True
     has_readable_residual: bool = False
+    glyph_residue_score: float = 0.0           # V18 (patch plan §8)
 
     def to_record(self) -> dict:
         return {
             "v17_pass_p0": self.pass_p0,
             "v17_hard_fail_reasons": list(self.hard_fail_reasons),
+            "v18_glyph_residue_score": round(self.glyph_residue_score, 4),
             "v17_residual_score": round(self.residual_score, 4),
             "v17_dot_chain_score": round(self.dot_chain_score, 4),
             "v17_template_residual_score": round(self.template_residual_score, 4),
@@ -211,6 +228,17 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
     elif dot_chain_readable:
         reasons.append("published_dot_chain")
 
+    # V18 — faint low-contrast glyph residue aligned on the watermark baseline
+    # (patch plan §8). A HARD fail: too faint for residual-OCR but human-visible.
+    try:
+        gr = detect_low_contrast_glyph_residue_v18(
+            original, output, bbox, watermark_mask)
+    except Exception:
+        gr = {"residue_score": 0.0, "passed": True}
+    res.glyph_residue_score = float(gr.get("residue_score", 0.0))
+    if not gr.get("passed", True):
+        reasons.append("published_low_contrast_glyph_residue")
+
     # ----- 2. Where did the change land? (background vs product) -----------
     prod_ratio, changed_edge_density = changed_region_product_overlap(
         original, output, bbox, product_mask, watermark_mask)
@@ -286,6 +314,71 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
                              if not (r in seen or seen.add(r))]
     res.pass_p0 = len(res.hard_fail_reasons) == 0
     return res
+
+
+# ---------------------------------------------------------------------------
+# V18 — low-contrast glyph residue (patch plan §8). Catches faint dot/dash
+# chains the residual-OCR detector misses: small low-contrast components aligned
+# along the original watermark baseline, spaced at glyph cadence, denser inside
+# the watermark band than in the surrounding ring. Only fires when the pattern
+# is aligned with the original mark — natural product texture is not punished.
+# ---------------------------------------------------------------------------
+def detect_low_contrast_glyph_residue_v18(original, output, bbox,
+                                          watermark_mask=None):
+    bx, by, bw, bh = bbox
+    if bw <= 4 or bh <= 4:
+        return {"residue_score": 0.0, "component_count": 0,
+                "aligned": False, "band_excess": 0.0, "passed": True}
+    out = output[by:by + bh, bx:bx + bw]
+    if out.size == 0:
+        return {"residue_score": 0.0, "component_count": 0,
+                "aligned": False, "band_excess": 0.0, "passed": True}
+    g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Local surface estimate via a large median blur; residue = small deviations.
+    ksize = max(3, (min(bw, bh) // 2) * 2 + 1)
+    ksize = min(ksize, 31)
+    surface = cv2.medianBlur(g.astype(np.uint8), ksize).astype(np.float32)
+    delta = np.abs(g - surface)
+    glyph = ((delta > GLYPH_RESIDUE_LUMA_MIN) &
+             (delta < GLYPH_RESIDUE_LUMA_MAX)).astype(np.uint8)
+    # Exclude the watermark's own (dilated) strokes — they are expected to differ
+    # if the fill is imperfect, but we want the RESIDUE that survived, so we keep
+    # them; instead exclude large blobs that are clearly product detail.
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(glyph, connectivity=8)
+    comps = []
+    area_box = float(bw * bh)
+    for i in range(1, n):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        w_i = int(stats[i, cv2.CC_STAT_WIDTH])
+        h_i = int(stats[i, cv2.CC_STAT_HEIGHT])
+        # dot/dash sized: small area, not a long product edge.
+        if a < 2 or a > area_box * 0.02:
+            continue
+        if w_i > bw * 0.5 or h_i > bh * 0.6:
+            continue
+        comps.append((cents[i][0], cents[i][1], a))
+    cc = len(comps)
+    if cc < GLYPH_RESIDUE_MIN_COMPONENTS:
+        return {"residue_score": 0.0, "component_count": cc,
+                "aligned": False, "band_excess": 0.0, "passed": True}
+    ys = np.array([c[1] for c in comps], dtype=np.float32)
+    # Aligned along a baseline => low vertical spread relative to box height.
+    vspread = float(ys.std()) / float(max(1.0, bh))
+    aligned = vspread < GLYPH_RESIDUE_ALIGN_TOL
+    # Density inside the central watermark band vs the top/bottom ring.
+    band_lo, band_hi = bh * 0.30, bh * 0.70
+    in_band = float(np.mean((ys >= band_lo) & (ys <= band_hi)))
+    ring_frac = 1.0 - in_band
+    band_excess = in_band / max(0.05, ring_frac)
+    score = 0.0
+    if aligned:
+        score = float(np.clip(cc / 12.0, 0.0, 1.0)) * \
+            float(np.clip(band_excess / GLYPH_RESIDUE_BAND_EXCESS, 0.0, 1.0))
+    passed = not (aligned and band_excess >= GLYPH_RESIDUE_BAND_EXCESS and
+                  cc >= GLYPH_RESIDUE_MIN_COMPONENTS)
+    return {"residue_score": round(score, 4), "component_count": cc,
+            "aligned": bool(aligned), "band_excess": round(band_excess, 4),
+            "passed": bool(passed)}
 
 
 # ---------------------------------------------------------------------------

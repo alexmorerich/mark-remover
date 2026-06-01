@@ -66,6 +66,26 @@ class GateStub:
         return self.q.pop(0) if self.q else self.default()
 
 
+class RepairAwareGate:
+    """V18 adds product-safe candidates to the REPAIR path, so the number of
+    repair candidates is no longer fixed. To test "every repair fails, a cover
+    passes -> clean_covered" robustly, fail on ``repaired=True`` and pass on
+    ``repaired=False`` (after an optional number of initial cover failures)."""
+    def __init__(self, cover_fails_before_pass=0):
+        self.cover_calls = 0
+        self.cover_fails = cover_fails_before_pass
+        self.calls = 0
+
+    def __call__(self, image, repaired, residual_pass=None):
+        self.calls += 1
+        if repaired:
+            return FAIL_HARD()
+        self.cover_calls += 1
+        if self.cover_calls <= self.cover_fails:
+            return FAIL_HARD()
+        return PASS()
+
+
 def _clean_recheck(image):
     return False, {}
 
@@ -115,8 +135,8 @@ def test_failed_repair_and_cover_become_auto_rejected():
 # 2 — failed repair + passing cover -> clean_covered, all P0 gates green
 # --------------------------------------------------------------------------
 def test_passing_cover_becomes_clean_covered():
-    # first call (repair) fails hard; every later call (cover) passes
-    res = _decide(GateStub([FAIL_HARD()], PASS))
+    # every repair candidate fails hard; the first cover candidate passes.
+    res = _decide(RepairAwareGate(cover_fails_before_pass=0))
     assert res.status == "clean_covered"
     assert res.publish_ok is True
     assert all(res.p0_gates.values())
@@ -126,8 +146,9 @@ def test_passing_cover_becomes_clean_covered():
 # 4 — candidate failures allowed; a later candidate passes
 # --------------------------------------------------------------------------
 def test_candidate_failures_allowed_when_one_passes():
-    res = _decide(GateStub([FAIL_HARD(), FAIL_HARD(), FAIL_HARD()], PASS),
-                  img=_white_img())
+    # every repair fails + the first two cover candidates fail, then a cover
+    # passes -> clean_covered with several recorded candidate failures.
+    res = _decide(RepairAwareGate(cover_fails_before_pass=2), img=_white_img())
     assert res.status == "clean_covered"
     assert res.candidate_publish_failures >= 3
     assert res.publish_ok is True

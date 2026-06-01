@@ -51,6 +51,7 @@ import v14_patch
 import v15_patch
 import v16_pipeline
 import v17_final_audit
+import v18_patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -63,13 +64,18 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V16_AUTO_DECISION"
-assert PIPELINE_VERSION == "V16_AUTO_DECISION"
+PIPELINE_VERSION = "V18_PATCH"
+assert PIPELINE_VERSION == "V18_PATCH"
 # V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
 # auto_rejected final state + a post-clean re-detection P0 gate around it, so
-# only gate-passing outputs are ever published. The visual gate version is v13;
-# the final-decision/state-machine version is v16.
+# only gate-passing outputs are ever published. V17 adds the truthful
+# final-output audit; V18 adds product-aware safe candidate generation +
+# low-contrast glyph-residue auditing. The visual gate version stays v13
+# (frozen); the layered versions are reported separately (patch plan §9).
 FINAL_VISUAL_GATE_VERSION = "v13"
+STATE_MACHINE_VERSION = "v16"
+FINAL_AUDIT_VERSION = "v17"
+PATCH_VERSION = "v18"
 
 
 def _git_commit() -> str:
@@ -92,6 +98,11 @@ def run_metadata(seed: int) -> dict:
         "qa_schema_version": QA_SCHEMA_VERSION,
         "strategy_schema_version": STRATEGY_SCHEMA_VERSION,
         "final_visual_gate_version": FINAL_VISUAL_GATE_VERSION,
+        # V18 (patch plan §9) — explicit per-layer versions.
+        "state_machine_version": STATE_MACHINE_VERSION,
+        "final_audit_version": FINAL_AUDIT_VERSION,
+        "patch_version": PATCH_VERSION,
+        "gate_version": "v13_frozen",
     }
 
 # ---------------------------------------------------------------------------
@@ -4153,6 +4164,39 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     # repair_qa_pass / no_false_clean_repaired: a clean_repaired is honest only
     # when the full P0 gate passed (it did — clean_repaired is gate-gated).
     rec["repair_qa_pass"] = (status == ST_CLEAN_REPAIRED) and bool(v16.publish_ok)
+
+    # --- V18 — per-image reject taxonomy (patch plan §1). For every rejected
+    # image, record the exact ROI class + mask type + best method + fail reasons
+    # so the run report can show which combination causes rejection, instead of
+    # blind threshold tuning. ------------------------------------------------
+    if status == ST_AUTO_REJECTED:
+        try:
+            mask_conf = v18_patch.stroke_mask_confidence(
+                img, bbox_tuple, stroke_mask, protect_combined)
+        except Exception:
+            mask_conf = {}
+        sc = getattr(v13_verdict, "scores", {}) if v13_verdict else {}
+        rec["v18_reject_taxonomy"] = {
+            "image_id": rec.get("product_id"),
+            "roi_class": pr_roi.roi_class,
+            "method_family": rec.get("v9_method_family"),
+            "best_repair_method": (v16.best_repair_image is not None) and
+                "repair" or "none",
+            "best_cover_method": (v16.best_cover_image is not None) and
+                "cover" or "none",
+            "mask_used": mask_conf.get("mask_type", "unknown"),
+            "product_overlap": rec.get("v18_product_overlap", 0.0),
+            "pure_background_score": rec.get("v18_pure_background_score", 0.0),
+            "hard_fail_reasons": [
+                r for r in (rec.get("v17_hard_fail_reasons") or [])],
+            "candidate_fail_reasons": list(v16.reject_reasons),
+            "changed_product_ratio": rec.get("v17_changed_product_ratio", 0.0),
+            "residual_score": rec.get("v17_residual_score", 0.0),
+            "visible_patch_score": float(sc.get("visible_patch_shape", 0.0)),
+            "visible_band_score": float(sc.get("visible_band", 0.0)),
+            "silhouette_damage_score": float(sc.get("contour_break", 0.0)),
+            "glyph_residue_score": rec.get("v18_glyph_residue_score", 0.0),
+        }
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,

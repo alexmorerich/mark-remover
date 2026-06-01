@@ -38,6 +38,7 @@ import v13_gates
 import v14_patch
 import v15_patch
 import v17_final_audit
+import v18_patch
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,30 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     state = {"candidate_failures": 0}
     reject_reasons = []
 
+    # --- V18 — product-context pre-routing (patch plan §2). Compute the
+    # product-overlap signals ONCE, decide whether destructive generators are
+    # banned, and pre-build product-safe candidates (segmented + specialized +
+    # stroke-only). These are ADDED to the repair/cover pools below; every one
+    # still passes through the unchanged P0 gate, so this can only widen the set
+    # of safe options, never ship an output the audit would reject. ----------
+    try:
+        pctx = v18_patch.compute_product_context(
+            img, bbox, product_mask, watermark_mask, roi_class=roi_class)
+        ban_destructive = v18_patch.should_ban_destructive(pctx)
+        v18_safe = v18_patch.build_safe_candidates(
+            img, bbox, watermark_mask, product_mask, pctx)
+        v18_safe = v18_patch.rank_candidates(
+            img, v18_safe, bbox, product_mask, watermark_mask, pctx)
+    except Exception:
+        pctx = None
+        ban_destructive = False
+        v18_safe = []
+    v18_telem = {"v18_ban_destructive": bool(ban_destructive),
+                 "v18_n_safe_candidates": len(v18_safe),
+                 "v18_safe_candidate_names": [n for n, _ in v18_safe]}
+    if pctx is not None:
+        v18_telem.update(pctx.to_record())
+
     def _p0(image, repaired):
         # Fresh per-candidate watermark-hiding verdict for the template/dot
         # residual gate, then the V13 visual gate, then the post-clean detector
@@ -194,8 +219,17 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                               verdict, gates, kind))
 
     # ---------------- REPAIR PATH ----------------
+    # V18 — product-safe candidates are real-pixel repairs: a pass here yields
+    # clean_repaired (the honest classification), and on a product region they
+    # are tried BEFORE the destructive uniform fill (which is banned anyway).
     repair_cands = []
-    if uniform is not None:
+    if not ban_destructive and uniform is not None:
+        repair_cands.append(("v16_uniform_background_fill", uniform))
+    for v18_name, v18_img in v18_safe:
+        repair_cands.append((v18_name, v18_img))
+    if ban_destructive and uniform is not None:
+        # Should not occur (uniform is product-overlap<0.03 gated), but if it
+        # does, demote it below every product-safe candidate.
         repair_cands.append(("v16_uniform_background_fill", uniform))
     if loop_repair_image is not None:
         repair_cands.append((loop_repair_method, loop_repair_image))
@@ -210,7 +244,7 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                 status="clean_repaired", image=rimg, method=name,
                 verdict=verdict, p0_gates=gates, publish_ok=True,
                 candidate_publish_failures=state["candidate_failures"],
-                best_repair_image=rimg, telemetry={"v16_path": "repair"})
+                best_repair_image=rimg, telemetry={**v18_telem, "v16_path": "repair"})
         _consider_safe(strict_ok, safe_ok, verdict, gates, name, rimg,
                        "clean_repaired", "repair")
         state["candidate_failures"] += 1
@@ -230,7 +264,7 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                         p0_gates=g2, publish_ok=True,
                         candidate_publish_failures=state["candidate_failures"],
                         best_repair_image=rescued,
-                        telemetry={"v16_path": "repair_rescued"})
+                        telemetry={**v18_telem, "v16_path": "repair_rescued"})
                 _consider_safe(s_ok, sf_ok, v2, g2,
                                name + "+v16_micro_cleanup", rescued,
                                "clean_repaired", "repair")
@@ -244,14 +278,25 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         cover_cands = [(n, im) for (n, im, _full, _s) in mc.ranked]
     except Exception:
         cover_cands = []
-    if uniform is not None:
-        cover_cands.insert(0, ("v16_uniform_background_fill", uniform))
-    try:
-        cover_cands.append(("v16_forced_removal",
-                            v15_patch.forced_removal_fill(img, bbox,
-                                                          watermark_mask)))
-    except Exception:
-        pass
+    # V18 — product-safe candidates also seed the cover beam (so a candidate that
+    # only clears the safe tier still publishes as clean_covered rather than
+    # auto-rejecting), and they lead the beam on product regions.
+    for v18_name, v18_img in reversed(v18_safe):
+        cover_cands.insert(0, (v18_name, v18_img))
+    # V18 — destructive full-band / forced-removal / uniform fills are BANNED on
+    # any product-overlap or silhouette-contact region (patch plan §1.3, §2): on
+    # product pixels they paint exactly the bands/blobs the audit rejects, so
+    # offering them only wastes the beam. They remain available on a strict
+    # pure-background box.
+    if not ban_destructive:
+        if uniform is not None:
+            cover_cands.insert(0, ("v16_uniform_background_fill", uniform))
+        try:
+            cover_cands.append(("v16_forced_removal",
+                                v15_patch.forced_removal_fill(img, bbox,
+                                                              watermark_mask)))
+        except Exception:
+            pass
 
     best_cover = cover_cands[0][1] if cover_cands else None
     last_verdict = None
@@ -265,7 +310,7 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                 verdict=verdict, p0_gates=gates, publish_ok=True,
                 candidate_publish_failures=state["candidate_failures"],
                 best_repair_image=best_repair, best_cover_image=cimg,
-                telemetry={"v16_path": "cover"})
+                telemetry={**v18_telem, "v16_path": "cover"})
         _consider_safe(strict_ok, safe_ok, verdict, gates, name, cimg,
                        "clean_covered", "cover")
         state["candidate_failures"] += 1
@@ -288,7 +333,7 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
             publish_ok=True, cosmetic_seam=True,
             candidate_publish_failures=state["candidate_failures"],
             best_repair_image=best_repair, best_cover_image=image,
-            telemetry={"v16_path": "safe_cosmetic_seam", "v16_seam_kind": kind})
+            telemetry={**v18_telem, "v16_path": "safe_cosmetic_seam", "v16_seam_kind": kind})
 
     # ---------------- AUTO REJECTED -----------------------------------------
     # The watermark could not be removed without damaging the product (or could
@@ -324,5 +369,5 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         candidate_publish_failures=state["candidate_failures"],
         reject_reasons=reasons or ["repair_and_cover_failed_final_gate"],
         best_repair_image=best_repair, best_cover_image=best_cover_diag,
-        telemetry={"v16_path": "auto_rejected",
+        telemetry={**v18_telem, "v16_path": "auto_rejected",
                    "v16_best_removed_conf": round(best_conf, 4)})

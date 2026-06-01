@@ -37,12 +37,24 @@ The pipeline has three responsibilities, documented in detail below:
 may be labelled `clean_repaired` or `clean_covered`. There is no path from a
 failed check into a clean status, and a candidate that passes the per-candidate
 gate but is then mutated by cleanup/cover polish is **re-audited on its final
-bytes** before it can ship. Anything uncertain is `auto_rejected`. The current
-pipeline is **V17**: it keeps the V16 auto-decision state machine and adds (a) a
-truthful final-output audit (`v17_final_audit.py`) made authoritative, and (b)
-product-aware gating of destructive fills. The visual detectors (`v13_gates.py`)
-are intentionally frozen — improvements go into candidate generation and into the
-final audit, never into weakening the gate.
+bytes** before it can ship. Anything uncertain is `auto_rejected`.
+
+The pipeline is built as **layered, independently-versioned stages** so a
+regression can never confuse one for another:
+
+| Layer | Version | Responsibility |
+|-------|:-------:|----------------|
+| **Visual gate** | `v13` (frozen) | The hard-safety + cosmetic detectors. **Never weakened.** |
+| **State machine** | `v16` | repair → cleanup → cover → `auto_rejected` decision flow. |
+| **Final audit** | `v17` | Truthful re-audit of the *actual published bytes*; authoritative. |
+| **Candidate patch** | `v18` | Product-aware routing + safe candidate generation to **reduce rejects without weakening the gate**. |
+
+The guiding principle is that **the clean rate is raised by giving the pipeline
+more safe, product-preserving candidates — never by loosening a gate.** The
+visual detectors (`v13_gates.py`) are intentionally frozen; V18's work is
+entirely upstream of them, in candidate generation, plus one *stricter* audit
+signal (low-contrast glyph residue). If a watermark cannot be removed without
+damaging the product, the image is still `auto_rejected`.
 
 ---
 
@@ -239,6 +251,64 @@ The beam publishes the first cover that passes the gate; otherwise the image
 falls to `auto_rejected` with its **most mark-removed, product-safest** attempt
 saved for diagnostics.
 
+### 2.4 Product-context routing & safe candidates (`v18_patch.py`)
+
+Most `auto_rejected` images are **not** "uncleanable" — they are cases where the
+old candidate bank could only offer a *destructive* fill (a full band, a forced
+removal, a uniform block) that the final audit correctly rejected, leaving no
+safe alternative. V18 closes that gap by **routing on product context before any
+candidate is generated** and **adding product-preserving candidates** to the
+repair/cover pools. Every V18 candidate still passes through the same `_p0`
+chokepoint (gate + re-detect + final audit), so this can only widen the set of
+*safe* options — it can never ship an output the audit would reject.
+
+**Pre-generation routing — `ProductContext`.** Computed once per image from the
+frozen V13 detectors: `product_overlap`, `touches_silhouette`,
+`edge_density_inside_box`, `long_line_score`, `protected_text_score`,
+`dark_surface_ratio`, `metallic_gradient_score`, `flex_line_score`, and a derived
+`pure_background_score`. From these, `allowed_generators(ctx)` decides which
+generators may run:
+
+| Regime | Condition | Allowed generators |
+|--------|-----------|--------------------|
+| **Pure background** | `product_overlap < 0.03` **and** `pure_background_score ≥ 0.85` | uniform-fill, bbox-clone, ring-median, segmented, stroke-only, **and** forced-removal |
+| **Light product** | `product_overlap < 0.10`, not touching silhouette | segmented micro-cover, stroke-only inpaint, ring-clone of background fragments |
+| **Heavy product / silhouette** | otherwise | **stroke-level or segmented product-safe repair only** |
+
+`should_ban_destructive(ctx)` returns true on **any** product overlap (`> 0.03`),
+silhouette contact, or protected text — and the state machine then withholds the
+uniform fill and forced-removal from the beam entirely, so the beam is never
+wasted on candidates that can only be rejected.
+
+**Segmented product/background repair** (`segmented_product_background_repair`)
+splits the ROI into background and product fragments and repairs each with the
+right tool (ring/plane fill on background, stroke-only inpaint on product) —
+**never one global fill across all fragments**, which is what produces white
+slabs, dark blobs and wedges.
+
+**Specialized repair tools for the high-reject ROI classes** — each restricts the
+change to the watermark strokes and self-verifies before being offered:
+
+| Tool | ROI target | Method & safety check |
+|------|-----------|------------------------|
+| `repair_thin_flex_line_preserving` | flex cables, long-line surfaces | NS inpaint of strokes only; **rejected** if cable line-continuity drops below 97% |
+| `repair_dark_surface_stroke_clone` | dark modules / backs / screens | Lab-plane clone from local **dark** ring pixels; **rejected** on a bright blob |
+| `repair_metallic_gradient_plane` | metallic / glass / glossy | fit a local gradient plane, paint strokes only; **rejected** if it flattens into a block |
+| `repair_colored_surface_hue_matched` | blue adhesive / coloured covers | hue/saturation-matched Lab fill; never a gray/white fill |
+| `stroke_only_inpaint` | universal fallback | conservative Telea over the strokes only |
+
+**Product-safety-first ranking** (`rank_candidates`) orders candidates by a cheap
+product-damage penalty *before* the gate, so on a product region the safest
+options are tried first and a high-removal-but-destructive candidate can never
+dominate the beam: `score −= 1000·(changed product ratio) + 1000·(visible patch
+on product) + 500·(texture drop) + 500·(dark-surface blob)`. On a pure-background
+box, ranking falls back to residual-removal and boundary smoothness.
+
+**Stroke-mask reliability** (`stroke_mask_confidence`) reports whether the mask is
+a precise `stroke` mask or a wide `logo_fallback`/`widened_text` mask. The rule:
+a `logo_fallback` mask on product (`product_overlap > 0.03`) may **only** drive a
+stroke-only conservative inpaint — never a destructive fill.
+
 ---
 
 ## 3. Cleaning Quality Review
@@ -246,9 +316,9 @@ saved for diagnostics.
 Quality review is the heart of the system: it is what makes every published
 output trustworthy. It is a **final visual publish gate** (`v13_gates.py`) plus a
 post-clean **re-detection** double-check, wired into an explicit auto-decision
-state machine (`v16_pipeline.decide_final_status`), and — new in V17 — a
-**truthful audit of the actual published bytes** (`v17_final_audit.py`) that is
-made *authoritative*: it can demote any candidate the gate accepted.
+state machine (`v16_pipeline.decide_final_status`), plus a **truthful audit of the
+actual published bytes** (`v17_final_audit.py`) that is made *authoritative*: it
+can demote any candidate the gate accepted.
 
 ### 3.1 The state machine
 
@@ -329,11 +399,22 @@ last word, and it introduces these P0 hard-fail reasons:
 | `changed_dark_surface_blob` | A new bright/dark blob on a dark product surface |
 | `changed_metallic_surface_block` | A flat block where a metallic gradient existed |
 | `changed_protected_text` | Real printed product text flattened away |
+| `published_low_contrast_glyph_residue` | **(V18)** A faint dot/dash chain aligned on the watermark baseline survived |
 
 The watermark's own strokes are always excluded when measuring "product
 structure", so a clean removal is never mistaken for damage. A failed audit sets
 `publish_ok = false` and forces `auto_rejected`; a high removal score can never
 compensate for product damage.
+
+**V18 — low-contrast glyph residue (`detect_low_contrast_glyph_residue_v18`).**
+Some outputs clear the residual-OCR and dot-chain detectors yet still show a faint
+low-contrast dot/dash chain to a human on a simple surface. V18 adds a dedicated
+detector that fires **only** when small low-contrast components are (a) aligned
+along the original watermark baseline (low vertical spread), (b) denser inside the
+watermark band than in the surrounding ring, and (c) numerous enough to read as
+text. Natural product texture — scattered, unaligned — is never punished. This is
+a new **stricter** P0 reason (`published_low_contrast_glyph_residue`); it never
+loosens an existing one.
 
 ### 3.5 Candidate vs final failures
 
@@ -395,17 +476,34 @@ these must be zero:
 }
 ```
 
+The V18 report adds a `published_low_contrast_glyph_residue` counter to the
+must-be-zero block, plus a **reject taxonomy** so rejects can be diagnosed instead
+of blindly tuned (patch plan §1): `auto_rejected_by_roi_class`,
+`auto_rejected_by_method`, `auto_rejected_by_mask_type`,
+`candidate_failures_by_reason`, and per-image `v18_reject_taxonomy` records
+(ROI class · mask type · best method · hard-fail reasons · changed-product-ratio ·
+residual / patch / band / glyph-residue scores). The report header carries the
+explicit layered versions (`state_machine_version`, `final_audit_version`,
+`patch_version`, `gate_version`) so a regression comparison can never confuse
+them.
+
 **Acceptance criteria for a release run (mandatory):** `manual_review = 0`,
 `final_output_publish_failures = 0`, every `published_with_*` hard-safety counter
-`= 0`, and every `v17_published_audit_failures` counter `= 0`. `auto_rejected > 0`
-and `candidate_publish_failures > 0` are allowed and healthy. **The clean rate is
+`= 0`, every `v17_published_audit_failures` counter `= 0` (including
+`published_low_contrast_glyph_residue`). `auto_rejected > 0` and
+`candidate_publish_failures > 0` are allowed and healthy. **The clean rate is
 never improved by publishing a damaged or residual-watermark image** — when in
 doubt, the pipeline rejects.
 
-> **Latest 50-image run (V17, `bench_assets`, seed 42):** clean_repaired 20,
-> clean_covered 10, auto_rejected 20; all hard-safety and V17 audit counters 0,
-> `all_clean = true`. V17 trades a higher reject count for a guarantee that no
-> shipped image is damaged or still marked.
+> **Latest 50-image run (V18, `bench_assets`, seed 2026):** clean_repaired 26,
+> clean_covered 4, auto_rejected 20; all hard-safety and final-audit counters 0,
+> `all_clean = true`; **12 of the 30 published outputs cleaned via a V18
+> product-safe candidate**, and destructive generators were banned on 28 images.
+> V18 raised real repairs (`clean_repaired` 20 → 26) without weakening any gate.
+> The remaining 20 rejects are genuine safety stops — most are a watermark
+> printed **over real product text** (removing it would destroy the text), or a
+> seam the audit cannot confirm sits on pure background. `auto_rejected` is the
+> correct floor for those; it is never traded away for a higher clean rate.
 
 ---
 
@@ -419,11 +517,12 @@ doubt, the pipeline rejects.
 | `v13_gates.py` | **③ Final visual publish gate** — dot-chain v2, visible-patch-shape, silhouette, product-overlap, protected-text detectors (frozen `v13`). |
 | `v14_patch.py` | Adaptive soft-metric context, near-miss rescue, segmented micro-cover beam, cover polish, `cover_hides_watermark`. |
 | `v15_patch.py` | Full-text mask widening, ghost-aware residual, dark-stroke cover, uniform-background fill, forced-removal fill. |
-| `v16_pipeline.py` | **Auto-decision state machine** — hard-safety vs cosmetic tiers, repair → cleanup → cover → `auto_rejected`; runs the V17 audit at the per-candidate chokepoint and gates the uniform fill. |
-| `v17_final_audit.py` | **③ Truthful final-output audit (V17)** — re-audits the actual published bytes, context-aware cosmetic→hard conversion, product-aware `allow_uniform_background_fill`. |
-| `v13_report.py` | **CI gate** — must-be-zero hard-safety counters, V17 published-audit counters, candidate/auto-reject reporting, manifest. |
+| `v16_pipeline.py` | **Auto-decision state machine** — hard-safety vs cosmetic tiers, repair → cleanup → cover → `auto_rejected`; runs the V17 audit at the per-candidate chokepoint, gates the uniform fill, and seeds the pools with V18 product-safe candidates. |
+| `v17_final_audit.py` | **③ Truthful final-output audit** — re-audits the actual published bytes, context-aware cosmetic→hard conversion, product-aware `allow_uniform_background_fill`, V18 low-contrast glyph-residue detector. |
+| `v18_patch.py` | **② Product-aware candidate generation (V18)** — `ProductContext` routing, destructive-generator bans, segmented product/background repair, flex / dark / metallic / coloured specialized repair tools, stroke-mask confidence, product-safety-first ranking. |
+| `v13_report.py` | **CI gate** — must-be-zero hard-safety + final-audit counters, V18 reject taxonomy aggregation, layered version stamps, candidate/auto-reject reporting, manifest. |
 | `watermark-template.png` | Canonical watermark text template for edge matching / logo masks. |
-| `test_v1*_*.py` | Regression + unit locks for the detectors, gate, state machine, CI gate and the V17 final audit (`test_v17_patch.py`). |
+| `test_v1*_*.py` | Regression + unit locks for the detectors, gate, state machine, CI gate, the V17 final audit (`test_v17_patch.py`) and the V18 patch (`test_v18_patch.py`). |
 
 ## Usage
 

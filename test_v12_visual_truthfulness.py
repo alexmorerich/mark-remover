@@ -214,7 +214,7 @@ def test_white_fill_banned_on_dark_and_flex():
 # --------------------------------------------------------------------------
 
 def test_version_string_is_v12():
-    assert mr.PIPELINE_VERSION == "V16_AUTO_DECISION"
+    assert mr.PIPELINE_VERSION == "V18_PATCH"
 
 
 def test_schema_versions_are_v12():
@@ -224,7 +224,7 @@ def test_schema_versions_are_v12():
 
 def test_run_metadata_carries_version():
     meta = mr.run_metadata(2026)
-    assert meta["version"] == "V16_AUTO_DECISION"
+    assert meta["version"] == "V18_PATCH"
     assert meta["qa_schema_version"] == "v13"
     assert meta["strategy_schema_version"] == "v13"
     assert meta["run_seed"] == 2026
