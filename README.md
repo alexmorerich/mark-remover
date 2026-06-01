@@ -10,30 +10,39 @@ visual-safety gate. Anything that cannot be cleaned safely is **`auto_rejected`*
 The pipeline has three responsibilities, documented in detail below:
 
 1. **[Identify the watermark position](#1-watermark-position-identification)** — where, and how confidently, the mark is present.
-2. **[Clean the mark](#2-mark-cleaning-strategies)** — a tiered bank of repair and cover strategies chosen by ROI context.
-3. **[Review cleaning quality](#3-cleaning-quality-review)** — a hard visual-safety gate that decides what is publishable, with a re-detection double-check and a CI gate.
+2. **[Clean the mark](#2-mark-cleaning-strategies)** — a tiered bank of repair and cover strategies chosen by ROI context, with destructive generators fenced off from product pixels.
+3. **[Review cleaning quality](#3-cleaning-quality-review)** — a hard visual-safety gate **plus a truthful audit of the actual published bytes**, with a re-detection double-check and a CI gate.
 
 ```
-                 ┌─────────────────────────────────────────────────────────┐
-   input image → │  ① PRESENCE GATE  →  ② ROI CLASS  →  ③ STRATEGY BANK     │
-                 │        │                                   │             │
-                 │   confirmed?                          repair / cover     │
-                 │        │                                   │             │
-                 │        ▼                                   ▼             │
-                 │   ④ FINAL VISUAL PUBLISH GATE (P0 hard-safety + cosmetic) │
-                 │        │                                                  │
-                 │   ┌────┴───────────────┬───────────────────┐             │
-                 │   ▼                    ▼                   ▼             │
-                 │ clean_repaired   clean_covered        auto_rejected      │
-                 └─────────────────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────────────────┐
+   input image → │  ① PRESENCE GATE  →  ② ROI CLASS  →  ③ STRATEGY BANK      │
+                 │        │                                   │              │
+                 │   confirmed?                       product-aware routing  │
+                 │        │                                   │              │
+                 │        ▼                                   ▼              │
+                 │   ④ FINAL VISUAL PUBLISH GATE  (P0 hard-safety + cosmetic) │
+                 │        │                                                   │
+                 │        ▼                                                   │
+                 │   ⑤ FINAL-OUTPUT AUDIT (re-audit the actual published      │
+                 │      bytes: residual? product damage? seam on product?)    │
+                 │        │                                                   │
+                 │   ┌────┴───────────────┬───────────────────┐              │
+                 │   ▼                    ▼                   ▼              │
+                 │ clean_repaired   clean_covered        auto_rejected       │
+                 └──────────────────────────────────────────────────────────┘
 ```
 
-**Core invariant:** only an output that passes every **hard-safety** gate
-(watermark verifiably gone **and** product undamaged) may be labelled
-`clean_repaired` or `clean_covered`. There is no path from a failed gate into a
-clean status. Pipeline version `V16_AUTO_DECISION`; the final visual gate is
-versioned `v13` (it is intentionally frozen — improvements go into the candidate
-generators, not the gate).
+**Core invariant:** only an output whose **actual published pixels** pass every
+**hard-safety** check — watermark verifiably gone **and** product undamaged —
+may be labelled `clean_repaired` or `clean_covered`. There is no path from a
+failed check into a clean status, and a candidate that passes the per-candidate
+gate but is then mutated by cleanup/cover polish is **re-audited on its final
+bytes** before it can ship. Anything uncertain is `auto_rejected`. The current
+pipeline is **V17**: it keeps the V16 auto-decision state machine and adds (a) a
+truthful final-output audit (`v17_final_audit.py`) made authoritative, and (b)
+product-aware gating of destructive fills. The visual detectors (`v13_gates.py`)
+are intentionally frozen — improvements go into candidate generation and into the
+final audit, never into weakening the gate.
 
 ---
 
@@ -185,12 +194,18 @@ actually installed.
   DeepFill on **stroke-level masks only** when available (never full-bbox
   neural inpaint on product structure).
 
-**Pure-background fast path (`v15_patch`).** When the local surround is uniform
-(judged on the *immediate* perimeter, so distant product never vetoes a
-pure-white case), the mark is simply replaced by an imitation of the
-surrounding background (`uniform_background_fill`, a feathered Telea from the
-ring). On a uniform surface this is exact and invisible, and it avoids the
-garbled-glyph artefacts that template-subtraction can leave on plain white.
+**Pure-background fast path (`v15_patch`), strictly gated (V17).** When the local
+surround is uniform, the mark is replaced by an imitation of the surrounding
+background (`uniform_background_fill`, a feathered Telea from the ring) — exact
+and invisible on a uniform surface, and free of the garbled-glyph artefacts that
+template-subtraction can leave on plain white. Because a full-footprint fill is
+*destructive on product pixels*, V17 only permits it when
+`v17_final_audit.allow_uniform_background_fill` confirms a **strict** pure-
+background case: product overlap `< 0.03` (watermark strokes excluded), interior
+edge density `< 0.04`, no long lines, no protected text, a uniform surrounding
+ring, **and** the box not touching the product silhouette. If any check fails the
+box is routed to segmented / stroke-only repair (or `auto_rejected`) — never a
+band painted across a cable, dark surface, label or silhouette.
 
 **Near-miss rescue (`v14_patch.near_miss_rescue`).** A repair that is clean
 except for a faint seam is not discarded: a bounded chain of
@@ -229,18 +244,28 @@ saved for diagnostics.
 ## 3. Cleaning Quality Review
 
 Quality review is the heart of the system: it is what makes every published
-output trustworthy. It is a single **final visual publish gate** (`v13_gates.py`)
-plus a post-clean **re-detection** double-check, wired into an explicit
-auto-decision state machine (`v16_pipeline.decide_final_status`).
+output trustworthy. It is a **final visual publish gate** (`v13_gates.py`) plus a
+post-clean **re-detection** double-check, wired into an explicit auto-decision
+state machine (`v16_pipeline.decide_final_status`), and — new in V17 — a
+**truthful audit of the actual published bytes** (`v17_final_audit.py`) that is
+made *authoritative*: it can demote any candidate the gate accepted.
 
 ### 3.1 The state machine
 
 ```
-repair candidate passes the P0 gate        → clean_repaired
-else residual micro-cleanup passes          → clean_repaired
-else best cover candidate passes the P0 gate → clean_covered
-else                                         → auto_rejected
+repair candidate passes P0 gate + final audit        → clean_repaired
+else residual micro-cleanup passes gate + final audit → clean_repaired
+else best cover candidate passes gate + final audit   → clean_covered
+else                                                  → auto_rejected
 ```
+
+Every candidate flows through one chokepoint (`_p0`) that runs the visual gate,
+the detector re-check, **and** the V17 final audit on that candidate's bytes; a
+candidate only counts as publishable if all three agree. The published output is
+then audited **once more** on its final bytes (`mark_remover` call site) — if it
+still shows the mark or damages the product, it is forced to `auto_rejected`.
+This closes the V16 gap where a candidate could pass an early gate and then be
+mutated by cleanup, cover polish or status conversion without re-auditing.
 
 `auto_rejected` is a **final, automated** decision — `publish_ok = false`,
 `manual_required = false`. It is not manual review and it is never published;
@@ -273,16 +298,44 @@ outputs; only aesthetic ranking may differ.**
   `residual_ocr` (re-detection), `template_residual`, `dot_chain`,
   `product_damage`, `silhouette`, `protected_text`. Leaving the mark, or
   damaging the product, is never publishable.
-- **COSMETIC gates — tracked, not publish-blocking:** `visible_patch`,
-  `visible_band`. A verifiably mark-removed, product-safe output with only a
-  faint seam publishes as `clean_covered` flagged `cosmetic_seam` — a faint seam
-  on the background is acceptable; shipping the mark or rejecting a cleanable,
-  product-safe image is not.
+- **COSMETIC gates — context-aware (V17):** `visible_patch`, `visible_band`.
+  A seam is cosmetic **only when the changed region is confirmed pure
+  background** — product overlap `< 0.03` (watermark strokes excluded), changed-
+  region edge density `< 0.03`, not touching the product silhouette, not over
+  protected text. On pure background, a faint seam is acceptable and the output
+  publishes as `clean_covered` flagged `cosmetic_seam`. **On product pixels the
+  same seam is product damage and becomes a P0 hard failure** — the image is
+  `auto_rejected` rather than shipped with a band painted across a cable, dark
+  surface, label or silhouette.
 
 So an image is `auto_rejected` only when the watermark cannot be removed **or**
 removing it would damage the product — exactly the cases that should not ship.
 
-### 3.4 Candidate vs final failures
+### 3.4 The V17 final-output audit (`v17_final_audit.py`)
+
+The audit re-runs the visual detectors on the **actual final output** and
+returns a `FinalAuditResult` (`pass_p0`, `hard_fail_reasons`, plus residual /
+silhouette / patch / band / changed-product-ratio scores). It is the truthful
+last word, and it introduces these P0 hard-fail reasons:
+
+| Reason | Trigger |
+|--------|---------|
+| `published_residual_watermark` | Detector re-detect still fires on the output (authoritative) |
+| `published_dot_chain` | A readable broken-glyph / dot-chain remains |
+| `visible_patch_on_product` | A visible patch whose changed region is **not** pure background |
+| `visible_band_on_product` | A visible band whose changed region is **not** pure background |
+| `changed_product_silhouette` | Contour break on product pixels (silhouette bitten / squared off) |
+| `changed_thin_flex_structure` | A continuous flex-cable line is broken by the fill |
+| `changed_dark_surface_blob` | A new bright/dark blob on a dark product surface |
+| `changed_metallic_surface_block` | A flat block where a metallic gradient existed |
+| `changed_protected_text` | Real printed product text flattened away |
+
+The watermark's own strokes are always excluded when measuring "product
+structure", so a clean removal is never mistaken for damage. A failed audit sets
+`publish_ok = false` and forces `auto_rejected`; a high removal score can never
+compensate for product damage.
+
+### 3.5 Candidate vs final failures
 
 Intermediate candidates are *expected* to fail the gate; only the final
 published output matters:
@@ -293,7 +346,7 @@ published output matters:
   gate. **Always 0** by construction (clean status is only assigned when the
   hard gates pass).
 
-### 3.5 Final statuses
+### 3.6 Final statuses
 
 | Status | `publish_ok` | `manual_required` | Meaning |
 |--------|:-:|:-:|---------|
@@ -304,13 +357,15 @@ published output matters:
 | `auto_rejected` | ❌ | ❌ | Repair **and** cover both failed; final automated decision, not published. |
 | `failed_io` | ❌ | ❌ | Corrupt/unreadable file. |
 
-### 3.6 CI gate & manifest (`v13_report.py`)
+### 3.7 CI gate & manifest (`v13_report.py`)
 
 `v13_report.py` scans every per-image `qa.json` and **fails the run (exit 1)** if
-any published output violates a hard-safety gate or carries a
-`final_output_publish_failure`. It reports `auto_rejected`, rejected-candidate
-counts, cosmetic-seam counts and honest tool availability separately. Each
-manifest row carries:
+any published output violates a hard-safety gate, carries a
+`final_output_publish_failure`, **or trips a V17 published-audit failure**. It
+reports `auto_rejected`, rejected-candidate counts, cosmetic-seam counts and
+honest tool availability separately. Each manifest row carries the gate verdict,
+the `p0_gates` dict, and the V17 audit fields (`v17_pass_p0`,
+`v17_hard_fail_reasons`, residual / silhouette / patch / band scores):
 
 ```json
 {
@@ -323,15 +378,34 @@ manifest row carries:
     "residual_ocr_pass": true, "template_residual_pass": true,
     "dot_chain_pass": true, "visible_patch_pass": true, "visible_band_pass": true,
     "product_damage_pass": true, "silhouette_pass": true, "protected_text_pass": true
-  }
+  },
+  "v17_pass_p0": true, "v17_hard_fail_reasons": []
 }
 ```
 
-**Acceptance criteria for a release run:** `manual_review = 0`,
-`final_output_publish_failures = 0`, and every `published_with_*` hard-safety
-counter `= 0` (residual_ocr, template_residual, dot_chain, product_damage,
-silhouette, protected_text). `auto_rejected > 0` and
-`candidate_publish_failures > 0` are allowed.
+The report also emits a `v17_published_audit_failures` block — every one of
+these must be zero:
+
+```json
+"v17_published_audit_failures": {
+  "published_residual_watermark": 0, "published_dot_chain": 0,
+  "published_product_damage": 0, "published_visible_patch_on_product": 0,
+  "published_visible_band_on_product": 0, "published_silhouette_damage": 0,
+  "published_protected_text_damage": 0
+}
+```
+
+**Acceptance criteria for a release run (mandatory):** `manual_review = 0`,
+`final_output_publish_failures = 0`, every `published_with_*` hard-safety counter
+`= 0`, and every `v17_published_audit_failures` counter `= 0`. `auto_rejected > 0`
+and `candidate_publish_failures > 0` are allowed and healthy. **The clean rate is
+never improved by publishing a damaged or residual-watermark image** — when in
+doubt, the pipeline rejects.
+
+> **Latest 50-image run (V17, `bench_assets`, seed 42):** clean_repaired 20,
+> clean_covered 10, auto_rejected 20; all hard-safety and V17 audit counters 0,
+> `all_clean = true`. V17 trades a higher reject count for a guarantee that no
+> shipped image is damaged or still marked.
 
 ---
 
@@ -345,10 +419,11 @@ silhouette, protected_text). `auto_rejected > 0` and
 | `v13_gates.py` | **③ Final visual publish gate** — dot-chain v2, visible-patch-shape, silhouette, product-overlap, protected-text detectors (frozen `v13`). |
 | `v14_patch.py` | Adaptive soft-metric context, near-miss rescue, segmented micro-cover beam, cover polish, `cover_hides_watermark`. |
 | `v15_patch.py` | Full-text mask widening, ghost-aware residual, dark-stroke cover, uniform-background fill, forced-removal fill. |
-| `v16_pipeline.py` | **Auto-decision state machine** — hard-safety vs cosmetic tiers, repair → cleanup → cover → `auto_rejected`. |
-| `v13_report.py` | **CI gate** — must-be-zero hard-safety counters, candidate/auto-reject reporting, manifest. |
+| `v16_pipeline.py` | **Auto-decision state machine** — hard-safety vs cosmetic tiers, repair → cleanup → cover → `auto_rejected`; runs the V17 audit at the per-candidate chokepoint and gates the uniform fill. |
+| `v17_final_audit.py` | **③ Truthful final-output audit (V17)** — re-audits the actual published bytes, context-aware cosmetic→hard conversion, product-aware `allow_uniform_background_fill`. |
+| `v13_report.py` | **CI gate** — must-be-zero hard-safety counters, V17 published-audit counters, candidate/auto-reject reporting, manifest. |
 | `watermark-template.png` | Canonical watermark text template for edge matching / logo masks. |
-| `test_v1*_*.py` | Regression + unit locks for the detectors, gate, state machine and CI gate. |
+| `test_v1*_*.py` | Regression + unit locks for the detectors, gate, state machine, CI gate and the V17 final audit (`test_v17_patch.py`). |
 
 ## Usage
 

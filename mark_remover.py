@@ -50,6 +50,7 @@ import v13_gates
 import v14_patch
 import v15_patch
 import v16_pipeline
+import v17_final_audit
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RWM_PATH = SCRIPT_DIR / "detector.py"
@@ -4079,6 +4080,45 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     v13_verdict = v16.verdict
     is_cover = (status == ST_CLEAN_COVERED)
     publishable = status in (ST_CLEAN_REPAIRED, ST_CLEAN_COVERED)
+
+    # --- V17 — authoritative audit of the ACTUAL published bytes. ----------
+    # decide_final_status already audits every candidate, but the published
+    # output is the final word: re-run the truthful audit on v16.image and, if
+    # it still shows the watermark or damages the product, force auto_rejected.
+    # Prefer auto_rejected over a dishonest clean result. (patch plan §3.2, §14)
+    rec["v17_audit_version"] = "v17"
+    if publishable:
+        try:
+            still_pub, _pub_info = recheck_watermark_present(
+                rwm, final_image, bbox_tuple)
+        except Exception:
+            still_pub = False
+        vp_failed = False
+        vb_failed = False
+        if v13_verdict is not None:
+            vp_failed = not (v13_verdict.visible_patch_pass and
+                             v13_verdict.rectangular_band_pass and
+                             v13_verdict.polygon_patch_pass)
+            vb_failed = not v13_verdict.rectangular_band_pass
+        try:
+            final_audit = v17_final_audit.audit_final_output(
+                img, final_image, bbox_tuple, protect_combined, stroke_mask,
+                final_status=status, still_present=still_pub,
+                visible_patch_failed=vp_failed, visible_band_failed=vb_failed,
+                roi_class=pr_roi.roi_class)
+        except Exception:
+            final_audit = None
+        if final_audit is not None:
+            rec.update(final_audit.to_record())
+            if not final_audit.pass_p0:
+                # Downgrade: a published output that fails the truthful audit is
+                # demoted to auto_rejected — never shipped.
+                status = ST_AUTO_REJECTED
+                is_cover = False
+                publishable = False
+                v16.publish_ok = False
+                v16.reject_reasons = list(v16.reject_reasons) + [
+                    "v17_" + r for r in final_audit.hard_fail_reasons]
 
     rec["status"] = status
     rec["v9_final_method"] = v16.method

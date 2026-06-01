@@ -43,6 +43,34 @@ COSMETIC_COUNTERS = [
     "published_with_visible_band",
 ]
 
+# V17 — published visual-audit counters (patch plan §11.1). EVERY one of these
+# must be zero: they count published outputs whose ACTUAL bytes failed the
+# truthful final audit (residual watermark or product damage). By construction
+# they are zero (a failed audit forces auto_rejected), and CI enforces it.
+V17_MUST_BE_ZERO = [
+    "published_residual_watermark",
+    "published_dot_chain",
+    "published_product_damage",
+    "published_visible_patch_on_product",
+    "published_visible_band_on_product",
+    "published_silhouette_damage",
+    "published_protected_text_damage",
+]
+
+# V17 audit hard-fail reason -> published_* counter.
+_V17_REASON_TO_COUNTER = {
+    "published_residual_watermark": "published_residual_watermark",
+    "published_dot_chain": "published_dot_chain",
+    "visible_patch_on_product": "published_visible_patch_on_product",
+    "visible_band_on_product": "published_visible_band_on_product",
+    "changed_product_silhouette": "published_silhouette_damage",
+    "changed_protected_text": "published_protected_text_damage",
+    "changed_thin_flex_structure": "published_product_damage",
+    "changed_dark_surface_blob": "published_product_damage",
+    "changed_metallic_surface_block": "published_product_damage",
+}
+
+
 # p0_gates key -> published_with_* counter it feeds when False.
 _P0_TO_COUNTER = {
     "residual_ocr_pass": "published_with_residual_ocr",
@@ -66,6 +94,7 @@ def _iter_records(out_root: Path):
 
 def build_report(out_root: Path) -> dict:
     must_zero = Counter()
+    v17_zero = Counter()
     status_counts = Counter()
     methods = set()
     rejected_reasons = Counter()
@@ -96,6 +125,11 @@ def build_report(out_root: Path) -> dict:
                     must_zero[counter] += 1
             if rec.get("final_output_publish_failure"):
                 must_zero["final_output_publish_failures"] += 1
+            # V17 — published-output truthful-audit failures (must be zero).
+            for reason in (rec.get("v17_hard_fail_reasons") or []):
+                counter = _V17_REASON_TO_COUNTER.get(reason)
+                if counter:
+                    v17_zero[counter] += 1
         elif status == "auto_rejected":
             reasons = rec.get("reject_reasons", []) or []
             for r in reasons:
@@ -107,7 +141,9 @@ def build_report(out_root: Path) -> dict:
 
     must_zero_d = {k: int(must_zero.get(k, 0)) for k in MUST_BE_ZERO}
     cosmetic_d = {k: int(must_zero.get(k, 0)) for k in COSMETIC_COUNTERS}
-    all_clean = all(v == 0 for v in must_zero_d.values())
+    v17_zero_d = {k: int(v17_zero.get(k, 0)) for k in V17_MUST_BE_ZERO}
+    all_clean = (all(v == 0 for v in must_zero_d.values()) and
+                 all(v == 0 for v in v17_zero_d.values()))
 
     report = {
         "version": "V16_AUTO_DECISION",
@@ -127,6 +163,8 @@ def build_report(out_root: Path) -> dict:
         "unique_final_methods": len(methods),
         # Must-be-zero published-output HARD-SAFETY counters.
         "must_be_zero": must_zero_d,
+        # V17 — published truthful-audit failures (must all be zero).
+        "v17_published_audit_failures": v17_zero_d,
         # Cosmetic counters (allowed > 0): a soft seam on a mark-removed,
         # product-safe published output.
         "cosmetic": cosmetic_d,

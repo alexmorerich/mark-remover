@@ -75,6 +75,13 @@ def _img():
     return rng.randint(0, 255, (200, 320, 3), dtype=np.uint8)
 
 
+def _white_img():
+    # Pure-background canvas: under V17 a cosmetic seam here is confirmed to be
+    # on background, so it stays cosmetic (publishable) rather than reading as
+    # product damage on the random-noise canvas.
+    return np.full((200, 320, 3), 245, np.uint8)
+
+
 def _mask():
     m = np.zeros((200, 320), np.uint8)
     m[96:108, 130:210] = 255
@@ -84,8 +91,8 @@ def _mask():
 BBOX = (120, 90, 100, 28)
 
 
-def _decide(gate, recheck=_clean_recheck, **kw):
-    img = _img()
+def _decide(gate, recheck=_clean_recheck, img=None, **kw):
+    img = _img() if img is None else img
     return v16_pipeline.decide_final_status(
         img, BBOX, None, _mask(), {"metrics_valid": True, "residual_pass": True,
                                    "product_gate_pass": True},
@@ -119,7 +126,8 @@ def test_passing_cover_becomes_clean_covered():
 # 4 — candidate failures allowed; a later candidate passes
 # --------------------------------------------------------------------------
 def test_candidate_failures_allowed_when_one_passes():
-    res = _decide(GateStub([FAIL_HARD(), FAIL_HARD(), FAIL_HARD()], PASS))
+    res = _decide(GateStub([FAIL_HARD(), FAIL_HARD(), FAIL_HARD()], PASS),
+                  img=_white_img())
     assert res.status == "clean_covered"
     assert res.candidate_publish_failures >= 3
     assert res.publish_ok is True
@@ -151,7 +159,8 @@ def test_passing_repair_becomes_clean_repaired():
 # (published with cosmetic_seam flag), NOT auto_rejected and NOT mark-present.
 # --------------------------------------------------------------------------
 def test_cosmetic_seam_publishes_as_clean_covered():
-    res = _decide(GateStub([], FAIL_COSMETIC))
+    # V17: a cosmetic seam publishes only when the change is on background.
+    res = _decide(GateStub([], FAIL_COSMETIC), img=_white_img())
     assert res.status == "clean_covered"
     assert res.publish_ok is True
     assert res.cosmetic_seam is True
@@ -160,6 +169,16 @@ def test_cosmetic_seam_publishes_as_clean_covered():
     assert p0["residual_ocr_pass"] and p0["product_damage_pass"]
     assert p0["silhouette_pass"] and p0["protected_text_pass"]
     assert p0["visible_band_pass"] is False
+
+
+def test_v17_cosmetic_seam_on_product_is_auto_rejected():
+    # V17 contract: the SAME cosmetic-fail verdict that publishes on a clean
+    # background must be auto_rejected when the change lands on product pixels
+    # (the random-noise canvas reads as textured product). Never ship a seam on
+    # product. (patch plan §1.2 / §4.1)
+    res = _decide(GateStub([], FAIL_COSMETIC), img=_img())
+    assert res.status == "auto_rejected"
+    assert res.publish_ok is False
 
 
 def test_mark_still_present_is_not_published():

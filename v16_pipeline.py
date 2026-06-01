@@ -37,6 +37,7 @@ from typing import Callable, Optional
 import v13_gates
 import v14_patch
 import v15_patch
+import v17_final_audit
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +139,44 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         gates = _p0_gates_from(verdict, still)
         # The V13 visual gate's own residual_pass is folded into template_residual;
         # the detector re-check is residual_ocr. Both feed the hard tier.
-        return _is_strict(gates) and verdict.publish_ok, _is_safe(gates), \
-            verdict, gates, still
+        strict_ok = _is_strict(gates) and verdict.publish_ok
+        safe_ok = _is_safe(gates)
+        # V17 — audit the ACTUAL candidate bytes. A cosmetic seam (visible patch /
+        # band) that lands ON PRODUCT is product damage, not cosmetic, and a
+        # destructive fill can break product structure without tripping the shape
+        # gates. The audit converts those to hard failures so a damaging candidate
+        # can never reach the safe-tier publish path. (patch plan §3, §4)
+        try:
+            audit = v17_final_audit.audit_final_output(
+                img, image, bbox, product_mask, watermark_mask,
+                final_status=("clean_repaired" if repaired else "clean_covered"),
+                still_present=still,
+                visible_patch_failed=not (verdict.visible_patch_pass and
+                                          verdict.rectangular_band_pass and
+                                          verdict.polygon_patch_pass),
+                visible_band_failed=not verdict.rectangular_band_pass,
+                roi_class=roi_class)
+        except Exception:
+            audit = None
+        if audit is not None:
+            verdict.v17_audit = audit
+            if not audit.pass_p0:
+                strict_ok = False
+                safe_ok = False
+                for r in audit.hard_fail_reasons:
+                    gates["v17_" + r] = False
+        return strict_ok, safe_ok, verdict, gates, still
 
+    # V17 — uniform_background_fill is allowed ONLY on a strict pure-background
+    # case: no product overlap, no interior edges/lines, no protected text, a
+    # uniform surrounding ring, and the box not touching the product silhouette.
+    # On thin flex, dark/metallic surfaces or printed labels it paints a
+    # product-damaging band, so it is vetoed here and the box is routed to
+    # segmented / stroke-only repair (or auto-reject). (patch plan §1.3, §5)
     uniform = None
-    if v15_patch.is_uniform_local_background(img, bbox, product_mask):
+    ring_uniform = v15_patch.is_uniform_local_background(img, bbox, product_mask)
+    if ring_uniform and v17_final_audit.allow_uniform_background_fill(
+            img, bbox, product_mask, watermark_mask, ring_uniform=ring_uniform):
         try:
             uniform = v15_patch.uniform_background_fill(img, bbox, watermark_mask)
         except Exception:
