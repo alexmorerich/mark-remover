@@ -5,16 +5,21 @@ watermark from B2B product photos **without leaving residue and without damaging
 the product**. It is an automated, fully self-deciding system: every image ends
 in exactly one terminal state — `clean_repaired`, `clean_covered`,
 `no_watermark_confirmed`, or `auto_rejected` — and **no output that still shows
-the mark or damages the product is ever published.** When the watermark cannot
-be removed safely, the image is rejected rather than shipped dirty. There is no
+the mark or damages the product is ever published.** When the watermark cannot be
+removed safely, the image is rejected rather than shipped dirty. There is no
 manual-review state.
 
 > **Prime directive:** safety beats clean rate. The pipeline will reject a
 > cleanable-looking image before it will publish a residual watermark, a visible
-> patch on product, or a damaged product surface.
+> patch on product, a ghost-dot residue on product, or a damaged product surface.
+> Clean rate may only rise by adding *safer* candidates — never by accepting a
+> worse output.
 
-Current release: **V19** — adds a deterministic reverse-alpha recovery engine and
-a stricter cover-on-product audit on top of the frozen V13/V16/V17 safety gates.
+Current release: **V20** — a deterministic reverse-alpha *variant beam*, a
+ghost-dot residue detector, a mixed product/background segmented repair, thin-flex
+continuity protection, a stricter (product-side) cover audit, a conservative
+union product mask, and a hard split between published and rejected artifacts —
+all on top of the frozen V13/V16/V17 safety gates.
 
 ---
 
@@ -22,81 +27,90 @@ a stricter cover-on-product audit on top of the frozen V13/V16/V17 safety gates.
 
 ```bash
 # Clean N random watermarked images and write a side-by-side comparison PDF.
-python3 mark_remover.py --assets bench_assets --n 50 --seed 2026 --out output
+python3 mark_remover.py --assets bench_assets --n 50 --seed 2026 --out output_v20
 
 # Aggregate the per-image qa.json records into a CI honesty report.
-python3 v13_report.py output          # exits non-zero if any safety gate broke
+python3 v13_report.py output_v20      # exits non-zero if any safety gate broke
+                                      # or if auto_rejected leaked a cleaned.jpg
 
 # (Re)solve the reverse-alpha asset from real watermarked images.
 python3 scripts/sunsky_alpha_solve.py --mode B --assets bench_assets --max 50
 
 # Run the test suite.
-python3 -m pytest tests/ -q
+python3 -m pytest -q
 ```
 
-Outputs land under `output/<status>/<product_id>/` with `original.jpg`,
-`cleaned.jpg`, and a full `qa.json` manifest. A `compare.pdf`, `compare.html`,
-`summary.jsonl` and `run_report.json` are written at the root.
+Published outputs land under `output_v20/<status>/<product_id>/` with
+`original.jpg`, **`cleaned.jpg`** (published states only) and a full `qa.json`
+manifest. An `auto_rejected/<product_id>/` folder instead holds
+**`best_attempt.jpg` + `reject_reason.txt`** (never `cleaned.jpg`), plus a
+`debug/` folder of residual replay heatmaps. A `compare.pdf`, `compare.html`,
+`summary.jsonl`, `run_report.json` and `v20_reasons.csv` are written at the root.
 
 **Dependencies:** Python 3, OpenCV (`cv2`), NumPy, Pillow. `onnxruntime` is
-*optional* — it enables the PP-OCRv3 text detector and the LaMA-ONNX backend;
-without it the pipeline uses robust heuristic fallbacks and runs unchanged.
+*optional* — it enables the PP-OCRv3 product-text detector and the LaMA-ONNX
+backend; without it the pipeline uses robust heuristic fallbacks and runs
+unchanged.
 
 ---
 
 ## 1. How the watermark position is identified
 
 The Sunsky watermark is a **fixed, faint, semi-transparent `sunsky-online.com`
-text line**, almost always rendered in the **horizontal centre band** of the
-image. Detection produces a `mark_box` = `{x, y, w, h}` (top-left + size) and
-proceeds in layers, cheap-to-expensive, so easy cases exit early.
+text line**, almost always in the **horizontal centre band** of the image.
+Detection produces a `mark_box = {x, y, w, h}` and proceeds in layers,
+cheap-to-expensive, so easy cases exit early.
 
 ### 1.1 Multi-scale template correlation
 `detector.py` correlates a synthesized `sunsky-online.com` glyph template
 (`watermark-template.png`) — plus optional real-crop templates — against the
-grayscale image at several scales using `cv2.matchTemplate` with
-`TM_CCOEFF_NORMED`. Large images are downscaled for the scan and the coordinates
-are scaled back. Non-maximum suppression (`IoU 0.3`) collapses overlapping hits,
-and an optional full-resolution verification pass re-scores the survivors.
+grayscale image at several scales using `cv2.matchTemplate` /
+`TM_CCOEFF_NORMED`. Large images are downscaled for the scan and coordinates are
+scaled back. Non-maximum suppression (`IoU 0.3`) collapses overlapping hits, and
+an optional full-resolution pass re-scores the survivors.
 
 ### 1.2 Position refinement
-Each surviving detection is passed to `refine_watermark_position`, which snaps
-the box onto the **full text line** — including the trailing `.com` glyphs and
-the low-contrast halo — and returns the canonical `mark_box`. Candidates are then
-ranked by a combined score that rewards:
-- a correlation peak consistent with a faint, low-contrast text strip,
-- an **aspect ratio in the `sunsky-online.com` range (~5.5–8.5 width/height)**,
-- a position inside the central band.
+Each surviving detection is passed to `refine_watermark_position`, which snaps the
+box onto the **full text line** — including the trailing `.com` glyphs and the
+low-contrast halo — and returns the canonical `mark_box`. Candidates are ranked by
+a score rewarding a faint low-contrast correlation peak, an **aspect ratio in the
+`sunsky-online.com` range (~5.5–8.5 w/h)**, and a central-band position. Because
+the overlay is semi-transparent, its polarity flips with the background (darker
+than white paper, lighter than dark stock); the detector is built around this
+faint, polarity-ambiguous signal, not a hard edge.
 
-Because the watermark is semi-transparent, its polarity flips with the
-background (darker than white paper, lighter than dark stock); the detector is
-built around this faint, polarity-ambiguous signal rather than a hard edge.
-
-### 1.3 Presence gate (avoid touching clean images)
-Before any cleaning, a fast **presence gate** classifies each image as
-`CONFIRMED_WATERMARK` / `UNCERTAIN` / `NO_WATERMARK` using a thumbnail-scale
-template + stroke + CLAHE-contrast check, escalating to a deeper OCR + template
-pass only when uncertain. Two model rules protect known-clean stock:
+### 1.3 Presence gate (never touch a clean image)
+A fast presence gate classifies each image `CONFIRMED_WATERMARK` / `UNCERTAIN` /
+`NO_WATERMARK` from a thumbnail-scale template + stroke + CLAHE-contrast check,
+escalating to a deeper OCR + template pass only when uncertain. Two model rules
+protect known-clean stock:
 - **iPhone 14 and newer** product photos carry no Sunsky watermark and are
   excluded from cleaning entirely.
 - Images with no confirmed detection are passed through untouched
-  (`no_watermark_confirmed`) — a clean image is never modified.
+  (`no_watermark_confirmed`).
 
-### 1.4 Reverse-alpha NCC alignment (V19)
-For the recovery engine, fixed geometry alone is not trusted. `sunsky_reverse_alpha`
-generates **two placements** of the solved glyph-alpha asset over the detected
-band — a *fixed* one (asset resized to `mark_box`) and an *NCC-aligned* one that
-searches scale `0.88–1.12` and a small x/y window for the placement whose glyph
-shape best correlates with the high-pass structure in the band — and keeps the
-placement that leaves the **lower residual** (mirrors the Doubao/Jimeng
-visible-watermark engines).
+### 1.4 Reverse-alpha NCC alignment
+For the recovery engine, fixed geometry alone is not trusted.
+`sunsky_reverse_alpha` builds **two placements** of the solved glyph-alpha asset
+over the band — a *fixed* one (asset resized to `mark_box`) and an *NCC-aligned*
+one that searches scale `0.88–1.12` and a small x/y window for the placement whose
+glyph shape best correlates with the high-pass structure in the band — and keeps
+whichever leaves the **lower residual**.
 
 ### 1.5 ROI classification
-The box interior is classified (`extract_roi_features` → `classify_roi`) into an
-ROI class — `plain_white`, `near_white`, `low_texture_background`,
-`thin_flex_cable`, `dark_product_surface`, `metallic_or_reflective`,
-`glass_or_gradient`, `simple_product_surface`, … — which routes the choice of
-cleaning strategy and the audit thresholds used downstream.
+The box interior is classified (`plain_white`, `near_white`,
+`low_texture_background`, `thin_flex_cable`, `dark_product_surface`,
+`metallic_or_reflective`, `glass_or_gradient`, `simple_product_surface`, …),
+which routes the cleaning strategy and the audit thresholds used downstream.
+
+### 1.6 Conservative union product mask (V20)
+Before any repair, `v18_patch.build_product_mask_safe` unions **every** product-
+like signal inside the box — non-white, dark, **saturated/colored**, edge-density,
+metallic-gradient, glass boundary, long-line/flex, protected text, dilated
+silhouette — and **excludes the watermark's own strokes**. This is the signal that
+prevents a destructive fill (or a ghost-residue mis-classification) from treating a
+**smooth red or silver product surface** as background — a gap that a sparse
+edge/dark product mask alone would miss.
 
 ---
 
@@ -105,17 +119,32 @@ cleaning strategy and the audit thresholds used downstream.
 Cleaning is a **candidate-bank state machine** (`v16_pipeline.decide_final_status`).
 Many candidate images are generated, each is run through the **same P0 safety
 gate**, and the *first* candidate that passes strictly is published. Strategies
-are ordered safest / most-faithful first. Crucially, **destructive generators are
-banned on any product overlap or silhouette contact** (`v18_patch.should_ban_destructive`),
-so the beam is never wasted on fills that could only be rejected.
+are ordered safest / most-faithful first. **Destructive generators are banned on
+any product overlap, silhouette contact, protected text, or union-product-mask
+coverage** (`v18_patch.should_ban_destructive`), so the beam is never wasted on
+fills that could only be rejected.
 
 A **`ProductContext`** is computed once per image (product overlap, silhouette
 contact, interior edge density, long-line/flex score, protected-text score,
-dark-surface ratio, metallic-gradient score, pure-background score) and gates
-which generators are allowed.
+dark-surface ratio, metallic-gradient score, pure-background score, and the V20
+union product-mask overlap) and gates which generators are allowed.
 
-### 2.1 Reverse-alpha recovery — **first, non-destructive** (V19)
-The watermark is an alpha blend: `watermarked = α·logo + (1−α)·original`. Given a
+Candidate priority order (`v16_pipeline`, patch plan §Patch 9):
+
+```
+1. reverse-alpha variant beam        (non-destructive, leads the beam)
+2. thin-flex reverse-alpha line-preserve
+3. segmented reverse-alpha + background clone   (mixed product/background)
+4. stroke-only inpaint
+5. metallic / dark / colored stroke-only specialized repair
+6. background clone-offset fill        ┐
+7. uniform background fill             │ background-only, banned on any product
+8. cover                              ┘
+9. auto_rejected                       (safety could not be met)
+```
+
+### 2.1 Reverse-alpha recovery — first, non-destructive
+The watermark is an alpha blend `watermarked = α·logo + (1−α)·original`. Given the
 solved per-pixel `α` map and the fixed `logo` colour, the real pixel is
 **recovered** by inverting the blend:
 
@@ -124,157 +153,200 @@ original = (watermarked − α·logo) / (1 − α)
 ```
 
 This does **not** paint, clone, or hallucinate — it *subtracts the overlay and
-keeps the product pixels underneath*. That is why it is allowed to run even over
-product detail, **product text**, flex cables, dark surfaces and metallic
-gradients, where covers and inpainting are banned.
+keeps the product pixels underneath*. That is why it may run even over product
+detail, **product text**, flex cables, dark surfaces and metallic gradients, where
+covers and inpainting are banned.
 
 - **Alpha asset** (`assets/sunsky_alpha.png` + `sunsky_alpha_meta.json`) is solved
-  reproducibly by `scripts/sunsky_alpha_solve.py`:
-  - *Mode A* — controlled captures over black/gray/white fields, `α = (I−B)/(L−B)`.
-  - *Mode B (default)* — empirical catalog solve from real white-background
-    watermark crops: estimate the clean background `B`, invert the blend with a
-    light-gray logo prior, align every crop to a canonical glyph grid,
-    median-combine, keep the full halo down to `α ≥ 0.02`, drop specks, and solve
-    the overlay colour `L` from the high-alpha pixels.
+  reproducibly by `scripts/sunsky_alpha_solve.py` (Mode A controlled captures /
+  Mode B empirical catalog solve, default).
 - **Safe inversion** clamps `α ∈ [0, 0.85]`, floors `(1−α) ≥ 0.25`, and **only
   rewrites pixels inside the alpha mask** — everything else is byte-identical.
-- **Thin residual cleanup** runs over *only* the dilated glyph footprint
-  (`INPAINT_NS`), never a full bbox, and **skips protected product-text pixels**.
-  On a *provably pure-background* box (zero product overlap, confirmed by
-  product mask + changed-region check) the cleanup may widen slightly and use a
-  texture-preserving `INPAINT_TELEA` to fully clear the footprint — safe because
-  there is no product to damage.
 
-### 2.2 Product-aware specialized repair (V18)
-When reverse-alpha is not selected, ROI-appropriate **real-pixel** repairs are
-tried, each of which restricts the change to the watermark strokes and self-rejects
-on any sign of damage:
-- `thin_flex_line_preserving` — line-friendly stroke inpaint that rejects if the
-  cable's straight-line continuity drops.
-- `dark_surface_stroke_clone` — clones strokes from local dark ring pixels;
-  rejects a bright blob on dark stock.
-- `metallic_gradient_plane` — fits a local gradient plane and paints it over the
-  strokes only; rejects a flat rectangular block.
-- `colored_surface_hue_matched` — hue/saturation-matched local fill (no gray/white).
-- `segmented_product_background_repair` — splits the ROI into background and
-  product fragments and repairs each with the right tool, never one global fill.
-- `stroke_only_inpaint` — the universal conservative stroke-only fallback.
+### 2.2 Reverse-alpha variant beam (V20)
+Rather than a single recovery, V20 generates a small **deterministic beam** of
+recovery variants and screens each with the same local pre-screen, publishing the
+first that clears the authoritative P0 audit (`sunsky_reverse_alpha.build_variant_beam`):
 
-### 2.3 Background fills — **destructive, background-only**
-On a strict pure-background box (no product overlap, uniform surrounding ring,
-no interior structure, no protected text, not touching the silhouette) a
-`uniform_background_fill` / `forced_removal` is permitted. These are **vetoed on
-any product signal** (`v17_final_audit.allow_uniform_background_fill`).
+- `v20_reverse_alpha_fixed` / `v20_reverse_alpha_ncc` — fixed and aligned placement.
+- `v20_reverse_alpha_ncc_local_gain` — fits a scalar `α`-gain in `[0.75, 1.25]`
+  minimising high-pass residual in the glyph footprint.
+- `v20_reverse_alpha_per_channel_logo` — solves a per-channel logo-colour nudge
+  (`±12`) from high-confidence alpha pixels, excluding protected text, so the
+  recovered footprint matches the surrounding surface instead of assuming one
+  global gray.
+- `v20_reverse_alpha_core_halo_split` — inverts the glyph **core** (`α ≥ 0.12`)
+  aggressively but **softens the halo** (`0.02 ≤ α < 0.12`) toward a locally
+  blurred surface; most visible ghosts come from the core/halo boundary.
+- `v20_reverse_alpha_low_alpha_halo_cleanup` / `..._no_cleanup` — halo cleanup
+  variants over **only** the dilated footprint.
 
-### 2.4 Cover beam — last resort, audited as product damage
-If no repair passes, a segmented micro-cover beam is tried. A visible cover that
-lands **on product pixels** is treated as a **hard failure** (see §3.4), not a
-cosmetic seam. A cover is only valid on pure background or when it is
-shape-conformal and visually matched.
+The beam is fully reproducible (no randomness) and **ranked safest/cleanest first**
+by `(residual, ghost-dot score, changed-product fraction)`. A variant that leaves
+an aligned ghost-dot chain **on product** is filtered out at the pre-screen, so the
+cleanest recovery wins.
+
+### 2.3 Product-aware specialized & mixed repair
+When a single reverse-alpha pass is not enough:
+- **`thin_flex_reverse_alpha_line_preserve` (V20)** — reverse-alpha on a flex
+  cable, then verify cable-line continuity (see §3.5) and reject if it drops.
+- **`segmented_reverse_alpha_background_clone` (V20)** — when the watermark crosses
+  **both** product and background, split the footprint: reverse-alpha on the
+  product pixels, a **clone-offset fill** that copies *real* clean pixels from a
+  band above/below into the pure-background pixels, blended only along the
+  footprint. Rejects a clone that lands on product or creates a rectangular
+  boundary.
+- `dark_surface_stroke_clone`, `metallic_gradient_plane`,
+  `colored_surface_hue_matched`, `segmented_product_background`,
+  `stroke_only_inpaint` — ROI-appropriate real-pixel repairs, each restricted to
+  the watermark strokes and self-rejecting on any sign of damage.
+
+### 2.4 Background fills & cover — destructive, background-only
+On a strict pure-background box (no product overlap, uniform ring, no interior
+structure, no protected text, not touching the silhouette) a
+`uniform_background_fill` / `forced_removal` / cover is permitted. These are
+**vetoed on any product signal**. A visible cover that lands on product is a
+**hard failure** (see §3.4), not a cosmetic seam — `clean_covered` is a rare
+*background-only* terminal state.
 
 ### 2.5 Optional LaMA-ONNX backend
 When `onnxruntime` + a model are present, a CPU LaMA crop/paste candidate is
-offered for hard stroke-only cases (stroke mask, low product overlap, zero
-protected-text overlap). It crops around the mask, inpaints, and pastes back
-**only the masked pixels**. It is a candidate generator, never a publish
-shortcut, and is a no-op when the model is absent.
+offered for hard stroke-only cases. It pastes back **only the masked pixels**, is
+a candidate (never a publish shortcut), and is a no-op when the model is absent.
 
 ### What is deliberately *not* used
 Global invisible-watermark diffusion / SynthID removal / face protection /
-metadata stripping are **excluded** from the publish path. Diffusion can
-hallucinate product geometry, soften labels and change SKU-critical detail; for a
-visible B2B product watermark that is unacceptable.
+metadata stripping are **excluded** from the publish path: diffusion can
+hallucinate geometry, soften labels and change SKU-critical detail.
 
 ---
 
 ## 3. Cleaning-quality review: methods & criteria
 
-Every candidate and every **final published byte stream** is audited. The audit
-is *truthful*: it runs on the actual output, not on an intermediate candidate,
-and a failure forces `auto_rejected`. The gate is the **same strictness for
-repaired and covered** outputs.
+Every candidate and every **final published byte stream** is audited. The audit is
+*truthful*: it runs on the actual output, not on an intermediate candidate, and a
+failure forces `auto_rejected`. The gate is the **same strictness for repaired and
+covered** outputs.
 
 ### 3.1 Two tiers of gate
-- **Hard-safety gates (must pass to publish):** the watermark must be verifiably
-  **gone** and the product **undamaged**.
-  - `residual_ocr_pass` — a fresh post-clean re-detection of the watermark on the
-    output (the authoritative residual signal; template correlation alone
-    false-passes on bright metal).
-  - `template_residual_pass`, `dot_chain_pass` — no template / dot-chain residue.
-  - `product_damage_pass`, `silhouette_pass`, `protected_text_pass` — no product
-    damage, no broken silhouette, no erased product text.
-- **Cosmetic gates (tracked, not blocking on a clean+safe output):**
+- **Hard-safety gates (must pass to publish):** watermark verifiably **gone** and
+  product **undamaged** — `residual_ocr_pass` (a fresh post-clean re-detection, the
+  authoritative residual signal), `template_residual_pass`, `dot_chain_pass`,
+  `product_damage_pass`, `silhouette_pass`, `protected_text_pass`.
+- **Cosmetic gates (tracked, non-blocking on a clean+safe output):**
   `visible_patch_pass`, `visible_band_pass`. A faint seam **on background** is
   acceptable; the same seam **on product** is promoted to a hard failure.
 
-### 3.2 Truthful final audit (V17)
-`v17_final_audit.audit_final_output` re-checks the published bytes for:
-- residual watermark / readable dot-chain / **low-contrast glyph residue**
-  (faint dot-dash chains aligned on the original baseline, too faint for OCR but
-  visible to a human),
-- **where the change landed** — the fraction of *changed* pixels that fall on
-  product and the edge density of the original inside that footprint, which
-  decides whether a seam is "on background" (safe) or "on product" (damage),
-- structural damage probes: broken thin-flex continuity, new bright/dark blob on
-  dark stock, flattened metallic gradient, erased protected text, broken
-  silhouette.
+### 3.2 Truthful final audit
+`v17_final_audit.audit_final_output` re-checks the published bytes for residual
+watermark / readable dot-chain / low-contrast glyph residue, **where the change
+landed** (the fraction of changed pixels on product), and structural-damage probes
+(broken thin-flex continuity, new bright/dark blob on dark stock, flattened
+metallic gradient, erased protected text, broken silhouette).
 
-### 3.3 Reverse-alpha local safety pre-screen (V19)
-Before a reverse-alpha candidate even reaches the gate, it must clear cheap local
-checks: residual confidence must **drop** versus the untouched band, it must not
-change essentially all product pixels, and it must not introduce a dark-surface
-blob. The authoritative gate above still has the final say.
+### 3.3 Reverse-alpha ghost-dot detector (V20)
+`detect_reverse_alpha_ghost_dots` catches the failure mode where reverse-alpha
+removes the glyph but leaves faint **paired dots / pits** aligned on the original
+baseline — too low-contrast for OCR, visible to a human on smooth colored / metallic
+surfaces. It finds small low-contrast components in the footprint, scores baseline
+alignment + paired spacing, and decides whether they sit **on product** using a
+self-contained colored/dark surface estimate (so a sparse product mask cannot hide
+a chain on a flat red or silver back-cover). On product → **hard fail**
+(`published_low_contrast_glyph_residue`); on pure background it is routed to one
+more micro-cleanup candidate before rejection. The same detector runs inside the
+variant-beam pre-screen, so a ghosting variant never becomes the published one.
 
-### 3.4 Stricter cover-on-product audit (V19)
-For `clean_covered` outputs whose change lands on product
-(`product_overlap > 0.03`), `detect_cover_shape_artifact_v19` hard-fails any
-visible artificial-cover shape: a **rectangular slab**, a **wedge/notch**, a
-**pale band**, a **dark blob on dark stock**, a **straight artificial boundary**,
-or a cover that **crosses the product silhouette**. A clean_covered result is
-valid only when the cover sits on pure background or is shape-conformal and
-visually matched.
+### 3.4 Stricter product-side cover audit (V20)
+For `clean_covered` outputs, `detect_cover_shape_artifact_v20` hard-fails whenever
+**more than 1%** of the changed pixels land on product **and** the cover is visible
+as a shape (rectangular slab / wedge), a straight artificial boundary, a local tone
+mismatch, a dark blob on dark stock, or it crosses the product silhouette. The
+`cover_artifact_v20` record (changed-on-product fraction, rectangularity, straight-
+boundary score, local color delta, silhouette crossing) is attached to every
+covered output for audit. A cover is valid only on pure background or as a stroke-
+shaped, tone-matched change.
 
-### 3.5 Pass / fail criteria (CI must-be-zero)
-`v13_report.py` aggregates every `qa.json` and **exits non-zero** if any of these
-published-output counters is greater than zero:
+### 3.5 Thin-flex continuity (V20)
+`detect_thin_flex_continuity_v20` traces the longest dark cable line before/after a
+repair; if its length drops beyond a small tolerance or its endpoints shift, the
+cable was cut or notched and the output hard-fails. Recorded as `thin_flex_v20`.
+
+### 3.6 Residual explainability (V20)
+Every output carries a `residual_explain` record separating *true residual
+watermark* (OCR / dot-chain / glyph positive) from a *repair artifact* from a
+*detector false-positive on product structure* (template-only positive). The run
+writes per-candidate residual replay heatmaps to `debug/`
+(`original_residual_heatmap.png`, `candidate_residual_heatmap.png`,
+`residual_delta_heatmap.png`, `changed_mask.png`, `product_mask.png`,
+`alpha_footprint.png`) so a reviewer can see exactly *what* the residual detector
+responded to. This makes rejections explainable **without loosening the detector**.
+
+### 3.7 Published vs rejected artifacts are physically separated (V20)
+Only `clean_repaired` / `clean_covered` / `no_watermark_confirmed` folders may
+contain `cleaned.jpg`. An `auto_rejected` folder holds `best_attempt.jpg` +
+`reject_reason.txt` and is labelled **“BEST ATTEMPT — NOT PUBLISHED”** in
+`compare.pdf` / `compare.html`. `v13_report.py` **fails CI** if any
+`auto_rejected/**/cleaned.jpg` exists, so a rejected attempt can never be mistaken
+for a delivered asset.
+
+### 3.8 Pass / fail criteria (CI must-be-zero)
+`v13_report.py` aggregates every `qa.json` and **exits non-zero** if any published-
+output counter is greater than zero:
 
 ```
 published_residual_watermark            = 0
 published_dot_chain                     = 0
-published_low_contrast_glyph_residue    = 0
+published_low_contrast_glyph_residue    = 0      # ghost dots on product
 published_product_damage                = 0
 published_visible_patch_on_product      = 0
 published_visible_band_on_product       = 0
 published_silhouette_damage             = 0
 published_protected_text_damage         = 0
 final_output_publish_failures           = 0
+auto_rejected_cleaned_jpg_leak          = 0
 ```
 
-The report also emits V19 diagnostics: `reverse_alpha` (attempted / passed /
-published / failure breakdown), `cover_artifacts_v19`, and `text_protection`.
+The report also emits a `v20` block (variant beam attempted/passed, ghost-dot
+failures, cover-on-product hard fails, segmented mixed repairs published, detector
+false-positive suspects, and the auto-rejected reason breakdown:
+true-residual / product-damage / cover-artifact / uncertain) plus a per-image
+`v20_reasons.csv`.
 
-### 3.6 Human eyeball
-The run writes a side-by-side `compare.pdf` / `compare.html` so a human can
-confirm, per image, that the mark is gone and the product is intact — the final
-acceptance check before delivery.
+### 3.9 Human eyeball
+The run writes a side-by-side `compare.pdf` / `compare.html` so a human can confirm,
+per image, that the mark is gone and the product is intact — the final acceptance
+check before delivery.
 
 ---
 
 ## 4. Benchmark (50 images, seed 2026)
 
-| Metric                  | V18 | **V19** |
-|-------------------------|----:|--------:|
-| clean_repaired          | 26  | **28**  |
-| clean_covered           | 4   | **6**   |
-| auto_rejected           | 20  | **16**  |
-| hard-safety failures    | 0   | **0**   |
-| cover-artifacts on product | — | **0**   |
-| reverse-alpha published | —   | **16** (12 over product text) |
+| Metric                       | V18 | V19 | **V20** |
+|------------------------------|----:|----:|--------:|
+| clean_repaired               | 26  | 28  | **28**  |
+| clean_covered                | 4   | 6   | **4**   |
+| auto_rejected                | 20  | 16  | **18**  |
+| hard-safety failures         | 0   | 0   | **0**   |
+| cover artifacts published on product | — | 0 | **0** |
+| ghost-dot residue published on product | — | — | **0** |
+| auto_rejected cleaned.jpg leak | — | — | **0** |
 
-All published outputs pass the truthful V17/V19 final audit. The remaining
-rejects are honest: the frozen residual detector still saw the mark, so they were
-**not** published. Clean rate improved only by adding a *safer* recovery
-candidate — never by accepting a worse output.
+V20 is **strictly safer** than V19 on the published set: the two product-side
+covers V19 published are now correctly hard-failed to `auto_rejected`
+(`clean_covered` 6→4), and the variant-beam pre-screen replaces a recovery that
+left readable text on a colored surface with a cleaner one. Every published output
+passes the truthful final audit; the remaining rejects are honest (the watermark
+could not be removed without damaging the product, or a safe candidate did not
+exist).
+
+**Known limitation (honest):** on heavily *textured* product surfaces (e.g. kraft
+cardboard) and some bright-metallic surfaces, a reverse-alpha recovery can leave a
+**noise-floor faint** trace that no cheap detector separates reliably from natural
+texture without false-rejecting genuinely clean images. These traces are far fainter
+than a readable watermark and are surfaced in the `compare.pdf` for human review;
+the clearly-readable cases are caught. Per the prime directive, the pipeline never
+publishes product damage or a clearly-readable mark, and prefers an honest rejection
+to a worse output.
 
 ---
 
@@ -282,23 +354,24 @@ candidate — never by accepting a worse output.
 
 | Layer | File | Role |
 |-------|------|------|
-| Orchestrator | `mark_remover.py` | CLI, scan, presence gate, per-image flow, qa.json, PDF/HTML |
+| Orchestrator | `mark_remover.py` | CLI, scan, presence gate, per-image flow, qa.json, residual heatmaps, PDF/HTML, published/rejected split |
 | Detector | `detector.py` | multi-scale template detection + `mark_box` refinement |
-| Known-mark registry | `sunsky_registry.py` | binds detect + recovery for `sunsky_online` (V19) |
-| Reverse-alpha engine | `sunsky_reverse_alpha.py` | alpha inversion, placement, thin cleanup (V19) |
-| Alpha solver | `scripts/sunsky_alpha_solve.py` | reproducible alpha asset (Mode A/B) (V19) |
-| Product-text protection | `product_text_detector.py` | PP-OCRv3 ONNX + heuristic fallback (V19) |
-| Optional inpaint backend | `lama_onnx_backend.py` | CPU LaMA crop/paste candidate (V19) |
+| Known-mark registry | `sunsky_registry.py` | binds detect + recovery for `sunsky_online` |
+| Reverse-alpha engine | `sunsky_reverse_alpha.py` | alpha inversion, placement, **variant beam**, thin cleanup |
+| Alpha solver | `scripts/sunsky_alpha_solve.py` | reproducible alpha asset (Mode A/B) |
+| Product-text protection | `product_text_detector.py` | PP-OCRv3 ONNX + heuristic fallback |
+| Optional inpaint backend | `lama_onnx_backend.py` | CPU LaMA crop/paste candidate |
 | Repair primitives | `progressive_repair.py` | stroke inpaint, clone, gradient-plane fits |
-| Safe candidates | `v18_patch.py` | `ProductContext`, product-safe + reverse-alpha candidates, ranking |
+| Safe candidates | `v18_patch.py` | `ProductContext`, **union product mask**, reverse-alpha beam + segmented/flex/specialized candidates, ranking |
 | State machine | `v16_pipeline.py` | candidate bank → P0 gate → terminal status |
-| Final audit | `v17_final_audit.py` | truthful audit of published bytes + V19 cover-shape audit |
-| Visual gates | `v13_gates.py` | frozen V13 visual + product-integrity detectors |
-| Report / CI | `v13_report.py` | aggregate qa.json, must-be-zero safety gate, V19 diagnostics |
-| Tests | `tests/`, `test_v1*_*.py` | V10–V19 unit + regression suites |
+| Final audit | `v17_final_audit.py` | truthful audit + **ghost-dot**, **cover-v20**, **thin-flex** detectors |
+| Visual gates | `v13_gates.py` | frozen V13 visual + product-integrity + thin-flex continuity detectors |
+| Report / CI | `v13_report.py` | aggregate qa.json, must-be-zero gate, `v20` diagnostics, `v20_reasons.csv`, rejected-leak check |
+| Tests | `tests/`, `test_v1*_*.py` | V10–V20 unit + regression suites |
 
-### V19 design principle
-> Improve the clean rate by adding a **safer recovery candidate**, not by
-> accepting worse outputs. Order: **reverse-alpha → stroke-only → segmented →
-> cover only on pure background → auto_rejected when safety is uncertain.** Never
-> trade product fidelity for a higher clean rate.
+### V20 design principle
+> Improve the clean rate by adding **safer recovery candidates and stricter
+> audits**, never by accepting worse outputs. Order: **reverse-alpha variant beam
+> → line-preserving / segmented reverse-alpha → stroke-only → cover only on pure
+> background → auto_rejected when safety is uncertain.** Never trade product
+> fidelity for a higher clean rate; do not loosen the frozen V13/V17 gates.

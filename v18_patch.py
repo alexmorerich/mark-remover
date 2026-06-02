@@ -93,6 +93,11 @@ class ProductContext:
     flex_line_score: float = 0.0
     pure_background_score: float = 0.0
     roi_class: str = ""
+    # V20 — conservative union safety overlap (patch plan §Patch 8). Fraction of
+    # the bbox covered by the union product-safe mask (non-white / edges / dark /
+    # colored / metallic / glass / flex / text / dilated silhouette). Destructive
+    # generators are banned whenever ANY of these signals are present.
+    product_mask_safe_overlap: float = 0.0
 
     def to_record(self) -> dict:
         return {
@@ -105,6 +110,7 @@ class ProductContext:
             "v18_metallic_gradient_score": round(self.metallic_gradient_score, 4),
             "v18_flex_line_score": round(self.flex_line_score, 4),
             "v18_pure_background_score": round(self.pure_background_score, 4),
+            "v20_product_mask_safe_overlap": round(self.product_mask_safe_overlap, 4),
             "v18_roi_class": self.roi_class,
         }
 
@@ -128,6 +134,65 @@ def _metallic_gradient_score(image, bbox) -> float:
     smooth = max(gx, gy)
     return float(np.clip(span / 160.0, 0.0, 1.0)) * \
         float(np.clip(1.0 - smooth / 24.0, 0.0, 1.0))
+
+
+def build_product_mask_safe(image, bbox, product_mask=None, watermark_mask=None):
+    """V20 — conservative UNION product mask for safety decisions (patch plan
+    §Patch 8). Unions every product-like signal so a destructive fill never runs
+    over dark / colored / metallic / glass / flex / text / silhouette pixels the
+    plain product mask might miss. The watermark's own strokes are excluded so
+    the mark cannot masquerade as product. Returns a full-image uint8 (0/255)."""
+    H, W = image.shape[:2]
+    bx, by, bw, bh = bbox
+    union = np.zeros((H, W), np.uint8)
+    if bw <= 1 or bh <= 1:
+        return union
+    bx2, by2 = min(W, bx + bw), min(H, by + bh)
+    bx, by = max(0, bx), max(0, by)
+    if bx2 <= bx or by2 <= by:
+        return union
+    g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    sub = union[by:by2, bx:bx2]
+    gg = g[by:by2, bx:bx2]
+    ss = sat[by:by2, bx:bx2]
+    # non-white connected component, dark surface, colored (saturated) surface.
+    sub[gg < 235] = 255                              # non-white
+    sub[gg < 80] = 255                               # dark surface
+    sub[ss > 60] = 255                               # colored / saturated
+    # edge-density (structure) + metallic gradient + glass boundary all read as
+    # local edges; Canny over the box captures them.
+    edges = cv2.Canny(gg, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8))
+    sub[edges > 0] = 255
+    union[by:by2, bx:bx2] = sub
+    # existing product mask + dilated silhouette.
+    if product_mask is not None and product_mask.shape[:2] == (H, W):
+        union[(product_mask > 0)] = 255
+    # long-line / flex mask: a HoughLines pass adds straight cable lines.
+    lines = cv2.HoughLinesP(cv2.Canny(gg, 50, 150), 1, np.pi / 180,
+                            threshold=max(10, bw // 6),
+                            minLineLength=max(10, bw // 3), maxLineGap=4)
+    if lines is not None:
+        for ln in lines:
+            x1, y1, x2, y2 = ln[0]
+            cv2.line(union, (bx + x1, by + y1), (bx + x2, by + y2), 255, 3)
+    # protected product text.
+    try:
+        if v17_final_audit._protected_text_overlap(image, bbox, watermark_mask) > 0.01:
+            og = g[by:by2, bx:bx2].astype(np.float32)
+            surface = float(np.median(og))
+            text = (np.abs(og - surface) > 45).astype(np.uint8) * 255
+            union[by:by2, bx:bx2] = cv2.bitwise_or(union[by:by2, bx:bx2], text)
+    except Exception:
+        pass
+    # Exclude the watermark's own dilated strokes (they are SUPPOSED to change).
+    if watermark_mask is not None and watermark_mask.shape[:2] == (H, W):
+        wm = cv2.dilate((watermark_mask > 0).astype(np.uint8),
+                        np.ones((3, 3), np.uint8), iterations=2)
+        union[wm > 0] = 0
+    return union
 
 
 def compute_product_context(image, bbox, product_mask=None, watermark_mask=None,
@@ -182,6 +247,16 @@ def compute_product_context(image, bbox, product_mask=None, watermark_mask=None,
     if ctx.touches_silhouette:
         bg -= 0.30
     ctx.pure_background_score = float(np.clip(bg, 0.0, 1.0))
+
+    # V20 — conservative union product-safe overlap (patch plan §Patch 8). Used
+    # to ban destructive fills on any product-like signal, not just product_mask.
+    try:
+        safe = build_product_mask_safe(image, bbox, product_mask, watermark_mask)
+        bx, by, bw, bh = bbox
+        sub = safe[by:by + bh, bx:bx + bw]
+        ctx.product_mask_safe_overlap = float((sub > 0).mean()) if sub.size else 0.0
+    except Exception:
+        ctx.product_mask_safe_overlap = ctx.product_overlap
     return ctx
 
 
@@ -203,12 +278,20 @@ def allowed_generators(ctx: ProductContext) -> set:
     return {"segmented", "stroke_only", "specialized"}
 
 
+# V20 — union safe-mask overlap above which destructive fills are banned (patch
+# plan §Patch 8). Conservative: any appreciable product-like structure vetoes a
+# destructive fill, even when the plain product_mask reads low.
+PRODUCT_MASK_SAFE_BAN = 0.12
+
+
 def should_ban_destructive(ctx: ProductContext) -> bool:
     """True when full-band / full-bbox / forced-removal fills must NOT run
-    (patch plan §1.3, §2): any meaningful product overlap or silhouette contact.
+    (patch plan §1.3, §2, §Patch 8): any meaningful product overlap, silhouette
+    contact, protected text, or union product-safe-mask coverage.
     """
     return (ctx.product_overlap > PRODUCT_OVERLAP_LOW or ctx.touches_silhouette
-            or ctx.protected_text_score > 1e-6)
+            or ctx.protected_text_score > 1e-6
+            or ctx.product_mask_safe_overlap > PRODUCT_MASK_SAFE_BAN)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +388,118 @@ def segmented_product_background_repair(image, bbox, watermark_mask,
 
 
 # ---------------------------------------------------------------------------
+# V20 — mixed product/background segmented repair (patch plan §Patch 5). When the
+# watermark crosses BOTH product and white background, a single method is unsafe:
+# background fill is safe on white but dangerous on product; stroke repair is too
+# weak for background residue. This splits the footprint and uses reverse-alpha
+# on product pixels and a clone-offset fill on pure-background pixels.
+# ---------------------------------------------------------------------------
+def _clone_offset_fill(image, bbox, target_mask, product_mask):
+    """Copy REAL pixels from a clean band above/below the watermark into the
+    background portion of the footprint (patch plan §Patch 5 background clone).
+    Returns the filled image, or ``None`` if no safe source offset exists."""
+    H, W = image.shape[:2]
+    bx, by, bw, bh = bbox
+    tgt = (target_mask > 0)
+    if int(tgt.sum()) < 4:
+        return None
+    # Candidate vertical offsets (above/below) and small horizontal shifts.
+    dys = [-3 * bh, -2 * bh, -1 * bh, bh, 2 * bh, 3 * bh]
+    dxs = [-bw // 2, 0, bw // 2]
+    best = None
+    best_cost = 1e18
+    ys, xs = np.where(tgt)
+    for dy in dys:
+        for dx in dxs:
+            sy, sx = ys + dy, xs + dx
+            ok = (sy >= 0) & (sy < H) & (sx >= 0) & (sx < W)
+            if float(ok.mean()) < 0.98:
+                continue
+            sy, sx = sy[ok], sx[ok]
+            ty, tx = ys[ok], xs[ok]
+            # Source must be pure background: not on product.
+            if product_mask is not None and product_mask.shape[:2] == (H, W):
+                if float((product_mask[sy, sx] > 0).mean()) > 0.02:
+                    continue
+            # Cost: brightness mismatch between source and the ring (prefer a
+            # tone-matched, low-variance source band).
+            src_vals = image[sy, sx].astype(np.float32)
+            cost = float(src_vals.std())
+            if cost < best_cost:
+                best_cost = cost
+                best = (sy, sx, ty, tx)
+    if best is None:
+        return None
+    sy, sx, ty, tx = best
+    out = image.copy()
+    out[ty, tx] = image[sy, sx]
+    return out
+
+
+def segmented_reverse_alpha_background_clone(image, bbox, watermark_mask,
+                                             product_mask=None):
+    """Mixed product/background repair (patch plan §Patch 5). Reverse-alpha on
+    product pixels, clone-offset fill on pure-background pixels, blended only
+    along the watermark footprint. Rejects a rectangular boundary or a clone that
+    lands on product. Returns ``None`` on any doubt (the caller skips it)."""
+    if _sra is None or not _sra.alpha_asset_available():
+        return None
+    sm = _stroke_mask(image, bbox, watermark_mask, dilate_px=1)
+    if sm is None:
+        return None
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    foot = (sm > 0)
+
+    # Product vs background split inside the footprint.
+    if product_mask is not None and product_mask.shape[:2] == (H, W):
+        prod = (product_mask > 0)
+    else:
+        g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        prod = (g < 235)
+    prod_foot = foot & prod
+    bg_foot = foot & (~prod)
+
+    # 1) reverse-alpha recovers the whole footprint (non-destructive on product).
+    ptmask = None
+    if _ptd is not None:
+        try:
+            ptmask = _ptd.detect_product_text(image, bbox, watermark_mask).mask
+        except Exception:
+            ptmask = None
+    try:
+        res = _sra.repair_sunsky_reverse_alpha(
+            image, bbox, watermark_mask=watermark_mask, product_mask=product_mask,
+            protected_text_mask=ptmask, allow_thin_cleanup=True)
+    except Exception:
+        res = None
+    out = res.image.copy() if (res is not None and res.image is not None) \
+        else image.copy()
+
+    # 2) clone-offset fill ONLY the pure-background portion of the footprint.
+    if int(bg_foot.sum()) >= 4:
+        bg_mask = np.zeros((H, W), np.uint8)
+        bg_mask[bg_foot] = 255
+        cloned = _clone_offset_fill(image, bbox, bg_mask, product_mask)
+        if cloned is not None:
+            out[bg_foot] = cloned[bg_foot]
+
+    if out.shape != image.shape:
+        return None
+    # 3) reject a rectangular artificial boundary on product.
+    try:
+        if v17_final_audit._metallic_block(image, out, bbox):
+            return None
+        patch = v13_gates.detect_visible_patch_shape_v13(image, out, bbox)
+        if float(patch.get("hard_boundary_score", 0.0)) > \
+                v13_gates.HARD_BOUNDARY_MAX and int(prod_foot.sum()) > 8:
+            return None
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 — specialized repair tools for high-reject ROI classes. Each restricts
 # the change to the watermark strokes and verifies it did not damage the product
 # surface it sits on; on any doubt it returns None (the caller skips it).
@@ -325,6 +520,39 @@ def repair_thin_flex_line_preserving(image, bbox, watermark_mask,
         return None
     after = v17_final_audit._flex_line_continuity(out, bbox)
     if before >= max(8.0, bbox[2] / 3.0) and after < before * FLEX_LINE_CONTINUITY_RATIO:
+        return None
+    return out
+
+
+def thin_flex_reverse_alpha_line_preserve(image, bbox, watermark_mask,
+                                          product_mask=None):
+    """V20 — line-preserving reverse-alpha for thin flex cables (patch plan
+    §Patch 6). Reverse-alpha is non-destructive, so it recovers the overlay
+    footprint without cutting the cable; we still verify continuity and reject if
+    the longest cable line shrinks or its endpoints shift. Returns ``None`` on
+    any doubt (the caller skips it)."""
+    if _sra is None or not _sra.alpha_asset_available():
+        return None
+    ptmask = None
+    if _ptd is not None:
+        try:
+            ptmask = _ptd.detect_product_text(image, bbox, watermark_mask).mask
+        except Exception:
+            ptmask = None
+    try:
+        res = _sra.repair_sunsky_reverse_alpha(
+            image, bbox, watermark_mask=watermark_mask, product_mask=product_mask,
+            protected_text_mask=ptmask, allow_thin_cleanup=True)
+    except Exception:
+        return None
+    if res is None or res.image is None:
+        return None
+    out = res.image
+    try:
+        cont = v13_gates.detect_thin_flex_continuity_v20(image, out, bbox)
+        if cont.get("hard_fail"):
+            return None
+    except Exception:
         return None
     return out
 
@@ -427,6 +655,10 @@ def build_safe_candidates(image, bbox, watermark_mask, product_mask,
     # ROI-specific specialized repair first (most surface-appropriate).
     if "specialized" in allowed:
         if roi in ("thin_flex_cable",) or ctx.flex_line_score > v13_gates.LONG_LINE_OVERRIDE:
+            # V20 — reverse-alpha line-preserving repair first (non-destructive).
+            _add("v20_thin_flex_reverse_alpha_line_preserve",
+                 thin_flex_reverse_alpha_line_preserve(image, bbox,
+                                                       watermark_mask, product_mask))
             _add("v18_flex_line_preserving",
                  repair_thin_flex_line_preserving(image, bbox, watermark_mask,
                                                   product_mask))
@@ -444,6 +676,13 @@ def build_safe_candidates(image, bbox, watermark_mask, product_mask,
         _add("v18_colored_hue_matched",
              repair_colored_surface_hue_matched(image, bbox, watermark_mask,
                                                 product_mask))
+
+    # V20 — mixed product/background segmented repair (reverse-alpha on product,
+    # clone-offset fill on pure background). Tried before the v14 fragment fill.
+    if "segmented" in allowed:
+        _add("v20_segmented_reverse_alpha_background_clone",
+             segmented_reverse_alpha_background_clone(
+                 image, bbox, watermark_mask, product_mask))
 
     # Segmented product/background repair (surgical, fragment-aware).
     if "segmented" in allowed:
@@ -564,6 +803,46 @@ def reverse_alpha_candidate(image, bbox, watermark_mask, product_mask,
     if res.pass_local_safety and res.image is not None:
         return "v19_sunsky_reverse_alpha", res.image, rec
     return None, None, rec
+
+
+# ---------------------------------------------------------------------------
+# V20 — reverse-alpha variant beam (patch plan §Patch 3). Returns an ordered
+# list of ``(name, image)`` reverse-alpha variants (safest/cleanest first) plus
+# an aggregate record. Each variant is a non-destructive real-pixel recovery
+# screened by the same local pre-screen; all still pass through the unchanged P0
+# audit in the pipeline. Tried BEFORE destructive generators.
+# ---------------------------------------------------------------------------
+def reverse_alpha_variant_beam(image, bbox, watermark_mask, product_mask,
+                               ctx: ProductContext):
+    """Return ``(candidates, record)`` where ``candidates`` is a list of
+    ``(name, image)`` and ``record`` carries the V20 beam telemetry."""
+    rec = {"reverse_alpha_variants_attempted": 0,
+           "reverse_alpha_variants_passed": 0,
+           "reverse_alpha_variant_names": []}
+    if _sra is None or not _sra.alpha_asset_available():
+        return [], rec
+    ptmask = None
+    over_text = False
+    if _ptd is not None:
+        try:
+            ptm = _ptd.detect_product_text(image, bbox, watermark_mask)
+            ptmask = ptm.mask
+            over_text = bool(ptm.overlap_in_box(bbox) > 0.02)
+        except Exception:
+            ptmask = None
+    try:
+        beam = _sra.build_variant_beam(
+            image, bbox, watermark_mask=watermark_mask, product_mask=product_mask,
+            protected_text_mask=ptmask, ctx=ctx, allow_thin_cleanup=True)
+    except Exception:
+        return [], rec
+    rec["reverse_alpha_variants_attempted"] = len(_sra.VARIANT_NAMES)
+    rec["reverse_alpha_variants_passed"] = len(beam)
+    rec["reverse_alpha_variant_names"] = [n for n, _ in beam]
+    rec["reverse_alpha_over_text"] = over_text
+    cands = [(name, res.image) for name, res in beam
+             if res.image is not None]
+    return cands, rec
 
 
 def lama_stroke_candidate(image, bbox, watermark_mask, product_mask,

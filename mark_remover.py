@@ -64,8 +64,8 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V19_PATCH"
-assert PIPELINE_VERSION == "V19_PATCH"
+PIPELINE_VERSION = "V20_PATCH"
+assert PIPELINE_VERSION == "V20_PATCH"
 # V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
 # auto_rejected final state + a post-clean re-detection P0 gate around it, so
 # only gate-passing outputs are ever published. V17 adds the truthful
@@ -4131,6 +4131,47 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
                 v16.reject_reasons = list(v16.reject_reasons) + [
                     "v17_" + r for r in final_audit.hard_fail_reasons]
 
+    # --- V20 — residual detector replay / explainability (patch plan §Patch 7).
+    # Make every rejection explainable: separate "true residual watermark" from
+    # "repair artifact" from "detector false positive on product structure". We
+    # do NOT loosen the detector — this only annotates WHY each output passed or
+    # failed, so detector false positives can be diagnosed without weakening
+    # product safety. ---------------------------------------------------------
+    try:
+        still_re, re_info = recheck_watermark_present(
+            rwm, final_image, bbox_tuple)
+    except Exception:
+        still_re, re_info = False, {}
+    try:
+        dc = v13_gates.detect_residual_dot_chain_v2(
+            img, final_image, bbox_tuple, stroke_mask)
+        dot_pos = (not dc.get("passed", True))
+    except Exception:
+        dot_pos = False
+    glyph_pos = bool((rec.get("v18_glyph_residue_score") or 0.0) > 0.0 or
+                     (rec.get("reverse_alpha_ghost_dots") or {}).get("hard_fail"))
+    template_pos = bool(still_re)
+    ocr_pos = bool(still_re)
+    # If the only positive signal is the template/re-detect but no stronger
+    # residual signal fires, this is likely a product-structure false positive.
+    fp_suspect = bool(template_pos and not dot_pos and not glyph_pos)
+    rec["residual_explain"] = {
+        "original_score": round(float(rec.get("reverse_alpha_residual_before",
+                                               0.0) or 0.0), 4),
+        "candidate_score": round(float(rec.get("v17_residual_score", 0.0) or 0.0),
+                                 4),
+        "score_drop": round(float((rec.get("reverse_alpha_residual_before", 0.0)
+                                    or 0.0) -
+                                   (rec.get("v17_residual_score", 0.0) or 0.0)), 4),
+        "ocr_positive": ocr_pos,
+        "template_positive": template_pos,
+        "dot_chain_positive": dot_pos,
+        "low_contrast_glyph_positive": glyph_pos,
+        "shape_matches_sunsky_baseline": bool(
+            (rec.get("reverse_alpha_residual_after", 1.0) or 1.0) > 0.3),
+        "possible_product_structure_false_positive": fp_suspect,
+    }
+
     rec["status"] = status
     rec["v9_final_method"] = v16.method
     rec["v9_method_family"] = (
@@ -4235,10 +4276,25 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         paths["original"] = _rel(out_root, base / "original.jpg")
 
+    # V20 — only published outputs may contain cleaned.jpg (patch plan §Patch 2).
+    # An auto_rejected attempt is written as best_attempt.jpg + reject_reason.txt
+    # so downstream delivery code can never mistake a rejected, possibly-damaged
+    # attempt for a final cleaned asset. CI (v13_report) fails if any
+    # auto_rejected/**/cleaned.jpg exists.
     if cleaned is not None:
-        cv2.imwrite(str(base / "cleaned.jpg"), cleaned,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        paths["cleaned"] = _rel(out_root, base / "cleaned.jpg")
+        if rec.get("status") == ST_AUTO_REJECTED:
+            cv2.imwrite(str(base / "best_attempt.jpg"), cleaned,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            paths["best_attempt"] = _rel(out_root, base / "best_attempt.jpg")
+            reasons = rec.get("reject_reasons") or ["unspecified"]
+            (base / "reject_reason.txt").write_text(
+                "NOT PUBLISHED — auto_rejected\n" + "\n".join(str(r)
+                                                              for r in reasons))
+            paths["reject_reason"] = _rel(out_root, base / "reject_reason.txt")
+        else:
+            cv2.imwrite(str(base / "cleaned.jpg"), cleaned,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            paths["cleaned"] = _rel(out_root, base / "cleaned.jpg")
 
     # V16 — auto_rejected diagnostic artifacts: keep the best repair and cover
     # attempts so a rejected image is debuggable (patch plan Fix 7). These live
@@ -4355,6 +4411,55 @@ def _write_terminal(out_root, debug_root, rec, img, masks_dict,
         cv2.imwrite(str(base / "patch_visibility_heatmap.png"), pv_heatmap)
         paths["patch_visibility_heatmap"] = _rel(
             out_root, base / "patch_visibility_heatmap.png")
+
+    # V20 — residual detector replay heatmaps (patch plan §Patch 7). Saved under
+    # debug/ so a reviewer can see WHAT the residual detector responded to:
+    # original vs candidate high-pass response, their delta, the changed mask,
+    # the product mask and the watermark alpha footprint.
+    if img is not None and cleaned is not None and rec.get("mark_box"):
+        try:
+            dbg = base / "debug"
+            dbg.mkdir(parents=True, exist_ok=True)
+            mb = rec["mark_box"]
+            bx_d, by_d, bw_d, bh_d = mb["x"], mb["y"], mb["w"], mb["h"]
+
+            def _resid_heat(im):
+                g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                blur = cv2.GaussianBlur(g, (0, 0), 2.0)
+                hp = np.abs(g - blur)
+                hp = cv2.normalize(hp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                return cv2.applyColorMap(hp, cv2.COLORMAP_JET)
+
+            oh = _resid_heat(img)
+            ch = _resid_heat(cleaned)
+            cv2.imwrite(str(dbg / "original_residual_heatmap.png"), oh)
+            cv2.imwrite(str(dbg / "candidate_residual_heatmap.png"), ch)
+            delta = cv2.absdiff(oh, ch)
+            cv2.imwrite(str(dbg / "residual_delta_heatmap.png"), delta)
+            chg = cv2.absdiff(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+                              cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY))
+            cv2.imwrite(str(dbg / "changed_mask.png"),
+                        ((chg > 6).astype(np.uint8) * 255))
+            if protect_layers is not None and isinstance(protect_layers, dict) \
+                    and protect_layers.get("combined") is not None:
+                cv2.imwrite(str(dbg / "product_mask.png"),
+                            protect_layers["combined"])
+            # Watermark alpha footprint from the solved sunsky asset.
+            try:
+                import sunsky_reverse_alpha as _sra_dbg
+                asset = _sra_dbg.load_alpha_asset()
+                if asset is not None and bw_d > 2 and bh_d > 2:
+                    foot = np.zeros(img.shape[:2], np.uint8)
+                    a = cv2.resize(asset["alpha"], (bw_d, bh_d),
+                                   interpolation=cv2.INTER_AREA)
+                    foot[by_d:by_d + bh_d, bx_d:bx_d + bw_d] = \
+                        (a * 255).astype(np.uint8)
+                    cv2.imwrite(str(dbg / "alpha_footprint.png"), foot)
+            except Exception:
+                pass
+            paths["debug_residual"] = _rel(out_root, dbg)
+        except Exception:
+            pass
 
     # V4-8: Write all candidate scores to debug JSON.
     if rec.get("attempts"):
@@ -4609,7 +4714,8 @@ def write_compare_html(out_root, records):
   <td><span class='badge {r['status']}'>{r['status']}</span><br>
       <small>{r.get('reason') or ''}</small></td>
   <td>{im('original',300)}</td>
-  <td>{im('cleaned',300)}</td>
+  <td>{im('best_attempt',300) if r['status'] == ST_AUTO_REJECTED else im('cleaned',300)}
+      {'<br><small><b>BEST ATTEMPT - NOT PUBLISHED</b></small>' if r['status'] == ST_AUTO_REJECTED else ''}</td>
   <td>{im('mask_final',150)}<br>{im('diff_heatmap',150)}<br>
       {im('patch_visibility_heatmap',150)}<br>
       <small>mask={mi.get('final_mask','?')}<br>
@@ -4920,12 +5026,19 @@ def write_compare_pdf(out_root, records) -> Path:
                    font=font_sm, fill=pi_color)
 
         box_y = 160
+        # V20 — auto_rejected shows the BEST ATTEMPT (best_attempt.jpg), clearly
+        # labelled NOT PUBLISHED so it is never mistaken for a cleaned asset.
+        if r["status"] == ST_CLEAN_REPAIRED:
+            right_key, right_label = "cleaned", "REPAIRED"
+        elif r["status"] == ST_CLEAN_COVERED:
+            right_key, right_label = "cleaned", "COVERED"
+        elif r["status"] == ST_AUTO_REJECTED:
+            right_key, right_label = "best_attempt", "BEST ATTEMPT - NOT PUBLISHED"
+        else:
+            right_key, right_label = "cleaned", "OUTPUT"
         for col, key, label in [
                 (0, "original", "ORIGINAL"),
-                (1, "cleaned",
-                 "REPAIRED" if r["status"] == ST_CLEAN_REPAIRED
-                 else ("COVERED" if r["status"] == ST_CLEAN_COVERED
-                       else "OUTPUT"))]:
+                (1, right_key, right_label)]:
             cx = pad + col * (cell_w + pad)
             d.rectangle([cx, box_y, cx + cell_w, box_y + cell_h], outline="#ccc")
             rel = (r.get("paths") or {}).get(key)

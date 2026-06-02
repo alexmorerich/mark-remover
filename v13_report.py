@@ -135,10 +135,49 @@ def build_report(out_root: Path) -> dict:
     cover_artifacts = Counter()
     protected_text_cases = 0
     ppocr_enabled = False
+    # V20 — diagnostics (patch plan §Patch 10).
+    v20_variants_attempted = v20_variants_passed = 0
+    v20_ghost_dot_failures = 0
+    v20_cover_on_product_hard_fails = 0
+    v20_segmented_mixed_published = 0
+    v20_fp_suspects = 0
+    v20_rej_true_residual = v20_rej_product_damage = 0
+    v20_rej_cover_artifact = v20_rej_uncertain = 0
+    _DAMAGE_TOKENS = ("product_damage", "silhouette", "flex", "dark_surface",
+                      "metallic", "protected_text", "thin_flex")
+    _COVER_TOKENS = ("visible_patch", "visible_band", "wedge", "slab", "cover")
 
     for rec in _iter_records(out_root):
         status = rec.get("status")
         status_counts[status] += 1
+        # V20 — reverse-alpha variant beam + audit sub-records.
+        v20_variants_attempted += int(
+            rec.get("reverse_alpha_variants_attempted", 0) or 0)
+        v20_variants_passed += int(
+            rec.get("reverse_alpha_variants_passed", 0) or 0)
+        if (rec.get("reverse_alpha_ghost_dots") or {}).get("hard_fail"):
+            v20_ghost_dot_failures += 1
+        if (rec.get("cover_artifact_v20") or {}).get("hard_fail_reason"):
+            v20_cover_on_product_hard_fails += 1
+        if (rec.get("residual_explain") or {}).get(
+                "possible_product_structure_false_positive"):
+            v20_fp_suspects += 1
+        if status in PUBLISHED and str(rec.get("v9_final_method", "")).startswith(
+                "v20_segmented_reverse_alpha_background_clone"):
+            v20_segmented_mixed_published += 1
+        if status == "auto_rejected":
+            rexp = rec.get("residual_explain") or {}
+            reasons_l = [str(r) for r in (rec.get("reject_reasons") or [])]
+            joined = " ".join(reasons_l)
+            if rexp.get("ocr_positive") or rexp.get("dot_chain_positive") or \
+                    rexp.get("low_contrast_glyph_positive"):
+                v20_rej_true_residual += 1
+            elif any(t in joined for t in _COVER_TOKENS):
+                v20_rej_cover_artifact += 1
+            elif any(t in joined for t in _DAMAGE_TOKENS):
+                v20_rej_product_damage += 1
+            else:
+                v20_rej_uncertain += 1
         # V19 — reverse-alpha telemetry (present on every record once wired).
         if rec.get("reverse_alpha_attempted"):
             ra_attempted += 1
@@ -235,12 +274,12 @@ def build_report(out_root: Path) -> dict:
         ppocr_enabled = False
 
     report = {
-        "version": "V19_PATCH",
-        # V19 (patch plan §5, §9) — explicit per-layer versions so a regression
+        "version": "V20_PATCH",
+        # V20 (patch plan §Patch 10) — explicit per-layer versions so a regression
         # comparison can never confuse the state machine, audit and gate.
         "state_machine_version": "v16",
         "final_audit_version": "v17",
-        "patch_version": "v19_reverse_alpha",
+        "patch_version": "v20_safer_reverse_alpha",
         "gate_version": "v13_frozen",
         "qa_schema_version": "v13",
         "final_gate_version": "v16",
@@ -299,6 +338,19 @@ def build_report(out_root: Path) -> dict:
             "dark_blob_cover":
                 int(cover_artifacts.get("dark_blob_cover", 0)),
         },
+        # V20 — diagnostics (patch plan §Patch 10).
+        "v20": {
+            "reverse_alpha_variants_attempted": v20_variants_attempted,
+            "reverse_alpha_variants_passed": v20_variants_passed,
+            "reverse_alpha_ghost_dot_failures": v20_ghost_dot_failures,
+            "cover_on_product_hard_fails": v20_cover_on_product_hard_fails,
+            "segmented_mixed_repairs_published": v20_segmented_mixed_published,
+            "detector_false_positive_suspects": v20_fp_suspects,
+            "auto_rejected_true_residual": v20_rej_true_residual,
+            "auto_rejected_product_damage": v20_rej_product_damage,
+            "auto_rejected_cover_artifact": v20_rej_cover_artifact,
+            "auto_rejected_uncertain": v20_rej_uncertain,
+        },
         # V19 — product-text protection (patch plan §1.7).
         "text_protection": {
             "ppocr_enabled": ppocr_enabled,
@@ -318,14 +370,74 @@ def build_report(out_root: Path) -> dict:
     return report
 
 
+def write_v20_reasons_csv(out_root: Path) -> Path:
+    """V20 — per-image one-line reason CSV (patch plan §Patch 10)::
+
+        id,status,final_method,roi_class,product_overlap,residual_reason,
+        damage_reason,published
+    """
+    import csv
+    rows = []
+    for rec in _iter_records(out_root):
+        status = rec.get("status", "")
+        rexp = rec.get("residual_explain") or {}
+        residual_reason = ""
+        if rexp.get("ocr_positive"):
+            residual_reason = "ocr"
+        elif rexp.get("dot_chain_positive"):
+            residual_reason = "dot_chain"
+        elif rexp.get("low_contrast_glyph_positive"):
+            residual_reason = "low_contrast_glyph"
+        elif rexp.get("possible_product_structure_false_positive"):
+            residual_reason = "template_only_fp_suspect"
+        damage_reason = ""
+        for r in (rec.get("reject_reasons") or []):
+            rs = str(r)
+            if any(t in rs for t in ("product_damage", "silhouette", "flex",
+                                     "dark_surface", "metallic", "protected_text",
+                                     "visible_patch", "visible_band", "wedge")):
+                damage_reason = rs
+                break
+        rows.append({
+            "id": rec.get("product_id", ""),
+            "status": status,
+            "final_method": rec.get("v9_final_method", ""),
+            "roi_class": rec.get("v18_roi_class") or rec.get("v9_roi_class") or "",
+            "product_overlap": rec.get("v18_product_overlap", ""),
+            "residual_reason": residual_reason,
+            "damage_reason": damage_reason,
+            "published": status in PUBLISHED,
+        })
+    rows.sort(key=lambda r: (r["status"], r["id"]))
+    csv_path = out_root / "v20_reasons.csv"
+    with csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["id", "status", "final_method",
+                                          "roi_class", "product_overlap",
+                                          "residual_reason", "damage_reason",
+                                          "published"])
+        w.writeheader()
+        w.writerows(rows)
+    return csv_path
+
+
 def main(argv):
     out_root = Path(argv[1]) if len(argv) > 1 else Path("output")
     report = build_report(out_root)
+    # V20 — only published outputs may contain cleaned.jpg (patch plan §Patch 2).
+    rejected_cleaned = list((out_root / "auto_rejected").rglob("cleaned.jpg"))
+    report["auto_rejected_cleaned_jpg_leak"] = len(rejected_cleaned)
+    if rejected_cleaned:
+        report["all_clean"] = False
     (out_root / "run_report.json").write_text(json.dumps(report, indent=2))
     # Back-compat filename used by older tooling.
     (out_root / "v13_honesty.json").write_text(json.dumps(report, indent=2))
+    try:
+        write_v20_reasons_csv(out_root)
+    except Exception:
+        pass
     print(json.dumps(report, separators=(",", ":")))
-    # CI gate (patch plan Fix 6): fail if any published output broke a P0 gate.
+    # CI gate: fail if any published output broke a P0 gate OR a rejected folder
+    # leaked a cleaned.jpg (patch plan §Patch 2, §Patch 10).
     return 0 if report["all_clean"] else 1
 
 

@@ -65,6 +65,24 @@ MAX_CHANGED_PRODUCT_RATIO = 0.92   # reverse-alpha may touch product, but not al
 DARK_BLOB_MAX = 26.0               # luma jump on dark stock that reads as a blob
 RESIDUAL_IMPROVE_MIN = 0.04        # residual confidence must drop by at least this
 
+# V20 — reverse-alpha variant beam (patch plan §Patch 3). A small deterministic
+# set of recovery variants is generated; each passes the SAME local pre-screen,
+# and the pipeline tries them in rank order, publishing the first that clears the
+# authoritative P0 audit. No randomness — the beam is fully reproducible.
+GAIN_LO, GAIN_HI, GAIN_STEPS = 0.75, 1.25, 6     # local alpha-gain search
+LOGO_DELTA_MAX = 12.0                            # per-channel logo colour nudge
+CORE_ALPHA = 0.12                                # glyph core threshold
+HALO_ALPHA_LO = 0.02                             # glyph halo band [lo, core)
+VARIANT_NAMES = (
+    "v20_reverse_alpha_fixed",
+    "v20_reverse_alpha_ncc",
+    "v20_reverse_alpha_ncc_local_gain",
+    "v20_reverse_alpha_core_halo_split",
+    "v20_reverse_alpha_per_channel_logo",
+    "v20_reverse_alpha_low_alpha_halo_cleanup",
+    "v20_reverse_alpha_no_cleanup",
+)
+
 
 # ---------------------------------------------------------------------------
 # Alpha asset (patch plan §1.3). Loaded once and cached.
@@ -135,6 +153,8 @@ class ReverseAlphaResult:
     pass_local_safety: bool = False
     source: str = "none"
     reject_reason: Optional[str] = None
+    ghost_dot_score: float = 0.0          # V20 (patch plan §Patch 4)
+    ghost_dot_hard_fail: bool = False     # V20
 
     def to_record(self) -> dict:
         return {
@@ -497,3 +517,193 @@ def repair_sunsky_reverse_alpha(image, mark_box, *, watermark_mask=None,
     res.pass_local_safety = (len(reasons) == 0)
     res.reject_reason = None if res.pass_local_safety else ",".join(reasons)
     return res
+
+
+# ---------------------------------------------------------------------------
+# V20 — reverse-alpha variant beam (patch plan §Patch 3). Build a small set of
+# deterministic recovery variants from the fixed + NCC placements: a local
+# alpha-gain solve, a per-channel logo-colour solve, a core/halo split, and a
+# soft halo cleanup. Each variant is a real-pixel recovery (it subtracts the
+# overlay, never paints a box), and each is screened by the same cheap local
+# safety check. The pipeline runs the authoritative P0 audit on the bytes.
+# ---------------------------------------------------------------------------
+def _apply_with_gain(image, placement: AlphaPlacement, gain: float) -> np.ndarray:
+    """Apply reverse-alpha with the alpha map scaled by ``gain`` (clamped)."""
+    buf = _full_alpha_buffer(image.shape, placement) * float(gain)
+    return apply_reverse_alpha(image, buf, placement.logo_bgr)
+
+
+def _solve_local_gain(image, placement: AlphaPlacement) -> float:
+    """Fit a scalar gain in [GAIN_LO, GAIN_HI] that minimises high-pass residual
+    inside the glyph footprint (patch plan §Patch 3.1)."""
+    best_gain, best_resid = 1.0, 2.0
+    for g in np.linspace(GAIN_LO, GAIN_HI, GAIN_STEPS):
+        cand = _apply_with_gain(image, placement, float(g))
+        rc = residual_confidence(cand, placement.bbox, placement.alpha_map)
+        if rc < best_resid:
+            best_resid, best_gain = rc, float(g)
+    return best_gain
+
+
+def _solve_logo_delta(image, placement: AlphaPlacement,
+                      protected_text_mask=None) -> Tuple[float, float, float]:
+    """Estimate a small per-channel logo-colour adjustment (delta_bgr in
+    [-LOGO_DELTA_MAX, +LOGO_DELTA_MAX]) so the recovered footprint pixels match
+    the surrounding ring median, using only high-confidence alpha pixels and
+    excluding protected product text (patch plan §Patch 3.2)."""
+    H, W = image.shape[:2]
+    buf = _full_alpha_buffer(image.shape, placement)
+    high = buf >= 0.30
+    if protected_text_mask is not None and \
+            protected_text_mask.shape[:2] == (H, W):
+        high &= (protected_text_mask == 0)
+    if int(high.sum()) < 8:
+        return (0.0, 0.0, 0.0)
+    base = apply_placement(image, placement)
+    ring = _ring_bgr_median(image, placement.bbox)
+    rec_med = base[high].reshape(-1, 3).astype(np.float32).mean(axis=0)
+    # A positive (ring - recovered) gap means recovery under-subtracted the
+    # overlay; nudging the logo brighter pushes recovered pixels toward the ring.
+    delta = np.clip(ring - rec_med, -LOGO_DELTA_MAX, LOGO_DELTA_MAX)
+    return (float(delta[0]), float(delta[1]), float(delta[2]))
+
+
+def _ring_bgr_median(image, bbox) -> np.ndarray:
+    bx, by, bw, bh = bbox
+    H, W = image.shape[:2]
+    pad = max(6, max(bw, bh) // 3)
+    y1, y2 = max(0, by - pad), min(H, by + bh + pad)
+    x1, x2 = max(0, bx - pad), min(W, bx + bw + pad)
+    region = image[y1:y2, x1:x2].reshape(-1, 3).astype(np.float32)
+    if region.size == 0:
+        return np.array([200.0, 200.0, 200.0], np.float32)
+    return np.median(region, axis=0)
+
+
+def _apply_per_channel(image, placement: AlphaPlacement,
+                       delta_bgr: Tuple[float, float, float]) -> np.ndarray:
+    logo = (placement.logo_bgr[0] + delta_bgr[0],
+            placement.logo_bgr[1] + delta_bgr[1],
+            placement.logo_bgr[2] + delta_bgr[2])
+    buf = _full_alpha_buffer(image.shape, placement)
+    return apply_reverse_alpha(image, buf, logo)
+
+
+def _apply_core_halo_split(image, placement: AlphaPlacement) -> np.ndarray:
+    """Invert the glyph core aggressively; soften the halo by blending the
+    recovered halo pixels toward a locally-blurred surface (patch plan §Patch
+    3.3 — most visible ghosts come from the core/halo boundary)."""
+    buf = _full_alpha_buffer(image.shape, placement)
+    cand = apply_reverse_alpha(image, buf, placement.logo_bgr)
+    halo = (buf >= HALO_ALPHA_LO) & (buf < CORE_ALPHA)
+    if int(halo.sum()) < 4:
+        return cand
+    blurred = cv2.GaussianBlur(cand, (0, 0), 1.2)
+    out = cand.copy()
+    out[halo] = ((cand[halo].astype(np.float32) * 0.4 +
+                  blurred[halo].astype(np.float32) * 0.6)).astype(np.uint8)
+    return out
+
+
+def _screen_variant(image, candidate, placement, *, watermark_mask, product_mask,
+                    orig_residual) -> ReverseAlphaResult:
+    """Cheap local-safety + scoring for one variant image (mirrors the single
+    candidate path). Authoritative gate is still the V17/V20 audit."""
+    res = ReverseAlphaResult()
+    res.placement = placement
+    res.source = placement.source
+    res.image = candidate
+    res.residual_confidence_original = orig_residual
+    resid_after = residual_confidence(candidate, placement.bbox,
+                                      placement.alpha_map)
+    res.residual_confidence_before_cleanup = resid_after
+    res.residual_confidence_after_cleanup = resid_after
+    res.changed_product_ratio = _changed_product_ratio(
+        image, candidate, placement.bbox, product_mask)
+    res.product_damage_score = _dark_blob(image, candidate, placement.bbox)
+    try:
+        import v17_final_audit
+        res.protected_text_overlap = float(
+            v17_final_audit._protected_text_overlap(
+                image, placement.bbox, watermark_mask))
+        gd = v17_final_audit.detect_reverse_alpha_ghost_dots(
+            image, candidate, placement.bbox, watermark_mask, product_mask)
+        res.ghost_dot_score = float(gd.get("score", 0.0))
+        res.ghost_dot_hard_fail = bool(gd.get("hard_fail", False))
+    except Exception:
+        res.protected_text_overlap = 0.0
+    reasons = []
+    if res.changed_product_ratio > MAX_CHANGED_PRODUCT_RATIO:
+        reasons.append("changed_too_much_product")
+    if res.product_damage_score > DARK_BLOB_MAX:
+        reasons.append("dark_surface_blob")
+    if getattr(res, "ghost_dot_hard_fail", False):
+        reasons.append("ghost_dot_residue_on_product")
+    if resid_after > orig_residual - RESIDUAL_IMPROVE_MIN and orig_residual > 0.05:
+        reasons.append("residual_did_not_improve")
+    res.pass_local_safety = (len(reasons) == 0)
+    res.reject_reason = None if res.pass_local_safety else ",".join(reasons)
+    return res
+
+
+def build_variant_beam(image, mark_box, *, watermark_mask=None, product_mask=None,
+                       protected_text_mask=None, ctx=None, allow_thin_cleanup=True):
+    """Return an ordered list of ``(name, ReverseAlphaResult)`` reverse-alpha
+    variants that passed the local pre-screen, safest/cleanest first (patch plan
+    §Patch 3). Empty when the asset is missing or no variant is locally safe."""
+    if isinstance(mark_box, dict):
+        mark_box = (mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"])
+    bx, by, bw, bh = mark_box
+    asset = load_alpha_asset()
+    if asset is None or bw < 6 or bh < 4:
+        return []
+    orig_residual = residual_confidence(
+        image, (bx, by, bw, bh),
+        cv2.resize(asset["alpha"], (bw, bh), interpolation=cv2.INTER_AREA))
+
+    fp = fixed_alpha_map(image, (bx, by, bw, bh), asset)
+    ap = aligned_alpha_map(image, (bx, by, bw, bh), ctx, asset)
+    base = ap or fp
+    if base is None:
+        return []
+
+    raw: list = []   # (name, candidate_image, placement)
+    if fp is not None:
+        raw.append(("v20_reverse_alpha_fixed", apply_placement(image, fp), fp))
+    raw.append(("v20_reverse_alpha_ncc", apply_placement(image, base), base))
+    gain = _solve_local_gain(image, base)
+    raw.append(("v20_reverse_alpha_ncc_local_gain",
+                _apply_with_gain(image, base, gain), base))
+    raw.append(("v20_reverse_alpha_core_halo_split",
+                _apply_core_halo_split(image, base), base))
+    delta = _solve_logo_delta(image, base, protected_text_mask)
+    raw.append(("v20_reverse_alpha_per_channel_logo",
+                _apply_per_channel(image, base, delta), base))
+    if allow_thin_cleanup:
+        base_img = apply_placement(image, base)
+        halo_clean, _ = thin_residual_cleanup(
+            base_img, base, protected_text_mask=protected_text_mask,
+            dilate_px=1, method=cv2.INPAINT_NS)
+        raw.append(("v20_reverse_alpha_low_alpha_halo_cleanup", halo_clean, base))
+    # Explicit no-cleanup variant (alias of the ncc placement, kept for ranking
+    # diversity / report parity).
+    raw.append(("v20_reverse_alpha_no_cleanup", apply_placement(image, base), base))
+
+    scored = []
+    seen_names = set()
+    for name, cand, pl in raw:
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        res = _screen_variant(image, cand, pl, watermark_mask=watermark_mask,
+                              product_mask=product_mask,
+                              orig_residual=orig_residual)
+        if not res.pass_local_safety:
+            continue
+        # rank key: lower residual, fewer ghosts, less product disturbance.
+        key = (round(res.residual_confidence_after_cleanup, 4),
+               round(getattr(res, "ghost_dot_score", 0.0), 4),
+               round(res.changed_product_ratio, 4))
+        scored.append((key, name, res))
+    scored.sort(key=lambda t: t[0])
+    return [(name, res) for _k, name, res in scored]

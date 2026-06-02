@@ -164,6 +164,17 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         v18_telem.update(ra_rec or {})
     except Exception:
         v18_telem["reverse_alpha_attempted"] = False
+    # V20 — reverse-alpha variant beam (patch plan §Patch 3). A small set of
+    # deterministic recovery variants (local-gain / per-channel logo / core-halo
+    # split / halo cleanup); each is non-destructive and still passes the P0
+    # audit. They LEAD the repair beam (rank 1, patch plan §Patch 9).
+    ra_beam = []
+    try:
+        ra_beam, ra_beam_rec = v18_patch.reverse_alpha_variant_beam(
+            img, bbox, watermark_mask, product_mask, pctx)
+        v18_telem.update(ra_beam_rec or {})
+    except Exception:
+        ra_beam = []
     try:
         v18_telem.update(v18_patch.manifest_routing_fields(
             img, bbox, watermark_mask, product_mask, pctx, ban_destructive))
@@ -248,9 +259,16 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     # clean_repaired (the honest classification), and on a product region they
     # are tried BEFORE the destructive uniform fill (which is banned anyway).
     repair_cands = []
-    # V19 — reverse-alpha leads the repair beam (non-destructive real-pixel
-    # recovery). A pass here yields the honest clean_repaired classification.
-    if ra_img is not None:
+    # V20 — the reverse-alpha variant beam leads the repair beam (rank 1): a set
+    # of non-destructive real-pixel recovery variants, safest/cleanest first. A
+    # pass here yields the honest clean_repaired classification.
+    seen_repair = set()
+    for v20_name, v20_img in ra_beam:
+        if v20_img is not None and v20_name not in seen_repair:
+            seen_repair.add(v20_name)
+            repair_cands.append((v20_name, v20_img))
+    # V19 — single reverse-alpha candidate retained for parity / fallback.
+    if ra_img is not None and ra_name not in seen_repair:
         repair_cands.append((ra_name, ra_img))
     if not ban_destructive and uniform is not None:
         repair_cands.append(("v16_uniform_background_fill", uniform))
@@ -317,6 +335,11 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     # V19 — reverse-alpha also leads the cover beam as a non-destructive fallback.
     if ra_img is not None:
         cover_cands.insert(0, (ra_name, ra_img))
+    # V20 — the reverse-alpha variant beam also seeds the cover beam (non-
+    # destructive), best variant first.
+    for v20_name, v20_img in reversed(ra_beam):
+        if v20_img is not None:
+            cover_cands.insert(0, (v20_name, v20_img))
     # V18 — destructive full-band / forced-removal / uniform fills are BANNED on
     # any product-overlap or silhouette-contact region (patch plan §1.3, §2): on
     # product pixels they paint exactly the bands/blobs the audit rejects, so

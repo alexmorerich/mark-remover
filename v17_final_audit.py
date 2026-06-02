@@ -74,6 +74,25 @@ P0_COVER_ARTIFACT_REASONS = (
     "changed_dark_surface_blob",
 )
 
+# V20 — stricter product-side cover publishing (patch plan §Patch 1). A
+# clean_covered output is a HARD failure when MORE than this fraction of the
+# changed pixels land on product AND a visible cover shape / boundary / silhouette
+# crossing is detected. This is tighter than the V19 PRODUCT_OVERLAP_HARD (0.03)
+# gate — covers must become a rare *background-only* terminal state.
+COVER_ON_PRODUCT_FRACTION = 0.01     # > this on a cover => inspect shape/boundary
+COVER_RECTANGULARITY_MAX = 0.78      # changed-region fill above => slab/box cover
+COVER_LOCAL_COLOR_DELTA_MAX = 14.0   # local tone mismatch (luma) that reads as a patch
+
+# V20 — reverse-alpha ghost-dot residue (patch plan §Patch 4). Reverse-alpha can
+# remove the glyph yet leave faint *paired* dots / pits aligned on the original
+# watermark baseline. Too low-contrast for residual-OCR but human-visible on
+# smooth colored / metallic surfaces. A HARD fail when on product.
+GHOST_DOT_SCORE_MAX = 0.45           # ghost_score above => publishable only on bg
+GHOST_DOT_LUMA_MIN = 3.0             # min |luma delta| vs local surface to count a dot
+GHOST_DOT_LUMA_MAX = 55.0            # above this it is real product detail, not a ghost
+GHOST_DOT_MIN_COMPONENTS = 3         # a ghost chain needs several aligned fragments
+GHOST_DOT_ALIGN_TOL = 0.20           # vertical spread / footprint height to read as a line
+
 # V18 — tiny low-contrast glyph residue (patch plan §8). A published output may
 # still show faint dot/dash residue aligned along the original watermark
 # baseline; it is too low-contrast for the residual-OCR detector but reads to a
@@ -106,6 +125,10 @@ class FinalAuditResult:
     pure_background_change: bool = True
     has_readable_residual: bool = False
     glyph_residue_score: float = 0.0           # V18 (patch plan §8)
+    # V20 — diagnostic sub-records (patch plan §Patch 1, §Patch 4, §Patch 6).
+    cover_artifact_v20: dict = field(default_factory=dict)
+    reverse_alpha_ghost_dots: dict = field(default_factory=dict)
+    thin_flex_v20: dict = field(default_factory=dict)
 
     def to_record(self) -> dict:
         return {
@@ -122,6 +145,9 @@ class FinalAuditResult:
             "v17_changed_product_ratio": round(self.changed_product_ratio, 4),
             "v17_pure_background_change": self.pure_background_change,
             "v17_has_readable_residual": self.has_readable_residual,
+            "cover_artifact_v20": dict(self.cover_artifact_v20),
+            "reverse_alpha_ghost_dots": dict(self.reverse_alpha_ghost_dots),
+            "thin_flex_v20": dict(self.thin_flex_v20),
         }
 
 
@@ -302,10 +328,19 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
             original, output, bbox, watermark_mask):
         reasons.append("changed_protected_text")
 
-    # Thin flex cable: a continuous dark line broken by the fill.
+    # Thin flex cable: a continuous dark line broken by the fill (V13 check +
+    # V20 continuity scoring, patch plan §Patch 6).
     if roi_class == "thin_flex_cable" or _looks_like_flex(original, bbox):
         if _flex_line_broken(original, output, bbox, product_mask):
             reasons.append("changed_thin_flex_structure")
+        try:
+            tf = v13_gates.detect_thin_flex_continuity_v20(original, output, bbox)
+            res.thin_flex_v20 = tf
+            if tf.get("hard_fail") and \
+                    "changed_thin_flex_structure" not in reasons:
+                reasons.append("changed_thin_flex_structure")
+        except Exception:
+            pass
 
     # Dark product surface: a new bright/dark blob on dark stock.
     if (sil.get("dark_surface_ratio", 0.0) > v13_gates.DARK_SURFACE_RATIO_FOR_BLOB
@@ -318,18 +353,48 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
         if _metallic_block(original, output, bbox):
             reasons.append("changed_metallic_surface_block")
 
-    # ----- 7. V19 — stricter cover-shape audit (patch plan §4.4). A visible
-    #          cover on product pixels is a HARD failure, not a cosmetic seam.
-    #          Only runs for clean_covered outputs that land on product. ------
-    if final_status == "clean_covered" and prod_ratio > PRODUCT_OVERLAP_HARD:
+    # ----- 7. V20 — stricter product-side cover publishing (patch plan §Patch
+    #          1). A clean_covered output is a HARD failure whenever MORE than
+    #          COVER_ON_PRODUCT_FRACTION (0.01) of the changed pixels land on
+    #          product AND a visible cover shape / boundary / silhouette crossing
+    #          is detected. This is tighter than V19's PRODUCT_OVERLAP_HARD gate:
+    #          clean_covered must become a rare *background-only* terminal state,
+    #          never a product-repair state. The cover_artifact_v20 record is
+    #          always attached (for diagnostics) even when it does not fail. ----
+    if final_status == "clean_covered":
         try:
             changed = _changed_mask(original, output, bbox)
-            artifact = detect_cover_shape_artifact_v19(
+            cav = detect_cover_shape_artifact_v20(
                 original, output, changed, product_mask, bbox)
-            for r in artifact.get("artifact_reasons", []):
-                reasons.append(r)
+            res.cover_artifact_v20 = cav
+            if cav.get("hard_fail_reason"):
+                # The V20 detector decided this cover is visible on product.
+                changed_v19 = _changed_mask(original, output, bbox)
+                artifact = detect_cover_shape_artifact_v19(
+                    original, output, changed_v19, product_mask, bbox)
+                v19_reasons = artifact.get("artifact_reasons", [])
+                if v19_reasons:
+                    for r in v19_reasons:
+                        reasons.append(r)
+                else:
+                    reasons.append(cav["hard_fail_reason"])
         except Exception:
             pass
+
+    # ----- 8. V20 — reverse-alpha ghost-dot residue (patch plan §Patch 4). A
+    #          published output may show faint paired dots / pits aligned on the
+    #          original watermark baseline left by reverse-alpha. A HARD fail when
+    #          on product; on pure background it is routed to micro-cleanup before
+    #          rejection (the beam already attempts that), so we only fail here
+    #          when the ghost residue lands on product pixels. -----------------
+    try:
+        gd = detect_reverse_alpha_ghost_dots(
+            original, output, bbox, watermark_mask, product_mask)
+        res.reverse_alpha_ghost_dots = gd
+        if gd.get("hard_fail"):
+            reasons.append("published_low_contrast_glyph_residue")
+    except Exception:
+        pass
 
     # De-dupe while preserving order.
     seen = set()
@@ -558,6 +623,195 @@ def detect_cover_shape_artifact_v19(original, output, changed_mask,
     out["artifact_reasons"] = [r for r in reasons
                                if not (r in seen or seen.add(r))]
     out["has_artifact"] = len(out["artifact_reasons"]) > 0
+    return out
+
+
+def detect_cover_shape_artifact_v20(original, output, changed_mask,
+                                    product_mask, mark_box):
+    """V20 — quantified product-side cover artifact (patch plan §Patch 1).
+
+    Returns the ``cover_artifact_v20`` record::
+
+        {changed_on_product_fraction, rectangularity, straight_boundary_score,
+         local_color_delta, crosses_silhouette, hard_fail_reason}
+
+    ``hard_fail_reason`` is non-null when MORE than ``COVER_ON_PRODUCT_FRACTION``
+    of the changed pixels land on product AND the cover is visible as a shape
+    (rectangular slab / wedge), a straight artificial boundary, a local tone
+    mismatch, or it crosses the product silhouette / touches protected text. A
+    stroke-shaped change on background stays null (allowed)."""
+    bx, by, bw, bh = mark_box
+    out = {"changed_on_product_fraction": 0.0, "rectangularity": 0.0,
+           "straight_boundary_score": 0.0, "local_color_delta": 0.0,
+           "crosses_silhouette": False, "hard_fail_reason": None}
+    if bw <= 2 or bh <= 2:
+        return out
+
+    ch = (changed_mask > 0)
+    n_changed = int(ch.sum())
+    if n_changed < 8:
+        return out
+    # Without a product mask we cannot PROVE the changed pixels are product, so
+    # the cover-on-product hard fail does not fire (the real pipeline always
+    # supplies protect_combined; only synthetic tests pass None).
+    if product_mask is None or product_mask.shape[:2] != original.shape[:2]:
+        return out
+    on_product = ch & (product_mask > 0)
+    n_prod = int(on_product.sum())
+    frac = n_prod / float(n_changed)
+    out["changed_on_product_fraction"] = round(frac, 4)
+    if frac <= COVER_ON_PRODUCT_FRACTION or n_prod < 12:
+        return out
+
+    # Rectangularity of the changed-on-product region (fill of its bbox).
+    ys, xs = np.where(on_product)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    rw, rh = (x1 - x0 + 1), (y1 - y0 + 1)
+    rectangularity = n_prod / float(max(1, rw * rh))
+    out["rectangularity"] = round(rectangularity, 4)
+
+    # Straight artificial boundary + visible patch shape.
+    straight = 0.0
+    patch_visible = False
+    try:
+        patch = v13_gates.detect_visible_patch_shape_v13(
+            original, output, (bx, by, bw, bh))
+        straight = float(patch.get("hard_boundary_score", 0.0))
+        patch_visible = float(patch.get("visible_patch_score", 0.0)) > 0.5
+    except Exception:
+        pass
+    out["straight_boundary_score"] = round(straight, 4)
+
+    # Local tone mismatch on the product pixels that changed (mean luma delta).
+    og = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    rg = cv2.cvtColor(output, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    color_delta = float(np.abs(rg[on_product] - og[on_product]).mean())
+    out["local_color_delta"] = round(color_delta, 4)
+
+    # Cover crossing the product silhouette.
+    crosses = False
+    try:
+        sil = v13_gates.detect_product_silhouette_damage_v13(
+            original, output, product_mask, (bx, by, bw, bh))
+        crosses = (not sil.get("passed", True)) and \
+            float(sil.get("product_overlap", 0.0)) > SILHOUETTE_PRODUCT_OVERLAP
+    except Exception:
+        crosses = False
+    out["crosses_silhouette"] = bool(crosses)
+
+    cover_shape_visible = (rectangularity > COVER_RECTANGULARITY_MAX or
+                           patch_visible)
+    cover_boundary_visible = (straight > v13_gates.HARD_BOUNDARY_MAX or
+                              color_delta > COVER_LOCAL_COLOR_DELTA_MAX)
+    if cover_shape_visible:
+        out["hard_fail_reason"] = "wedge_or_slab_shape" \
+            if rectangularity > COVER_RECTANGULARITY_MAX else \
+            "visible_patch_on_product"
+    elif cover_boundary_visible:
+        out["hard_fail_reason"] = "visible_patch_on_product"
+    elif crosses:
+        out["hard_fail_reason"] = "visible_patch_on_product"
+    return out
+
+
+def detect_reverse_alpha_ghost_dots(original, output, bbox, watermark_mask=None,
+                                    product_mask=None):
+    """V20 — ghost-dot residue from reverse-alpha (patch plan §Patch 4).
+
+    After reverse-alpha removes the glyph, faint *paired* dark/bright dots or
+    pits can remain inside the original watermark footprint, aligned on the glyph
+    baseline. They are too low-contrast for residual-OCR but a human sees them on
+    smooth colored / metallic surfaces. Returns::
+
+        {score, component_count, baseline_alignment, on_product_fraction, hard_fail}
+
+    ``hard_fail`` is True only when the ghost pattern is aligned/baseline-locked
+    AND a meaningful fraction of those dots sit on product pixels (changed-on-
+    product > COVER_ON_PRODUCT_FRACTION). On pure background it never hard-fails
+    (the beam routes those to one more micro-cleanup candidate before rejection).
+    """
+    bx, by, bw, bh = bbox
+    out = {"score": 0.0, "component_count": 0, "baseline_alignment": 0.0,
+           "on_product_fraction": 0.0, "hard_fail": False}
+    if bw <= 4 or bh <= 4:
+        return out
+    region = output[by:by + bh, bx:bx + bw]
+    if region.size == 0:
+        return out
+    g = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Local surface estimate; ghost dots are small deviations from it.
+    ksize = max(3, (min(bw, bh) // 2) * 2 + 1)
+    ksize = min(ksize, 31)
+    surface = cv2.medianBlur(g.astype(np.uint8), ksize).astype(np.float32)
+    delta = np.abs(g - surface)
+    dots = ((delta > GHOST_DOT_LUMA_MIN) &
+            (delta < GHOST_DOT_LUMA_MAX)).astype(np.uint8)
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(dots, connectivity=8)
+    comps = []
+    area_box = float(bw * bh)
+    for i in range(1, n):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        w_i = int(stats[i, cv2.CC_STAT_WIDTH])
+        h_i = int(stats[i, cv2.CC_STAT_HEIGHT])
+        if a < 2 or a > area_box * 0.015:
+            continue
+        if w_i > bw * 0.4 or h_i > bh * 0.6:
+            continue
+        comps.append((cents[i][0], cents[i][1]))
+    cc = len(comps)
+    out["component_count"] = cc
+    if cc < GHOST_DOT_MIN_COMPONENTS:
+        return out
+    ys = np.array([c[1] for c in comps], dtype=np.float32)
+    xs = np.array([c[0] for c in comps], dtype=np.float32)
+    vspread = float(ys.std()) / float(max(1.0, bh))
+    aligned = vspread < GHOST_DOT_ALIGN_TOL
+    out["baseline_alignment"] = round(1.0 - min(1.0, vspread / GHOST_DOT_ALIGN_TOL),
+                                      4)
+    # Paired-spacing: ghost dots tend to recur at a regular horizontal cadence.
+    pair_score = 0.0
+    if cc >= 2:
+        xs_sorted = np.sort(xs)
+        gaps = np.diff(xs_sorted)
+        if gaps.size:
+            pair_score = float(np.clip(
+                1.0 - (gaps.std() / (gaps.mean() + 1e-6)), 0.0, 1.0))
+    score = 0.0
+    if aligned:
+        score = float(np.clip(cc / 10.0, 0.0, 1.0)) * \
+            (0.5 + 0.5 * pair_score)
+    out["score"] = round(score, 4)
+
+    # Where do the ghost dots sit — product or background? The supplied product
+    # mask (protect_combined) is SPARSE: it misses smooth colored / metallic
+    # surfaces, so a ghost chain on a flat red or silver back-cover reads as
+    # "background" and escapes. V20 (patch plan §Patch 8) therefore also treats
+    # a locally colored (saturated) or dark surface under the dot as product —
+    # a self-contained estimate the sparse mask cannot fool. Pure white / very
+    # light background stays non-product, so a faint chain on background never
+    # hard-fails (it is routed to micro-cleanup before rejection instead).
+    region_hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    sat_r = region_hsv[:, :, 1]
+    colored_or_dark = (sat_r > 40) | (g < 200)
+    have_mask = (product_mask is not None and
+                 product_mask.shape[:2] == original.shape[:2])
+    pm = product_mask[by:by + bh, bx:bx + bw] > 0 if have_mask else None
+    hit = 0
+    for cx, cy in comps:
+        yi, xi = int(round(cy)), int(round(cx))
+        if not (0 <= yi < bh and 0 <= xi < bw):
+            continue
+        is_prod = bool(colored_or_dark[yi, xi])
+        if have_mask and pm[yi, xi]:
+            is_prod = True
+        if is_prod:
+            hit += 1
+    on_product_fraction = hit / float(max(1, cc))
+    out["on_product_fraction"] = round(on_product_fraction, 4)
+
+    out["hard_fail"] = bool(aligned and score > GHOST_DOT_SCORE_MAX and
+                            on_product_fraction > 0.25)
     return out
 
 

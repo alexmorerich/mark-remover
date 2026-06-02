@@ -115,7 +115,8 @@ def test_safe_candidates_are_valid_images_only():
     cands = v18_patch.build_safe_candidates(img, bbox, wm, None, ctx)
     assert len(cands) >= 1
     for name, im in cands:
-        assert name.startswith("v18_")
+        # V20 added reverse-alpha-backed safe candidates alongside the v18_ ones.
+        assert name.startswith(("v18_", "v20_"))
         assert im is not None and im.shape == img.shape and im.dtype == img.dtype
 
 
@@ -216,8 +217,8 @@ def test_report_carries_v18_versions_and_taxonomy(tmp_path):
         },
     }))
     rep = v13_report.build_report(tmp_path)
-    assert rep["version"] == "V19_PATCH"
-    assert rep["patch_version"] == "v19_reverse_alpha"
+    assert rep["version"] == "V20_PATCH"
+    assert rep["patch_version"] == "v20_safer_reverse_alpha"
     assert rep["state_machine_version"] == "v16"
     assert rep["gate_version"] == "v13_frozen"
     assert rep["auto_rejected_by_roi_class"]["dark_product_surface"] == 1

@@ -603,6 +603,63 @@ def _band_metrics(cleaned, bbox):
             "band_rectangularity": m["rectangularity"]}
 
 
+# ---------------------------------------------------------------------------
+# V20 — thin flex cable continuity (patch plan §Patch 6). A thin flex cable must
+# never be cut or notched by a repair. Trace the long dark cable lines before and
+# after; if the longest line shrinks or its endpoints shift, the cable continuity
+# dropped and the output is unsafe. Returns the thin_flex_v20 QA record.
+# ---------------------------------------------------------------------------
+THIN_FLEX_CONTINUITY_DROP_MAX = 0.06     # fractional drop in longest-line length
+THIN_FLEX_EDGE_SHIFT_MAX = 3.0           # px shift of the dominant line endpoints
+
+
+def _trace_lines(image, bbox):
+    """Return (line_count, longest_len, dominant_endpoints) for dark lines in
+    the bbox interior."""
+    bx, by, bw, bh = bbox
+    inner = image[by:by + bh, bx:bx + bw]
+    if inner.size == 0:
+        return 0, 0.0, None
+    g = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(g, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=max(10, bw // 6),
+                            minLineLength=max(10, bw // 3), maxLineGap=4)
+    if lines is None or len(lines) == 0:
+        return 0, 0.0, None
+    longest = 0.0
+    dom = None
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        L = float(np.hypot(x2 - x1, y2 - y1))
+        if L > longest:
+            longest = L
+            dom = (x1, y1, x2, y2)
+    return len(lines), longest, dom
+
+
+def detect_thin_flex_continuity_v20(original, output, bbox):
+    """V20 — thin-flex continuity QA (patch plan §Patch 6)."""
+    out = {"line_count_before": 0, "line_count_after": 0,
+           "continuity_drop": 0.0, "edge_position_shift_px": 0.0,
+           "hard_fail": False}
+    nb, lb, db = _trace_lines(original, bbox)
+    na, la, da = _trace_lines(output, bbox)
+    out["line_count_before"] = nb
+    out["line_count_after"] = na
+    if lb < max(8.0, bbox[2] / 3.0):
+        # No appreciable cable line to begin with — nothing to protect.
+        return out
+    out["continuity_drop"] = round(float((lb - la) / max(1.0, lb)), 4)
+    if db is not None and da is not None:
+        shift = (abs(db[0] - da[0]) + abs(db[1] - da[1]) +
+                 abs(db[2] - da[2]) + abs(db[3] - da[3])) / 4.0
+        out["edge_position_shift_px"] = round(float(shift), 4)
+    out["hard_fail"] = bool(
+        out["continuity_drop"] > THIN_FLEX_CONTINUITY_DROP_MAX or
+        out["edge_position_shift_px"] > THIN_FLEX_EDGE_SHIFT_MAX)
+    return out
+
+
 def final_visual_publish_gate_v13(original, cleaned, bbox, product_mask,
                                   qa_info=None, *, repaired=True,
                                   watermark_mask=None):
