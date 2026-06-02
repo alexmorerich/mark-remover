@@ -892,3 +892,134 @@ def build_residue_micro_cleanup_beam(original, candidate, mark_box,
         seen.add(name)
         uniq.append((name, img))
     return uniq
+
+
+# ---------------------------------------------------------------------------
+# V22 — alpha-footprint partial-glyph residue cleanup beam (patch plan §Patch 3).
+# V21's micro-cleanup caps each component very tightly and mainly targets paired
+# dots / pits. V22 adds a slightly broader (but still footprint-capped) path for
+# *partial-glyph* fragments — surviving s / m / .com pieces and short dashes —
+# while keeping all the V21 safety limits. It edits ONLY inside the solved glyph
+# footprint, never a full bbox or band, and refuses when the residue area is too
+# large to be residue (the image stays auto_rejected). Every variant still passes
+# the unchanged P0 / V17 / V22 audit in the pipeline.
+# ---------------------------------------------------------------------------
+RESIDUE_V22_MAX_FOOTPRINT_FRAC = 0.30   # edited area <= 30% of alpha footprint
+RESIDUE_V22_MAX_BOX_FRAC = 0.06         # edited area <= 6% of mark_box
+RESIDUE_V22_COMPONENT_MAX_FRAC = 0.020  # a residue blob is "small": <= 2% of box
+RESIDUE_V22_LOWCONTRAST_LO = 3          # min |hi-pass| (8-bit) to count as residue
+RESIDUE_V22_LOWCONTRAST_HI = 58         # above this it is real product detail
+
+
+def _detect_residue_mask_v22(candidate, mark_box, footprint, product_mask=None):
+    """Broader-but-capped partial-glyph residue mask inside ``footprint``. Returns
+    ``(mask_uint8, edited_frac_of_footprint)`` or ``(None, frac)`` when no safe
+    residue is found / the area cap is exceeded (patch plan §Patch 3 limits)."""
+    if isinstance(mark_box, dict):
+        mark_box = (mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"])
+    bx, by, bw, bh = [int(v) for v in mark_box]
+    H, W = candidate.shape[:2]
+    foot_bool = footprint > 0
+    foot_area = int(foot_bool.sum())
+    if foot_area < 4:
+        return None, 0.0
+    gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    blur = cv2.medianBlur(gray, 5)
+    hp = cv2.absdiff(gray, blur)
+    resid = ((hp >= RESIDUE_V22_LOWCONTRAST_LO) &
+             (hp <= RESIDUE_V22_LOWCONTRAST_HI) & foot_bool).astype(np.uint8)
+    if int(resid.sum()) == 0:
+        return None, 0.0
+    box_area = max(1, bw * bh)
+    comp_max = max(2, int(RESIDUE_V22_COMPONENT_MAX_FRAC * box_area))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(resid, connectivity=8)
+    keep = np.zeros((H, W), np.uint8)
+    for i in range(1, n):
+        a = int(stats[i, cv2.CC_STAT_AREA])
+        w_i = int(stats[i, cv2.CC_STAT_WIDTH])
+        h_i = int(stats[i, cv2.CC_STAT_HEIGHT])
+        # small fragment, not a long product edge or a tall product feature.
+        if a > comp_max or w_i > bw * 0.5 or h_i > bh * 0.6:
+            continue
+        keep[lab == i] = 255
+    edited = int((keep > 0).sum())
+    if edited == 0:
+        return None, 0.0
+    frac_foot = edited / foot_area
+    frac_box = edited / box_area
+    if frac_foot > RESIDUE_V22_MAX_FOOTPRINT_FRAC or \
+            frac_box > RESIDUE_V22_MAX_BOX_FRAC:
+        return None, frac_foot
+    return keep, frac_foot
+
+
+def _directional_surface_clone(candidate, resid_mask):
+    """Fill the residue with a directional (column-median) estimate of the local
+    surface — preserves smooth horizontal gradients on cardboard / metallic."""
+    target = cv2.blur(candidate, (9, 1))      # horizontal average (column-wise)
+    return _blend_at_mask(candidate, target, resid_mask, feather_px=1)
+
+
+def build_alpha_footprint_residue_cleanup_beam_v22(
+        original, candidate, bbox, *, watermark_mask=None, product_mask=None,
+        roi_class=""):
+    """Patch plan §Patch 3. Given a reverse-alpha ``candidate`` with faint
+    partial-glyph residue, return ``(name, image)`` cleanup variants that edit
+    ONLY small residue components inside the solved glyph footprint. Empty when
+    there is no safe residue or the residue is too large (image stays rejected).
+    Variants (patch plan §Patch 3):
+      v22_residue_alpha_footprint_median_blend
+      v22_residue_directional_surface_clone
+      v22_residue_bilateral_texture_blend
+      v22_residue_component_ns_inpaint
+      v22_residue_component_telea_inpaint
+    """
+    if candidate is None or candidate.shape != original.shape:
+        return []
+    foot = footprint_mask_for_box(original, bbox, watermark_mask, dilate_px=1)
+    if foot is None:
+        return []
+    resid, _frac = _detect_residue_mask_v22(candidate, bbox, foot, product_mask)
+    if resid is None:
+        return []
+    out = []
+    # 1) alpha-footprint median blend — average the fragment into its surround.
+    try:
+        med = cv2.medianBlur(candidate, 5)
+        out.append(("v22_residue_alpha_footprint_median_blend",
+                    _blend_at_mask(candidate, med, resid, feather_px=1)))
+    except Exception:
+        pass
+    # 2) directional surface clone — preserve smooth gradient direction.
+    try:
+        out.append(("v22_residue_directional_surface_clone",
+                    _directional_surface_clone(candidate, resid)))
+    except Exception:
+        pass
+    # 3) bilateral texture blend — suppress the fragment, keep micro-texture.
+    try:
+        bil = cv2.bilateralFilter(candidate, 7, 45, 45)
+        out.append(("v22_residue_bilateral_texture_blend",
+                    _blend_at_mask(candidate, bil, resid, feather_px=1)))
+    except Exception:
+        pass
+    # 4) component NS inpaint.
+    try:
+        ns = cv2.inpaint(candidate, resid, RESIDUAL_INPAINT_RADIUS, cv2.INPAINT_NS)
+        out.append(("v22_residue_component_ns_inpaint", ns))
+    except Exception:
+        pass
+    # 5) component Telea inpaint.
+    try:
+        telea = cv2.inpaint(candidate, resid, RESIDUAL_INPAINT_RADIUS,
+                            cv2.INPAINT_TELEA)
+        out.append(("v22_residue_component_telea_inpaint", telea))
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for name, img in out:
+        if name in seen or img is None or img.shape != original.shape:
+            continue
+        seen.add(name)
+        uniq.append((name, img))
+    return uniq

@@ -1,0 +1,7 @@
+# V22 §Patch 10 — regression: rejects that a SAFER non-destructive candidate
+# (reverse-alpha variant / v22 alpha-footprint cleanup) should be able to recover
+# without weakening any gate. Smooth coloured / metallic / near-white surfaces.
+back-cover-for-ipad-2-64gb-wifi-version-7.jpg
+back-housing-cover-with-appearance-imitation-of-ip13-for-iphone-xr-blue-2.jpg
+glass-back-cover-with-appearance-imitation-of-ip12-for-iphone-xr-gold-4.jpg
+original-battery-back-housing-cover-for-ipad-air-3g-version-ipad-5-black-11.jpg

@@ -34,6 +34,14 @@ import numpy as np
 
 import v13_gates
 
+# V22 — additive safety detectors (visible band on non-white surface + alpha-
+# footprint partial-glyph residue). v22_patch imports only v13_gates and the
+# alpha asset, NOT this module, so the dependency graph stays acyclic.
+try:
+    import v22_patch
+except Exception:  # pragma: no cover - always importable in practice
+    v22_patch = None
+
 
 # ---------------------------------------------------------------------------
 # Thresholds (patch plan §1.2, §4.1, §5). Kept here so the audit's product-aware
@@ -101,6 +109,17 @@ P0_RESIDUE_REASONS = (
     "published_low_contrast_glyph_residue",
 )
 
+# V22 — additional HARD P0 reasons (patch plan §Patch 1, §Patch 2). A published
+# output with a visible band on a non-white / product-like surface, or with
+# faint partial-glyph residue inside the solved Sunsky footprint, is a release
+# blocker — CI must exit non-zero. They never relax an existing gate; they only
+# add publish blockers, so a clean_* output that trips one is forced to
+# auto_rejected (never shipped).
+P0_V22_REASONS = (
+    "published_visible_band_on_nonwhite_surface",
+    "published_partial_glyph_residue",
+)
+
 # Low-contrast glyph-residue thresholds (patch plan §8).
 GLYPH_RESIDUE_LUMA_MIN = 4.0         # min |luma delta| vs surface to count a dot
 GLYPH_RESIDUE_LUMA_MAX = 60.0        # above this it is real product detail, not residue
@@ -129,6 +148,10 @@ class FinalAuditResult:
     cover_artifact_v20: dict = field(default_factory=dict)
     reverse_alpha_ghost_dots: dict = field(default_factory=dict)
     thin_flex_v20: dict = field(default_factory=dict)
+    # V22 — sub-records for the new band / partial-glyph detectors + surface class.
+    v22_visible_band: dict = field(default_factory=dict)
+    v22_alpha_footprint: dict = field(default_factory=dict)
+    v22_surface: dict = field(default_factory=dict)
 
     def to_record(self) -> dict:
         return {
@@ -148,6 +171,18 @@ class FinalAuditResult:
             "cover_artifact_v20": dict(self.cover_artifact_v20),
             "reverse_alpha_ghost_dots": dict(self.reverse_alpha_ghost_dots),
             "thin_flex_v20": dict(self.thin_flex_v20),
+            # V22 — band / partial-glyph residue diagnostics + surface class.
+            "v22_visible_band": dict(self.v22_visible_band),
+            "v22_alpha_footprint": dict(self.v22_alpha_footprint),
+            "v22_surface": dict(self.v22_surface),
+            "v22_visible_band_score":
+                round(float(self.v22_visible_band.get("score", 0.0)), 4),
+            "v22_alpha_footprint_residue_score":
+                round(float(self.v22_alpha_footprint.get("score", 0.0)), 4),
+            "v22_surface_class": self.v22_surface.get("surface_class", ""),
+            "v22_product_like_overlap":
+                round(float(self.v22_surface.get("v22_product_like_overlap",
+                                                 0.0)), 4),
         }
 
 
@@ -395,6 +430,40 @@ def audit_final_output(original, output, mark_box, product_mask, watermark_mask,
             reasons.append("published_low_contrast_glyph_residue")
     except Exception:
         pass
+
+    # ----- 9. V22 — visible band on a non-white / product-like surface (patch
+    #          plan §Patch 1). A faint band on PURE white background is cosmetic
+    #          (allowed); the same band on grey film / black frame / metallic /
+    #          near-white product is product damage and a HARD fail. This closes
+    #          the V21 leak where a clean_repaired output still carried a visible
+    #          band. The surface record is always attached for diagnostics. -----
+    if v22_patch is not None:
+        try:
+            vb = v22_patch.detect_visible_band_on_nonwhite_surface_v22(
+                original, output, bbox, product_mask, watermark_mask, roi_class)
+            res.v22_visible_band = vb
+            if vb.get("hard_fail"):
+                reasons.append("published_visible_band_on_nonwhite_surface")
+        except Exception:
+            pass
+        # ----- 10. V22 — alpha-footprint partial-glyph residue (patch plan
+        #           §Patch 2). Faint surviving s / m / .com / paired-pit fragments
+        #           inside the SOLVED Sunsky footprint, too weak for OCR / the
+        #           dot-chain check but human-visible. A HARD fail. -------------
+        try:
+            af = v22_patch.detect_alpha_footprint_residue_v22(
+                original, output, bbox, watermark_mask, product_mask)
+            res.v22_alpha_footprint = af
+            if af.get("hard_fail"):
+                reasons.append("published_partial_glyph_residue")
+        except Exception:
+            pass
+        # Surface classification (diagnostics + report surface_class).
+        try:
+            res.v22_surface = v22_patch.classify_surface_v22(
+                original, bbox, product_mask, watermark_mask, roi_class)
+        except Exception:
+            pass
 
     # De-dupe while preserving order.
     seen = set()

@@ -187,6 +187,20 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         v18_telem.update(v21_residue_rec or {})
     except Exception:
         v21_residue = []
+    # V22 — alpha-footprint partial-glyph cleanup beam (patch plan §Patch 3,
+    # rank 3). Runs on the reverse-alpha + v21 bases to strip faint surviving
+    # partial-glyph fragments inside the solved Sunsky footprint. Ranked
+    # immediately AFTER the v21 residue beam; each variant is still audited
+    # authoritatively below (P0 / V17 / V22).
+    v22_residue = []
+    try:
+        v22_residue, v22_residue_rec = \
+            v18_patch.alpha_footprint_residue_cleanup_beam_v22(
+                img, bbox, watermark_mask, product_mask, pctx,
+                list(ra_beam) + list(v21_residue))
+        v18_telem.update(v22_residue_rec or {})
+    except Exception:
+        v22_residue = []
     try:
         v18_telem.update(v18_patch.manifest_routing_fields(
             img, bbox, watermark_mask, product_mask, pctx, ban_destructive))
@@ -285,6 +299,13 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         if v21_img is not None and v21_name not in seen_repair:
             seen_repair.add(v21_name)
             repair_cands.append((v21_name, v21_img))
+    # V22 — alpha-footprint partial-glyph cleanup variants follow the v21 beam
+    # (rank 3, patch plan §Patch 9): same non-destructive recovery, faint
+    # partial-glyph fragments removed inside the solved Sunsky footprint.
+    for v22_name, v22_img in v22_residue:
+        if v22_img is not None and v22_name not in seen_repair:
+            seen_repair.add(v22_name)
+            repair_cands.append((v22_name, v22_img))
     # V19 — single reverse-alpha candidate retained for parity / fallback.
     if ra_img is not None and ra_name not in seen_repair:
         repair_cands.append((ra_name, ra_img))
@@ -362,6 +383,10 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     for v21_name, v21_img in reversed(v21_residue):
         if v21_img is not None:
             cover_cands.insert(0, (v21_name, v21_img))
+    # V22 — alpha-footprint partial-glyph cleanup variants also seed the cover beam.
+    for v22_name, v22_img in reversed(v22_residue):
+        if v22_img is not None:
+            cover_cands.insert(0, (v22_name, v22_img))
     # V18 — destructive full-band / forced-removal / uniform fills are BANNED on
     # any product-overlap or silhouette-contact region (patch plan §1.3, §2): on
     # product pixels they paint exactly the bands/blobs the audit rejects, so

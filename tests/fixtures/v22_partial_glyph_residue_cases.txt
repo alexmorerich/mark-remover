@@ -1,0 +1,9 @@
+# V22 §Patch 10 — regression: clean_repaired surfaces that must show NO partial-
+# glyph residue (faint s / m / .com / paired-pit fragments) after cleaning.
+# Smooth cardboard / grey watch frame / metallic back / near-white plastic tray /
+# coloured battery back cover.
+middle-frame-for-apple-watch-series-5-40mm-grey-8.jpg
+battery-back-cover-for-iphone-12-mini-blue-3.jpg
+back-cover-with-adhesive-for-iphone-xr-red-1.jpg
+glass-battery-back-cover-with-camera-lens-frame-for-iphone-se-2020-red-3.jpg
+sim-card-tray-for-ipad-2-3-4-silver-1.jpg

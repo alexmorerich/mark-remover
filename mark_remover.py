@@ -64,8 +64,8 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V21_PATCH"
-assert PIPELINE_VERSION == "V21_PATCH"
+PIPELINE_VERSION = "V22_PATCH"
+assert PIPELINE_VERSION == "V22_PATCH"
 # V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
 # auto_rejected final state + a post-clean re-detection P0 gate around it, so
 # only gate-passing outputs are ever published. V17 adds the truthful
@@ -4875,7 +4875,7 @@ def write_compare_pdf(out_root, records) -> Path:
 
     cell_w, cell_h, pad = 480, 320, 22
     page_w = pad * 3 + cell_w * 2
-    page_h = pad * 2 + 160 + cell_h + 28
+    page_h = pad * 2 + 168 + cell_h + 28
 
     counts = {s: 0 for s in STATUS_ORDER}
     by_class = {}; by_route = {}; by_mask = {}; by_family = {}
@@ -4923,8 +4923,20 @@ def write_compare_pdf(out_root, records) -> Path:
            f"product-damage={cr_prod}  (all must be 0)",
            font=font_sm,
            fill=("#0a4" if (cr_dot == cr_band == cr_prod == 0) else "#a00"))
+    # V22 — published band-on-non-white / partial-glyph residue leaks (must be 0).
+    pub_recs = [r for r in records if r["status"] in (ST_CLEAN_REPAIRED,
+                                                      ST_CLEAN_COVERED)]
+    v22_band_leak = sum(1 for r in pub_recs
+                        if (r.get("v22_visible_band") or {}).get("hard_fail"))
+    v22_glyph_leak = sum(1 for r in pub_recs
+                         if (r.get("v22_alpha_footprint") or {}).get("hard_fail"))
+    d.text((pad, pad + 72),
+           f"V22: published band-on-non-white={v22_band_leak}  "
+           f"partial-glyph-residue={v22_glyph_leak}  (all must be 0)",
+           font=font_sm,
+           fill=("#0a4" if (v22_band_leak == v22_glyph_leak == 0) else "#a00"))
 
-    y = pad + 80
+    y = pad + 94
     d.text((pad, y), f"total images:   {len(records)}",
            font=font_md, fill="black"); y += 22
     for st, color in [(ST_CLEAN_REPAIRED, "#0a4"),
@@ -5038,7 +5050,29 @@ def write_compare_pdf(out_root, records) -> Path:
                    f"  outside_diff={pi.get('mean_outside_diff',0):.2f}",
                    font=font_sm, fill=pi_color)
 
-        box_y = 160
+        # V22 — surface class + near-fail warning band. If a CLEAN image carries
+        # a near-fail V22 signal (alpha residue / band / product-like surface),
+        # print it in the page header so the compare PDF surfaces marginal cases.
+        v22_vb = r.get("v22_visible_band") or {}
+        v22_af = r.get("v22_alpha_footprint") or {}
+        v22_sc = r.get("v22_surface_class") or (r.get("v22_surface") or {}).get(
+            "surface_class") or "?"
+        v22_pl = r.get("v22_product_like_overlap")
+        if v22_pl is None:
+            v22_pl = (r.get("v22_surface") or {}).get("v22_product_like_overlap", 0)
+        af_s = float(v22_af.get("score", 0.0) or 0.0)
+        vb_s = float(v22_vb.get("score", 0.0) or 0.0)
+        warn = (r["status"] in (ST_CLEAN_REPAIRED, ST_CLEAN_COVERED) and
+                (af_s >= 0.30 or (vb_s >= 0.30 and v22_vb.get("surface_is_nonwhite"))
+                 or float(v22_pl or 0.0) >= 0.40))
+        v22_color = "#a00" if warn else "#777"
+        v22_prefix = "V22 WARN: " if warn else "V22: "
+        d.text((pad, 152),
+               f"{v22_prefix}surface={v22_sc}  alpha_residue={af_s:.2f}  "
+               f"band={vb_s:.2f}  product_like={float(v22_pl or 0.0):.2f}",
+               font=font_sm, fill=v22_color)
+
+        box_y = 168
         # V20 — auto_rejected shows the BEST ATTEMPT (best_attempt.jpg), clearly
         # labelled NOT PUBLISHED so it is never mistaken for a cleaned asset.
         if r["status"] == ST_CLEAN_REPAIRED:

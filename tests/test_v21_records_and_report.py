@@ -14,7 +14,7 @@ import mark_remover  # noqa: E402
 
 
 def test_version_is_v21():
-    assert mark_remover.PIPELINE_VERSION == "V21_PATCH"
+    assert mark_remover.PIPELINE_VERSION == "V22_PATCH"
     assert mark_remover.PATCH_VERSION == "v21"
     # Frozen layers are NOT renamed.
     assert mark_remover.FINAL_VISUAL_GATE_VERSION == "v13"
@@ -99,7 +99,7 @@ def test_report_emits_v21_block_and_stays_clean(tmp_path):
         "residual_explain": {},
     }))
     report = v13_report.build_report(root)
-    assert report["version"] == "V21_PATCH"
+    assert report["version"] == "V22_PATCH"
     assert "v21" in report
     assert report["v21"]["residue_micro_published"] == 1
     assert report["v21"]["logo_fallback_count"] == 1

@@ -59,6 +59,35 @@ V17_MUST_BE_ZERO = [
     "published_low_contrast_glyph_residue",
 ]
 
+# V22 — additional published-output counters that MUST be zero (patch plan
+# §Patch 9). They count published outputs whose ACTUAL bytes failed a V22 audit:
+# a visible band on a non-white / product-like surface, faint partial-glyph
+# residue inside the solved Sunsky footprint, a cover landing on product, or a
+# product-structure change. By construction all are zero (a failed audit forces
+# auto_rejected); CI enforces it.
+V22_MUST_BE_ZERO = [
+    "published_visible_band_on_nonwhite_surface",
+    "published_partial_glyph_residue",
+    "published_alpha_footprint_residue",
+    "published_cover_on_product",
+    "published_product_silhouette_change",
+    "published_protected_text_change",
+    "clean_repaired_with_any_p0_fail",
+    "clean_covered_with_any_p0_fail",
+]
+
+# V22 audit hard-fail reason -> published_* counter.
+_V22_REASON_TO_COUNTER = {
+    "published_visible_band_on_nonwhite_surface":
+        "published_visible_band_on_nonwhite_surface",
+    "published_partial_glyph_residue": "published_partial_glyph_residue",
+}
+# Reasons that, on a clean_covered output, count as a cover landing on product.
+_V22_COVER_ON_PRODUCT_REASONS = frozenset({
+    "visible_patch_on_product", "visible_band_on_product", "wedge_or_slab_shape",
+    "published_visible_band_on_nonwhite_surface",
+})
+
 # V17/V18 audit hard-fail reason -> published_* counter.
 _V17_REASON_TO_COUNTER = {
     "published_residual_watermark": "published_residual_watermark",
@@ -110,6 +139,12 @@ def _iter_records(out_root: Path):
 def build_report(out_root: Path) -> dict:
     must_zero = Counter()
     v17_zero = Counter()
+    v22_zero = Counter()
+    v22_band_blocked = 0
+    v22_glyph_blocked = 0
+    v22_cover_on_product_blocked = 0
+    v22_surface_class = Counter()
+    v22_cleanup_attempted = v22_cleanup_published = 0
     status_counts = Counter()
     methods = set()
     rejected_reasons = Counter()
@@ -158,6 +193,54 @@ def build_report(out_root: Path) -> dict:
     for rec in _iter_records(out_root):
         status = rec.get("status")
         status_counts[status] += 1
+        # V22 — surface-class + cleanup diagnostics (patch plan §Patch 9, §10).
+        scl = rec.get("v22_surface_class") or rec.get("v22_surface", {}).get(
+            "surface_class") or ""
+        if scl:
+            v22_surface_class[scl] += 1
+        v22_cleanup_attempted += int(
+            rec.get("v22_residue_cleanup_attempted", 0) or 0)
+        if str(rec.get("v9_final_method", "")).startswith("v22_residue") and \
+                status in PUBLISHED:
+            v22_cleanup_published += 1
+        # V22 — a published output that retained a V22 hard-fail signal would be a
+        # fatal leak. By construction zero (a failed audit forces auto_rejected).
+        if status in PUBLISHED:
+            hard = [str(r) for r in (rec.get("v17_hard_fail_reasons") or [])]
+            for reason in hard:
+                ctr = _V22_REASON_TO_COUNTER.get(reason)
+                if ctr:
+                    v22_zero[ctr] += 1
+                    if ctr == "published_visible_band_on_nonwhite_surface":
+                        v22_band_blocked += 1
+                    elif ctr == "published_partial_glyph_residue":
+                        v22_glyph_blocked += 1
+            if (rec.get("v22_alpha_footprint") or {}).get("hard_fail"):
+                v22_zero["published_alpha_footprint_residue"] += 1
+            if status == "clean_covered" and any(
+                    r in _V22_COVER_ON_PRODUCT_REASONS for r in hard):
+                v22_zero["published_cover_on_product"] += 1
+            if "changed_product_silhouette" in hard:
+                v22_zero["published_product_silhouette_change"] += 1
+            if "changed_protected_text" in hard:
+                v22_zero["published_protected_text_change"] += 1
+            if hard:
+                if status == "clean_repaired":
+                    v22_zero["clean_repaired_with_any_p0_fail"] += 1
+                elif status == "clean_covered":
+                    v22_zero["clean_covered_with_any_p0_fail"] += 1
+        else:
+            # Rejected outputs: count how many V22 caught (diagnostics only).
+            hard = [str(r) for r in (rec.get("v17_hard_fail_reasons") or [])]
+            reasons_j = " ".join(str(r) for r in (rec.get("reject_reasons") or []))
+            if "visible_band_on_nonwhite_surface" in (
+                    " ".join(hard) + " " + reasons_j):
+                v22_band_blocked += 1
+            if "partial_glyph_residue" in (" ".join(hard) + " " + reasons_j):
+                v22_glyph_blocked += 1
+            if status == "auto_rejected" and any(
+                    r in _V22_COVER_ON_PRODUCT_REASONS for r in hard):
+                v22_cover_on_product_blocked += 1
         # V20 — reverse-alpha variant beam + audit sub-records.
         v20_variants_attempted += int(
             rec.get("reverse_alpha_variants_attempted", 0) or 0)
@@ -300,8 +383,10 @@ def build_report(out_root: Path) -> dict:
     must_zero_d = {k: int(must_zero.get(k, 0)) for k in MUST_BE_ZERO}
     cosmetic_d = {k: int(must_zero.get(k, 0)) for k in COSMETIC_COUNTERS}
     v17_zero_d = {k: int(v17_zero.get(k, 0)) for k in V17_MUST_BE_ZERO}
+    v22_zero_d = {k: int(v22_zero.get(k, 0)) for k in V22_MUST_BE_ZERO}
     all_clean = (all(v == 0 for v in must_zero_d.values()) and
-                 all(v == 0 for v in v17_zero_d.values()))
+                 all(v == 0 for v in v17_zero_d.values()) and
+                 all(v == 0 for v in v22_zero_d.values()))
 
     try:
         import product_text_detector as _ptd
@@ -310,14 +395,14 @@ def build_report(out_root: Path) -> dict:
         ppocr_enabled = False
 
     report = {
-        "version": "V21_PATCH",
-        # V21 (patch plan §Patch 10) — explicit per-layer versions so a regression
-        # comparison can never confuse the state machine, audit and gate. The
-        # frozen gate / state machine / audit versions are UNCHANGED; V21 only
-        # adds safer candidates + diagnostics.
+        "version": "V22_PATCH",
+        # V22 (patch plan §Patch 9, §10) — explicit per-layer versions so a
+        # regression comparison can never confuse the state machine, audit and
+        # gate. The frozen gate / state machine / audit versions are UNCHANGED;
+        # V22 only adds safer candidates + stricter publish blockers.
         "state_machine_version": "v16",
         "final_audit_version": "v17",
-        "patch_version": "v21_safer_reject_recovery",
+        "patch_version": "v22_safety_preserving_recovery",
         "gate_version": "v13_frozen",
         "qa_schema_version": "v13",
         "final_gate_version": "v16",
@@ -337,6 +422,17 @@ def build_report(out_root: Path) -> dict:
         "must_be_zero": must_zero_d,
         # V17 — published truthful-audit failures (must all be zero).
         "v17_published_audit_failures": v17_zero_d,
+        # V22 — published band / partial-glyph / cover-on-product blockers (must
+        # all be zero) + recovery diagnostics (patch plan §Patch 9, §10).
+        "v22_published_audit_failures": v22_zero_d,
+        "v22": {
+            "visible_band_on_nonwhite_blocked": v22_band_blocked,
+            "partial_glyph_residue_blocked": v22_glyph_blocked,
+            "cover_on_product_blocked": v22_cover_on_product_blocked,
+            "residue_cleanup_attempted": v22_cleanup_attempted,
+            "residue_cleanup_published": v22_cleanup_published,
+            "surface_class_breakdown": dict(v22_surface_class),
+        },
         # Cosmetic counters (allowed > 0): a soft seam on a mark-removed,
         # product-safe published output.
         "cosmetic": cosmetic_d,

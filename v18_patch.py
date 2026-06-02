@@ -58,6 +58,12 @@ try:
 except Exception:  # pragma: no cover
     _lama = None
 
+# V22 — low-texture product-surface classification + band/glyph detectors.
+try:
+    import v22_patch
+except Exception:  # pragma: no cover
+    v22_patch = None
+
 
 # ---------------------------------------------------------------------------
 # Routing thresholds (patch plan §2). Kept explicit so product-overlap routing
@@ -98,6 +104,15 @@ class ProductContext:
     # colored / metallic / glass / flex / text / dilated silhouette). Destructive
     # generators are banned whenever ANY of these signals are present.
     product_mask_safe_overlap: float = 0.0
+    # V22 — low-texture product-surface signals the plain mask misses (patch plan
+    # §Patch 4). Populated from v22_patch.classify_surface_v22.
+    connected_component_crosses_bbox: bool = False
+    near_white_product_surface: bool = False
+    translucent_stack_surface: bool = False
+    dark_smooth_product_surface: bool = False
+    long_thin_component_crosses_bbox: bool = False
+    v22_product_like_overlap: float = 0.0
+    v22_surface_class: str = ""
 
     def to_record(self) -> dict:
         return {
@@ -112,6 +127,18 @@ class ProductContext:
             "v18_pure_background_score": round(self.pure_background_score, 4),
             "v20_product_mask_safe_overlap": round(self.product_mask_safe_overlap, 4),
             "v18_roi_class": self.roi_class,
+            # V22 surface classification (patch plan §Patch 4).
+            "v22_connected_component_crosses_bbox":
+                bool(self.connected_component_crosses_bbox),
+            "v22_near_white_product_surface":
+                bool(self.near_white_product_surface),
+            "v22_translucent_stack_surface": bool(self.translucent_stack_surface),
+            "v22_dark_smooth_product_surface":
+                bool(self.dark_smooth_product_surface),
+            "v22_long_thin_component_crosses_bbox":
+                bool(self.long_thin_component_crosses_bbox),
+            "v22_product_like_overlap": round(self.v22_product_like_overlap, 4),
+            "v22_surface_class": self.v22_surface_class,
         }
 
 
@@ -257,6 +284,29 @@ def compute_product_context(image, bbox, product_mask=None, watermark_mask=None,
         ctx.product_mask_safe_overlap = float((sub > 0).mean()) if sub.size else 0.0
     except Exception:
         ctx.product_mask_safe_overlap = ctx.product_overlap
+
+    # V22 — low-texture product-surface classification (patch plan §Patch 4). The
+    # plain product mask misses dark-smooth / near-white / translucent-stack /
+    # thin-flex surfaces; these self-contained signals let candidate generation
+    # know earlier that the region is product-like, so destructive covers are
+    # banned on them (patch plan §Patch 5, §Patch 7).
+    if v22_patch is not None:
+        try:
+            surf = v22_patch.classify_surface_v22(
+                image, bbox, product_mask, watermark_mask, roi_class)
+            ctx.connected_component_crosses_bbox = bool(
+                surf["connected_component_crosses_bbox"])
+            ctx.near_white_product_surface = bool(
+                surf["near_white_product_surface"])
+            ctx.translucent_stack_surface = bool(surf["translucent_stack_surface"])
+            ctx.dark_smooth_product_surface = bool(
+                surf["dark_smooth_product_surface"])
+            ctx.long_thin_component_crosses_bbox = bool(
+                surf["long_thin_component_crosses_bbox"])
+            ctx.v22_product_like_overlap = float(surf["v22_product_like_overlap"])
+            ctx.v22_surface_class = surf["surface_class"]
+        except Exception:
+            pass
     return ctx
 
 
@@ -286,12 +336,19 @@ PRODUCT_MASK_SAFE_BAN = 0.12
 
 def should_ban_destructive(ctx: ProductContext) -> bool:
     """True when full-band / full-bbox / forced-removal fills must NOT run
-    (patch plan §1.3, §2, §Patch 8): any meaningful product overlap, silhouette
-    contact, protected text, or union product-safe-mask coverage.
+    (patch plan §1.3, §2, §Patch 8, §Patch 5/7): any meaningful product overlap,
+    silhouette contact, protected text, union product-safe-mask coverage, OR a
+    V22 low-texture product surface (dark-smooth / translucent-stack / near-white
+    product / thin-flex) the plain mask would miss.
     """
+    v22_product_surface = (
+        ctx.dark_smooth_product_surface or ctx.translucent_stack_surface
+        or (ctx.near_white_product_surface and ctx.connected_component_crosses_bbox)
+        or ctx.long_thin_component_crosses_bbox)
     return (ctx.product_overlap > PRODUCT_OVERLAP_LOW or ctx.touches_silhouette
             or ctx.protected_text_score > 1e-6
-            or ctx.product_mask_safe_overlap > PRODUCT_MASK_SAFE_BAN)
+            or ctx.product_mask_safe_overlap > PRODUCT_MASK_SAFE_BAN
+            or v22_product_surface)
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +944,45 @@ def residue_micro_cleanup_beam(image, bbox, watermark_mask, product_mask,
             out.append((vname, vimg))
     rec["v21_residue_micro_candidates"] = len(out)
     rec["v21_residue_micro_candidate_names"] = [n for n, _ in out]
+    return out, rec
+
+
+def alpha_footprint_residue_cleanup_beam_v22(image, bbox, watermark_mask,
+                                             product_mask, ctx: ProductContext,
+                                             base_candidates):
+    """V22 (patch plan §Patch 3). Broader-but-footprint-capped partial-glyph
+    cleanup. Runs on the reverse-alpha / v21 bases and strips faint surviving
+    s / m / .com fragments inside the solved glyph footprint. Returns
+    ``(candidates, record)``. Every variant still passes the unchanged P0 / V17 /
+    V22 audit downstream — a cleanup that creates a blob or band is rejected
+    there, and an over-large residue is refused (image stays auto_rejected)."""
+    rec = {"v22_residue_cleanup_attempted": 0,
+           "v22_residue_cleanup_candidates": 0,
+           "v22_residue_cleanup_candidate_names": []}
+    if _sra is None or not _sra.alpha_asset_available():
+        return [], rec
+    roi = (ctx.roi_class if ctx is not None else "") or ""
+    bases = [(n, im) for (n, im) in (base_candidates or [])
+             if im is not None and str(n).startswith(
+                 ("v20_reverse_alpha", "v19_sunsky_reverse_alpha",
+                  "v21_reverse_alpha", "v21_residue_micro"))][:3]
+    out, seen = [], set()
+    for bname, bimg in bases:
+        rec["v22_residue_cleanup_attempted"] += 1
+        try:
+            variants = _sra.build_alpha_footprint_residue_cleanup_beam_v22(
+                image, bimg, bbox, watermark_mask=watermark_mask,
+                product_mask=product_mask, roi_class=roi)
+        except Exception:
+            variants = []
+        for vname, vimg in variants:
+            key = vname + "<" + bname
+            if key in seen or vimg is None or vimg.shape != image.shape:
+                continue
+            seen.add(key)
+            out.append((vname, vimg))
+    rec["v22_residue_cleanup_candidates"] = len(out)
+    rec["v22_residue_cleanup_candidate_names"] = [n for n, _ in out]
     return out, rec
 
 
