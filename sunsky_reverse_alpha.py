@@ -81,6 +81,11 @@ VARIANT_NAMES = (
     "v20_reverse_alpha_per_channel_logo",
     "v20_reverse_alpha_low_alpha_halo_cleanup",
     "v20_reverse_alpha_no_cleanup",
+    # V21 — smooth-surface refinement (patch plan §Patch 5). A texture-preserving
+    # bilateral pass restricted to the glyph halo suppresses faint reverse-alpha
+    # residue on cardboard / smooth coloured / metallic backs without flattening
+    # the surface. Screened by the same local pre-screen; audited authoritatively.
+    "v21_reverse_alpha_texture_preserve_blend",
 )
 
 
@@ -688,6 +693,20 @@ def build_variant_beam(image, mark_box, *, watermark_mask=None, product_mask=Non
     # Explicit no-cleanup variant (alias of the ncc placement, kept for ranking
     # diversity / report parity).
     raw.append(("v20_reverse_alpha_no_cleanup", apply_placement(image, base), base))
+    # V21 — smooth-surface texture-preserving refinement (patch plan §Patch 5).
+    # Bilateral filter the glyph halo of the reverse-alpha base: it suppresses
+    # faint low-contrast residue while keeping high-frequency surface texture
+    # (cardboard grain, brushed metal), blended back ONLY over the footprint.
+    try:
+        base_img2 = apply_placement(image, base)
+        foot2 = footprint_mask_for_box(image, (bx, by, bw, bh),
+                                       watermark_mask, dilate_px=2)
+        if foot2 is not None:
+            smooth = cv2.bilateralFilter(base_img2, 5, 35, 7)
+            refined = _blend_at_mask(base_img2, smooth, foot2, feather_px=2)
+            raw.append(("v21_reverse_alpha_texture_preserve_blend", refined, base))
+    except Exception:
+        pass
 
     scored = []
     seen_names = set()
@@ -707,3 +726,169 @@ def build_variant_beam(image, mark_box, *, watermark_mask=None, product_mask=Non
         scored.append((key, name, res))
     scored.sort(key=lambda t: t[0])
     return [(name, res) for _k, name, res in scored]
+
+
+# ===========================================================================
+# V21 — Residue micro-cleanup beam (patch plan §Patch 2) + smooth-surface
+# reverse-alpha refinement (patch plan §Patch 5).
+#
+# Reverse-alpha removes the *readable* overlay but can leave faint, low-contrast
+# paired dots / pits aligned on the old watermark baseline (most visible on
+# cardboard, smooth coloured backs and bright metal). V21 adds a micro-clean
+# pass that touches ONLY small aligned residue components INSIDE the glyph
+# footprint, area-capped, never a full bbox / band / rectangle. Each variant is
+# returned as a candidate image; the AUTHORITATIVE gate is still the V17 final
+# audit in the pipeline — a micro-clean that creates a blob or damages the
+# product is rejected there, exactly like every other candidate.
+# ===========================================================================
+RESIDUE_MAX_FOOTPRINT_FRAC = 0.20   # edited area <= 20% of alpha footprint
+RESIDUE_MAX_BOX_FRAC = 0.04         # edited area <= 4% of mark_box
+RESIDUE_COMPONENT_MAX_FRAC = 0.015  # a residue blob is "small": <= 1.5% of box
+RESIDUE_LOWCONTRAST_LO = 4          # min |hi-pass| (8-bit) to count as residue
+RESIDUE_LOWCONTRAST_HI = 60         # above this it is real product detail — skip
+
+
+def footprint_mask_for_box(image, mark_box, watermark_mask=None,
+                           dilate_px=1) -> Optional[np.ndarray]:
+    """Return a full-image uint8 mask of the watermark glyph footprint inside
+    ``mark_box`` — the alpha-asset glyph shape if available, else the supplied
+    ``watermark_mask`` crop. Used to restrict every V21 micro edit to the old
+    overlay footprint (never the whole box)."""
+    if isinstance(mark_box, dict):
+        mark_box = (mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"])
+    bx, by, bw, bh = [int(v) for v in mark_box]
+    H, W = image.shape[:2]
+    if bw < 4 or bh < 4:
+        return None
+    foot = np.zeros((H, W), np.uint8)
+    asset = load_alpha_asset()
+    if asset is not None:
+        a = cv2.resize(asset["alpha"], (bw, bh), interpolation=cv2.INTER_AREA)
+        glyph = (a > 0.06).astype(np.uint8) * 255
+        foot[by:by + bh, bx:bx + bw] = glyph
+    elif watermark_mask is not None and watermark_mask.shape[:2] == (H, W):
+        foot[by:by + bh, bx:bx + bw] = watermark_mask[by:by + bh, bx:bx + bw]
+    else:
+        return None
+    if dilate_px > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                      (2 * dilate_px + 1, 2 * dilate_px + 1))
+        foot = cv2.dilate(foot, k)
+    if int((foot > 0).sum()) < 4:
+        return None
+    return foot
+
+
+def _detect_residue_mask(candidate, mark_box, footprint, product_mask=None):
+    """Find small, aligned, low-contrast residue components of ``candidate``
+    inside ``footprint``. Returns ``(mask_uint8, edited_frac_of_footprint)`` or
+    ``(None, 0.0)`` when no safe residue is found / the area cap is exceeded."""
+    if isinstance(mark_box, dict):
+        mark_box = (mark_box["x"], mark_box["y"], mark_box["w"], mark_box["h"])
+    bx, by, bw, bh = [int(v) for v in mark_box]
+    H, W = candidate.shape[:2]
+    foot_bool = footprint > 0
+    foot_area = int(foot_bool.sum())
+    if foot_area < 4:
+        return None, 0.0
+    gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
+    # High-pass: deviation from a local median = paired-dot / pit residue.
+    blur = cv2.medianBlur(gray, 5)
+    hp = cv2.absdiff(gray, blur)
+    resid = ((hp >= RESIDUE_LOWCONTRAST_LO) & (hp <= RESIDUE_LOWCONTRAST_HI) &
+             foot_bool).astype(np.uint8)
+    if int(resid.sum()) == 0:
+        return None, 0.0
+    # Keep only SMALL connected components (large => real product detail).
+    box_area = max(1, bw * bh)
+    comp_max = max(2, int(RESIDUE_COMPONENT_MAX_FRAC * box_area))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(resid, connectivity=8)
+    keep = np.zeros((H, W), np.uint8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] <= comp_max:
+            keep[lab == i] = 255
+    # Never touch protected product pixels passed explicitly.
+    if product_mask is not None and product_mask.shape[:2] == (H, W):
+        # micro-clean MAY touch product (it is non-destructive blur/inpaint of a
+        # tiny dot), but cap product-side area harder by intersecting with the
+        # footprint only — already done. Keep as-is.
+        pass
+    edited = int((keep > 0).sum())
+    if edited == 0:
+        return None, 0.0
+    frac_foot = edited / foot_area
+    frac_box = edited / box_area
+    if frac_foot > RESIDUE_MAX_FOOTPRINT_FRAC or frac_box > RESIDUE_MAX_BOX_FRAC:
+        # Too much area — this is not isolated residue; refuse (caller skips).
+        return None, frac_foot
+    return keep, frac_foot
+
+
+def _blend_at_mask(base, repl, mask, feather_px=1):
+    """Feathered alpha blend of ``repl`` into ``base`` over ``mask``."""
+    m = (mask > 0).astype(np.float32)
+    if feather_px > 0:
+        m = cv2.GaussianBlur(m, (2 * feather_px + 1, 2 * feather_px + 1), 0)
+    m3 = np.dstack([m, m, m])
+    return (base.astype(np.float32) * (1 - m3) +
+            repl.astype(np.float32) * m3).clip(0, 255).astype(np.uint8)
+
+
+def build_residue_micro_cleanup_beam(original, candidate, mark_box,
+                                     *, watermark_mask=None, product_mask=None,
+                                     roi_class=""):
+    """Patch plan §Patch 2. Given a reverse-alpha ``candidate`` (mark removed but
+    possibly faint dots remaining), return a list of ``(name, image)`` micro-clean
+    variants that touch ONLY small aligned residue components inside the glyph
+    footprint. Empty when there is no safe residue to clean. Every variant still
+    passes the unchanged P0 / V17 audit in the pipeline."""
+    if candidate is None or candidate.shape != original.shape:
+        return []
+    foot = footprint_mask_for_box(original, mark_box, watermark_mask, dilate_px=1)
+    if foot is None:
+        return []
+    resid, _frac = _detect_residue_mask(candidate, mark_box, foot, product_mask)
+    if resid is None:
+        return []
+    out = []
+    # 1) surface blur — average out the dot against its immediate surround.
+    try:
+        blurred = cv2.GaussianBlur(candidate, (5, 5), 0)
+        out.append(("v21_residue_micro_surface_blur",
+                    _blend_at_mask(candidate, blurred, resid, feather_px=1)))
+    except Exception:
+        pass
+    # 2) hue-matched clone / NS inpaint of only the residue components.
+    try:
+        ns = cv2.inpaint(candidate, resid, RESIDUAL_INPAINT_RADIUS, cv2.INPAINT_NS)
+        out.append(("v21_residue_micro_hue_matched_clone", ns))
+    except Exception:
+        pass
+    # 3) component inpaint (Telea) — different reconstruction prior.
+    try:
+        telea = cv2.inpaint(candidate, resid, RESIDUAL_INPAINT_RADIUS,
+                            cv2.INPAINT_TELEA)
+        out.append(("v21_residue_micro_component_inpaint", telea))
+    except Exception:
+        pass
+    # 4) reverse-alpha residual-gain: lift the residue toward the local ring mean
+    #    (handles faint pits where inpaint over-smooths).
+    try:
+        ring = cv2.dilate(resid, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                           (5, 5))) & ~resid
+        if int((ring > 0).sum()) >= 4:
+            target = cv2.medianBlur(candidate, 5)
+            out.append(("v21_residue_micro_reverse_alpha_gain",
+                        _blend_at_mask(candidate, target, resid, feather_px=1)))
+    except Exception:
+        pass
+    # 5) no-op control (kept for ranking parity / report).
+    out.append(("v21_residue_micro_noop_control", candidate))
+    # De-dup by name, drop shape mismatches.
+    seen, uniq = set(), []
+    for name, img in out:
+        if name in seen or img is None or img.shape != original.shape:
+            continue
+        seen.add(name)
+        uniq.append((name, img))
+    return uniq

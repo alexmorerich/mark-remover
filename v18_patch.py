@@ -845,6 +845,51 @@ def reverse_alpha_variant_beam(image, bbox, watermark_mask, product_mask,
     return cands, rec
 
 
+def residue_micro_cleanup_beam(image, bbox, watermark_mask, product_mask,
+                               ctx: ProductContext, base_candidates):
+    """V21 (patch plan §Patch 2). Given the already-built reverse-alpha repair
+    candidates (``base_candidates`` = list of ``(name, image)``), generate
+    residue micro-cleanup variants that touch ONLY small aligned residue
+    components inside the glyph footprint. Returns ``(candidates, record)``.
+
+    The micro-clean operates on the *reverse-alpha output*, not the original, so
+    it removes faint paired-dot / ghost residue the overlay subtraction left
+    behind. Every variant still passes the unchanged P0 / V17 audit downstream —
+    a micro-clean that creates a blob or damages product is rejected there."""
+    rec = {"v21_residue_micro_attempted": 0,
+           "v21_residue_micro_candidates": 0,
+           "v21_residue_micro_candidate_names": []}
+    if _sra is None or not _sra.alpha_asset_available():
+        return [], rec
+    roi = (ctx.roi_class if ctx is not None else "") or ""
+    # Only the top reverse-alpha bases are worth micro-cleaning (the cleanest
+    # placements); cap to 2 to keep the beam small and deterministic.
+    bases = [(n, im) for (n, im) in (base_candidates or [])
+             if im is not None and str(n).startswith(
+                 ("v20_reverse_alpha", "v19_sunsky_reverse_alpha",
+                  "v21_reverse_alpha"))][:2]
+    out, seen = [], set()
+    for bname, bimg in bases:
+        rec["v21_residue_micro_attempted"] += 1
+        try:
+            variants = _sra.build_residue_micro_cleanup_beam(
+                image, bimg, bbox, watermark_mask=watermark_mask,
+                product_mask=product_mask, roi_class=roi)
+        except Exception:
+            variants = []
+        for vname, vimg in variants:
+            if vname.endswith("noop_control"):
+                continue   # the base itself is already in the beam
+            key = vname + "<" + bname
+            if key in seen or vimg is None or vimg.shape != image.shape:
+                continue
+            seen.add(key)
+            out.append((vname, vimg))
+    rec["v21_residue_micro_candidates"] = len(out)
+    rec["v21_residue_micro_candidate_names"] = [n for n, _ in out]
+    return out, rec
+
+
 def lama_stroke_candidate(image, bbox, watermark_mask, product_mask,
                           ctx: ProductContext):
     """Optional CPU LaMA-ONNX stroke-only candidate (patch plan §1.6). Returns
@@ -866,6 +911,143 @@ def lama_stroke_candidate(image, bbox, watermark_mask, product_mask,
             protected_text_overlap=ptext)
     except Exception:
         return None
+
+
+_V21_DAMAGE_TOKENS = ("product_damage", "silhouette", "dark_surface",
+                      "metallic", "protected_text")
+_V21_COVER_TOKENS = ("visible_patch", "visible_band", "wedge", "slab", "cover")
+_V21_SMOOTH_ROI = ("metallic_or_reflective", "glass_or_gradient",
+                   "simple_product_surface", "dark_product_surface",
+                   "low_texture_background", "transparent_or_glossy")
+
+
+def build_v21_records(rec: dict, status: str) -> dict:
+    """V21 (patch plan §1, §6, §8). Derive the additive failure-taxonomy,
+    mask-quality and residual-explain records from signals already present on
+    ``rec``. Pure post-processing — changes no decision, only diagnostics, so it
+    can never alter what is published. Returns a dict of new qa.json keys."""
+    rexp = rec.get("residual_explain") or {}
+    hard = [str(r) for r in (rec.get("v17_hard_fail_reasons") or [])]
+    reasons = " ".join(str(r) for r in (rec.get("reject_reasons") or []))
+    hjoined = " ".join(hard)
+    roi = (rec.get("v18_roi_class") or rec.get("v9_roi_class") or "")
+    overlap = float(rec.get("v18_product_overlap", 0.0) or 0.0)
+    pure_bg = float(rec.get("v18_pure_background_score", 0.0) or 0.0)
+    touches = bool(rec.get("v18_touches_silhouette"))
+    ocr_pos = bool(rexp.get("ocr_positive"))
+    dot_pos = bool(rexp.get("dot_chain_positive"))
+    glyph_pos = bool(rexp.get("low_contrast_glyph_positive"))
+    template_pos = bool(rexp.get("template_positive"))
+    fp_suspect = bool(rexp.get("possible_product_structure_false_positive"))
+
+    # residual_kind
+    if ocr_pos:
+        residual_kind = "readable_text"
+    elif dot_pos:
+        residual_kind = "dot_chain"
+    elif glyph_pos:
+        residual_kind = "low_contrast_ghost"
+    elif template_pos and fp_suspect:
+        residual_kind = "template_only"
+    else:
+        residual_kind = "none"
+
+    # changed_region_kind
+    if touches:
+        changed_region_kind = "silhouette_touching"
+    elif overlap > PRODUCT_OVERLAP_MID:
+        changed_region_kind = "product"
+    elif pure_bg >= PURE_BACKGROUND_SCORE_MIN and overlap < PRODUCT_OVERLAP_LOW:
+        changed_region_kind = "pure_background"
+    elif overlap >= PRODUCT_OVERLAP_LOW:
+        changed_region_kind = "mixed"
+    else:
+        changed_region_kind = "unknown"
+
+    # primary_reject_class (only meaningful when auto_rejected)
+    if residual_kind in ("readable_text", "dot_chain", "low_contrast_ghost"):
+        primary = "true_residual"
+    elif "thin_flex" in hjoined or "flex" in reasons:
+        primary = "thin_flex_break"
+    elif "protected_text" in hjoined:
+        primary = "protected_text_risk"
+    elif any(t in hjoined or t in reasons for t in _V21_COVER_TOKENS):
+        primary = "cover_artifact"
+    elif any(t in hjoined or t in reasons for t in _V21_DAMAGE_TOKENS):
+        primary = "product_damage"
+    elif fp_suspect:
+        primary = "detector_false_positive_suspect"
+    elif int(rec.get("v18_n_safe_candidates", 0) or 0) == 0:
+        primary = "no_safe_candidate"
+    else:
+        primary = "mask_uncertain"
+
+    # recommended_next_candidate
+    if residual_kind in ("dot_chain", "low_contrast_ghost"):
+        nxt = "residue_micro_clean"
+    elif changed_region_kind == "mixed":
+        nxt = "mixed_roi_split_v2"
+    elif roi == "thin_flex_cable":
+        nxt = "thin_flex_line_preserve_v2"
+    elif roi in _V21_SMOOTH_ROI:
+        nxt = "surface_reverse_alpha_refine"
+    else:
+        nxt = "none"
+
+    # mask source mapping
+    mt = str(rec.get("mask_type", "") or "")
+    if "logo_fallback" in mt or mt == "logo":
+        mask_source = "logo_fallback"
+    elif "alpha_stroke" in mt:
+        mask_source = "alpha_stroke_intersection"
+    elif "alpha" in mt:
+        mask_source = "alpha_ncc"
+    elif "stroke" in mt:
+        mask_source = "stroke"
+    else:
+        mask_source = mt or "unknown"
+
+    method = str(rec.get("v9_final_method", "") or "")
+    micro_attempted = int(rec.get("v21_residue_micro_attempted", 0) or 0) > 0
+    if method.startswith("v21_residue_micro") and \
+            status in ("clean_repaired", "clean_covered"):
+        micro_result = "passed"
+    elif micro_attempted:
+        micro_result = "failed"
+    else:
+        micro_result = "not_applicable"
+
+    return {
+        "v21_failure_taxonomy": {
+            "primary_reject_class": primary if status == "auto_rejected"
+            else "published",
+            "residual_kind": residual_kind,
+            "changed_region_kind": changed_region_kind,
+            "recommended_next_candidate": nxt,
+        },
+        "v21_mask_quality": {
+            "mask_source": mask_source,
+            "alpha_ncc_score": round(float(
+                rec.get("reverse_alpha_ncc", 0.0) or 0.0), 4),
+            "stroke_coverage": round(float(
+                rec.get("stroke_mask_confidence", 0.0) or 0.0), 4),
+            "fallback_reason": "product_overlap" if (
+                mask_source == "logo_fallback" and overlap > PRODUCT_OVERLAP_LOW)
+            else "",
+            "mask_product_overlap": round(overlap, 4),
+        },
+        "v21_residual_explain": {
+            "authoritative_residual": (
+                "ocr" if ocr_pos else "dot_chain" if dot_pos
+                else "ghost_dot" if glyph_pos
+                else "template_only" if template_pos else "none"),
+            "template_only_suspect": fp_suspect,
+            "on_product": bool(overlap > PRODUCT_OVERLAP_LOW),
+            "on_background": bool(pure_bg >= PURE_BACKGROUND_SCORE_MIN),
+            "micro_cleanup_attempted": micro_attempted,
+            "micro_cleanup_result": micro_result,
+        },
+    }
 
 
 def manifest_routing_fields(image, bbox, watermark_mask, product_mask,

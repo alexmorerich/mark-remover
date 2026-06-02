@@ -146,6 +146,14 @@ def build_report(out_root: Path) -> dict:
     _DAMAGE_TOKENS = ("product_damage", "silhouette", "flex", "dark_surface",
                       "metallic", "protected_text", "thin_flex")
     _COVER_TOKENS = ("visible_patch", "visible_band", "wedge", "slab", "cover")
+    # V21 — safer reject-recovery diagnostics (patch plan §Patch 10).
+    v21_residue_attempted = v21_residue_published = 0
+    v21_residue_rejected_by_audit = 0
+    v21_smooth_surface_published = 0
+    v21_logo_fallback_count = v21_alpha_ncc_mask_count = v21_stroke_mask_count = 0
+    v21_repairable_rejects_remaining = 0
+    v21_reject_class = Counter()
+    v21_recommended_next = Counter()
 
     for rec in _iter_records(out_root):
         status = rec.get("status")
@@ -178,6 +186,34 @@ def build_report(out_root: Path) -> dict:
                 v20_rej_product_damage += 1
             else:
                 v20_rej_uncertain += 1
+        # V21 — safer reject-recovery diagnostics (patch plan §Patch 10).
+        v21_residue_attempted += int(
+            rec.get("v21_residue_micro_attempted", 0) or 0)
+        v21_method = str(rec.get("v9_final_method", "") or "")
+        if v21_method.startswith("v21_residue_micro") and status in PUBLISHED:
+            v21_residue_published += 1
+        if v21_method.startswith("v21_reverse_alpha_texture_preserve") and \
+                status in PUBLISHED:
+            v21_smooth_surface_published += 1
+        v21_mq = rec.get("v21_mask_quality") or {}
+        msrc = v21_mq.get("mask_source")
+        if msrc == "logo_fallback":
+            v21_logo_fallback_count += 1
+        elif msrc == "alpha_ncc":
+            v21_alpha_ncc_mask_count += 1
+        elif msrc in ("stroke", "alpha_stroke_intersection"):
+            v21_stroke_mask_count += 1
+        v21_tax = rec.get("v21_failure_taxonomy") or {}
+        if status == "auto_rejected":
+            v21_reject_class[v21_tax.get("primary_reject_class") or "unknown"] += 1
+            nxt = v21_tax.get("recommended_next_candidate") or "none"
+            v21_recommended_next[nxt] += 1
+            # A reject the taxonomy thinks a safer candidate could still fix.
+            if nxt and nxt != "none" and v21_tax.get(
+                    "primary_reject_class") != "true_residual":
+                v21_repairable_rejects_remaining += 1
+            if rec.get("v21_residue_micro_attempted"):
+                v21_residue_rejected_by_audit += 1
         # V19 — reverse-alpha telemetry (present on every record once wired).
         if rec.get("reverse_alpha_attempted"):
             ra_attempted += 1
@@ -274,12 +310,14 @@ def build_report(out_root: Path) -> dict:
         ppocr_enabled = False
 
     report = {
-        "version": "V20_PATCH",
-        # V20 (patch plan §Patch 10) — explicit per-layer versions so a regression
-        # comparison can never confuse the state machine, audit and gate.
+        "version": "V21_PATCH",
+        # V21 (patch plan §Patch 10) — explicit per-layer versions so a regression
+        # comparison can never confuse the state machine, audit and gate. The
+        # frozen gate / state machine / audit versions are UNCHANGED; V21 only
+        # adds safer candidates + diagnostics.
         "state_machine_version": "v16",
         "final_audit_version": "v17",
-        "patch_version": "v20_safer_reverse_alpha",
+        "patch_version": "v21_safer_reject_recovery",
         "gate_version": "v13_frozen",
         "qa_schema_version": "v13",
         "final_gate_version": "v16",
@@ -350,6 +388,19 @@ def build_report(out_root: Path) -> dict:
             "auto_rejected_product_damage": v20_rej_product_damage,
             "auto_rejected_cover_artifact": v20_rej_cover_artifact,
             "auto_rejected_uncertain": v20_rej_uncertain,
+        },
+        # V21 — safer reject-recovery diagnostics (patch plan §Patch 10).
+        "v21": {
+            "residue_micro_attempted": v21_residue_attempted,
+            "residue_micro_published": v21_residue_published,
+            "residue_micro_rejected_by_final_audit": v21_residue_rejected_by_audit,
+            "smooth_surface_refine_published": v21_smooth_surface_published,
+            "logo_fallback_count": v21_logo_fallback_count,
+            "alpha_ncc_mask_count": v21_alpha_ncc_mask_count,
+            "stroke_mask_count": v21_stroke_mask_count,
+            "repairable_rejects_remaining": v21_repairable_rejects_remaining,
+            "reject_class_breakdown": dict(v21_reject_class),
+            "recommended_next_candidate_breakdown": dict(v21_recommended_next),
         },
         # V19 — product-text protection (patch plan §1.7).
         "text_protection": {

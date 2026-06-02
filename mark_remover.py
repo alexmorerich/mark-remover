@@ -64,8 +64,8 @@ DEFAULT_OUT = Path("output")
 # all carry this exact string so a run can never claim a version other than
 # the code that produced it (Phase J).
 # ---------------------------------------------------------------------------
-PIPELINE_VERSION = "V20_PATCH"
-assert PIPELINE_VERSION == "V20_PATCH"
+PIPELINE_VERSION = "V21_PATCH"
+assert PIPELINE_VERSION == "V21_PATCH"
 # V14/V15/V16 keep the V13 final visual gate unchanged; V16 adds the
 # auto_rejected final state + a post-clean re-detection P0 gate around it, so
 # only gate-passing outputs are ever published. V17 adds the truthful
@@ -75,7 +75,12 @@ assert PIPELINE_VERSION == "V20_PATCH"
 FINAL_VISUAL_GATE_VERSION = "v13"
 STATE_MACHINE_VERSION = "v16"
 FINAL_AUDIT_VERSION = "v17"
-PATCH_VERSION = "v18"
+# V21 — adds safer reject-recovery candidates (residue micro-cleanup beam,
+# smooth-surface reverse-alpha refinement) + reject taxonomy / mask-quality /
+# residual-explain records. The frozen V13 visual gate, V16 state machine and
+# V17 final audit are UNCHANGED; V21 only widens the safe-candidate set before
+# the audit, so it cannot publish an output the audit would reject.
+PATCH_VERSION = "v21"
 
 
 def _git_commit() -> str:
@@ -4238,6 +4243,14 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
             "silhouette_damage_score": float(sc.get("contour_break", 0.0)),
             "glyph_residue_score": rec.get("v18_glyph_residue_score", 0.0),
         }
+
+    # --- V21 — additive failure-taxonomy / mask-quality / residual-explain
+    # records (patch plan §1, §6, §8). Pure post-processing of signals already
+    # on ``rec`` — it changes no decision and never alters what is published. ---
+    try:
+        rec.update(v18_patch.build_v21_records(rec, status))
+    except Exception:
+        pass
 
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,

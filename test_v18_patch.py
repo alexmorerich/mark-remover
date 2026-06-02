@@ -217,8 +217,8 @@ def test_report_carries_v18_versions_and_taxonomy(tmp_path):
         },
     }))
     rep = v13_report.build_report(tmp_path)
-    assert rep["version"] == "V20_PATCH"
-    assert rep["patch_version"] == "v20_safer_reverse_alpha"
+    assert rep["version"] == "V21_PATCH"
+    assert rep["patch_version"] == "v21_safer_reject_recovery"
     assert rep["state_machine_version"] == "v16"
     assert rep["gate_version"] == "v13_frozen"
     assert rep["auto_rejected_by_roi_class"]["dark_product_surface"] == 1

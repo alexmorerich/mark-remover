@@ -175,6 +175,18 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         v18_telem.update(ra_beam_rec or {})
     except Exception:
         ra_beam = []
+    # V21 — residue micro-cleanup beam (patch plan §Patch 2). Runs on the
+    # reverse-alpha outputs to strip faint paired-dot / ghost residue left after
+    # overlay subtraction, touching only small aligned components inside the
+    # glyph footprint. Ranked immediately AFTER the reverse-alpha beam (patch
+    # plan §Patch 9). Each variant is still audited authoritatively below.
+    v21_residue = []
+    try:
+        v21_residue, v21_residue_rec = v18_patch.residue_micro_cleanup_beam(
+            img, bbox, watermark_mask, product_mask, pctx, ra_beam)
+        v18_telem.update(v21_residue_rec or {})
+    except Exception:
+        v21_residue = []
     try:
         v18_telem.update(v18_patch.manifest_routing_fields(
             img, bbox, watermark_mask, product_mask, pctx, ban_destructive))
@@ -267,6 +279,12 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
         if v20_img is not None and v20_name not in seen_repair:
             seen_repair.add(v20_name)
             repair_cands.append((v20_name, v20_img))
+    # V21 — residue micro-cleanup variants follow the reverse-alpha beam (rank 2,
+    # patch plan §Patch 9): same non-destructive recovery, faint residue removed.
+    for v21_name, v21_img in v21_residue:
+        if v21_img is not None and v21_name not in seen_repair:
+            seen_repair.add(v21_name)
+            repair_cands.append((v21_name, v21_img))
     # V19 — single reverse-alpha candidate retained for parity / fallback.
     if ra_img is not None and ra_name not in seen_repair:
         repair_cands.append((ra_name, ra_img))
@@ -340,6 +358,10 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     for v20_name, v20_img in reversed(ra_beam):
         if v20_img is not None:
             cover_cands.insert(0, (v20_name, v20_img))
+    # V21 — residue micro-cleanup variants also seed the cover beam.
+    for v21_name, v21_img in reversed(v21_residue):
+        if v21_img is not None:
+            cover_cands.insert(0, (v21_name, v21_img))
     # V18 — destructive full-band / forced-removal / uniform fills are BANNED on
     # any product-overlap or silhouette-contact region (patch plan §1.3, §2): on
     # product pixels they paint exactly the bands/blobs the audit rejects, so

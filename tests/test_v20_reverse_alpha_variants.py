@@ -32,7 +32,7 @@ def _white_with_overlay():
 
 
 def test_variant_names_are_stable_and_deterministic():
-    assert len(ra.VARIANT_NAMES) == 7
+    assert len(ra.VARIANT_NAMES) == 8
     img, box = _white_with_overlay()
     if box is None:
         return
