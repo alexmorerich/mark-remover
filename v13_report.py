@@ -88,6 +88,39 @@ _V22_COVER_ON_PRODUCT_REASONS = frozenset({
     "published_visible_band_on_nonwhite_surface",
 })
 
+# V23 — acceptance counters (patch plan §14). All must be zero to accept V23.
+V23_MUST_BE_ZERO = [
+    "published_residual_watermark",
+    "published_dot_chain",
+    "published_low_contrast_glyph_residue",
+    "published_partial_glyph_residue",
+    "published_visible_band_on_nonwhite_surface",
+    "published_cover_on_product",
+    "published_product_damage",
+    "published_silhouette_damage",
+    "published_protected_text_damage",
+    "auto_rejected_cleaned_jpg_leak",
+]
+
+# V23 audit hard-fail reason -> published_* counter (a superset of V17 + V22).
+_V23_REASON_TO_COUNTER = {
+    "published_residual_watermark": "published_residual_watermark",
+    "published_dot_chain": "published_dot_chain",
+    "published_low_contrast_glyph_residue":
+        "published_low_contrast_glyph_residue",
+    "published_partial_glyph_residue": "published_partial_glyph_residue",
+    "published_visible_band_on_nonwhite_surface":
+        "published_visible_band_on_nonwhite_surface",
+    "visible_patch_on_product": "published_cover_on_product",
+    "visible_band_on_product": "published_cover_on_product",
+    "wedge_or_slab_shape": "published_cover_on_product",
+    "changed_product_silhouette": "published_silhouette_damage",
+    "changed_protected_text": "published_protected_text_damage",
+    "changed_thin_flex_structure": "published_product_damage",
+    "changed_dark_surface_blob": "published_product_damage",
+    "changed_metallic_surface_block": "published_product_damage",
+}
+
 # V17/V18 audit hard-fail reason -> published_* counter.
 _V17_REASON_TO_COUNTER = {
     "published_residual_watermark": "published_residual_watermark",
@@ -189,6 +222,18 @@ def build_report(out_root: Path) -> dict:
     v21_repairable_rejects_remaining = 0
     v21_reject_class = Counter()
     v21_recommended_next = Counter()
+    # V23 — sharper reject taxonomy aggregation (patch plan §Patch 1).
+    v23_reject_buckets = Counter()
+    v23_rejects_by_roi_class = Counter()
+    v23_rejects_by_mask_type = Counter()
+    v23_candidate_failures_by_gate = Counter()
+    v23_candidate_starvation_cases = 0
+    v23_logo_fallback_on_product_cases = 0
+    v23_mixed_surface_cases = 0
+    v23_thin_flex_cases = 0
+    v23_smooth_surface_residue_cases = 0
+    v23_published_via_v23_candidate = 0
+    v23_must_zero = Counter()
 
     for rec in _iter_records(out_root):
         status = rec.get("status")
@@ -297,6 +342,39 @@ def build_report(out_root: Path) -> dict:
                 v21_repairable_rejects_remaining += 1
             if rec.get("v21_residue_micro_attempted"):
                 v21_residue_rejected_by_audit += 1
+        # V23 — sharper reject taxonomy aggregation (patch plan §Patch 1).
+        v23_method = str(rec.get("v9_final_method", "") or "")
+        if status in PUBLISHED and v23_method.startswith("v23"):
+            v23_published_via_v23_candidate += 1
+        v23_tax = rec.get("v23_reject_taxonomy") or {}
+        if status == "auto_rejected" and v23_tax:
+            bucket = v23_tax.get("bucket") or "unknown_safe_reject"
+            v23_reject_buckets[bucket] += 1
+            v23_rejects_by_roi_class[v23_tax.get("roi_class") or "unknown"] += 1
+            v23_rejects_by_mask_type[v23_tax.get("mask_type") or "unknown"] += 1
+            v23_candidate_failures_by_gate[
+                v23_tax.get("top_failed_gate") or "none"] += 1
+            if int(v23_tax.get("safe_candidate_count", 0) or 0) == 0:
+                v23_candidate_starvation_cases += 1
+            mt = str(v23_tax.get("mask_type") or "")
+            if "logo_fallback" in mt and float(
+                    v23_tax.get("product_like_overlap", 0.0) or 0.0) > 0.03:
+                v23_logo_fallback_on_product_cases += 1
+            if bucket == "mixed_product_background_starved":
+                v23_mixed_surface_cases += 1
+            if bucket == "thin_flex_continuity_risk":
+                v23_thin_flex_cases += 1
+            if bucket in ("residual_after_reverse_alpha", "partial_glyph_residue",
+                          "dark_surface_blob_risk", "metallic_gradient_flattening"):
+                v23_smooth_surface_residue_cases += 1
+        # V23 — the same must-be-zero published-safety counters, keyed by V23
+        # names, so the V23 acceptance gate can be read straight from the report.
+        if status in PUBLISHED:
+            _hard23 = [str(r) for r in (rec.get("v17_hard_fail_reasons") or [])]
+            for r in _hard23:
+                c = _V23_REASON_TO_COUNTER.get(r)
+                if c:
+                    v23_must_zero[c] += 1
         # V19 — reverse-alpha telemetry (present on every record once wired).
         if rec.get("reverse_alpha_attempted"):
             ra_attempted += 1
@@ -384,9 +462,13 @@ def build_report(out_root: Path) -> dict:
     cosmetic_d = {k: int(must_zero.get(k, 0)) for k in COSMETIC_COUNTERS}
     v17_zero_d = {k: int(v17_zero.get(k, 0)) for k in V17_MUST_BE_ZERO}
     v22_zero_d = {k: int(v22_zero.get(k, 0)) for k in V22_MUST_BE_ZERO}
+    # V23 — acceptance counters (patch plan §14). cleaned.jpg leak is filled in
+    # by main() after a filesystem scan; default 0 here.
+    v23_zero_d = {k: int(v23_must_zero.get(k, 0)) for k in V23_MUST_BE_ZERO}
     all_clean = (all(v == 0 for v in must_zero_d.values()) and
                  all(v == 0 for v in v17_zero_d.values()) and
-                 all(v == 0 for v in v22_zero_d.values()))
+                 all(v == 0 for v in v22_zero_d.values()) and
+                 all(v == 0 for v in v23_zero_d.values()))
 
     try:
         import product_text_detector as _ptd
@@ -432,6 +514,22 @@ def build_report(out_root: Path) -> dict:
             "residue_cleanup_attempted": v22_cleanup_attempted,
             "residue_cleanup_published": v22_cleanup_published,
             "surface_class_breakdown": dict(v22_surface_class),
+        },
+        # V23 — acceptance counters (must all be zero, patch plan §14) + sharper
+        # reject taxonomy (patch plan §Patch 1). V23 adds safer candidates only;
+        # it never relaxes a gate, so these mirror V17/V22 under V23 names.
+        "v23_published_audit_failures": v23_zero_d,
+        "v23_published_via_v23_candidate": v23_published_via_v23_candidate,
+        "v23": {
+            "reject_buckets": dict(v23_reject_buckets),
+            "rejects_by_roi_class": dict(v23_rejects_by_roi_class),
+            "rejects_by_mask_type": dict(v23_rejects_by_mask_type),
+            "candidate_failures_by_gate": dict(v23_candidate_failures_by_gate),
+            "candidate_starvation_cases": v23_candidate_starvation_cases,
+            "logo_fallback_on_product_cases": v23_logo_fallback_on_product_cases,
+            "mixed_surface_cases": v23_mixed_surface_cases,
+            "thin_flex_cases": v23_thin_flex_cases,
+            "smooth_surface_residue_cases": v23_smooth_surface_residue_cases,
         },
         # Cosmetic counters (allowed > 0): a soft seam on a mark-removed,
         # product-safe published output.
@@ -573,6 +671,10 @@ def main(argv):
     # V20 — only published outputs may contain cleaned.jpg (patch plan §Patch 2).
     rejected_cleaned = list((out_root / "auto_rejected").rglob("cleaned.jpg"))
     report["auto_rejected_cleaned_jpg_leak"] = len(rejected_cleaned)
+    # Fold the filesystem-scanned leak into the V23 acceptance counters too.
+    if isinstance(report.get("v23_published_audit_failures"), dict):
+        report["v23_published_audit_failures"]["auto_rejected_cleaned_jpg_leak"] = \
+            len(rejected_cleaned)
     if rejected_cleaned:
         report["all_clean"] = False
     (out_root / "run_report.json").write_text(json.dumps(report, indent=2))

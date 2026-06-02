@@ -40,6 +40,50 @@ import v15_patch
 import v17_final_audit
 import v18_patch
 
+try:
+    import v23_retry
+except Exception:  # pragma: no cover
+    v23_retry = None
+try:
+    import v23_surface_classifier as _v23_surface
+except Exception:  # pragma: no cover
+    _v23_surface = None
+
+
+# V23 — cover is allowed ONLY on a confirmed pure-background footprint (patch
+# plan §Patch 8). This is STRICTER than the V17 uniform-fill gate; it can only
+# remove a cover candidate, never add one.
+V23_COVER_PURE_BG_MIN = 0.92
+V23_COVER_PRODUCT_OVERLAP_MAX = 0.01
+V23_COVER_SAFE_OVERLAP_MAX = 0.03
+
+
+def _v23_cover_allowed(pctx, surface) -> bool:
+    """True only when the changed region is confirmed pure background — no
+    product overlap, no silhouette contact, no protected text, and no V22/V23
+    product-like surface signal (patch plan §Patch 8)."""
+    if pctx is None:
+        return False
+    if float(getattr(pctx, "pure_background_score", 0.0)) < V23_COVER_PURE_BG_MIN:
+        return False
+    if float(getattr(pctx, "product_overlap", 1.0)) > V23_COVER_PRODUCT_OVERLAP_MAX:
+        return False
+    if float(getattr(pctx, "product_mask_safe_overlap", 1.0)) > \
+            V23_COVER_SAFE_OVERLAP_MAX:
+        return False
+    if bool(getattr(pctx, "touches_silhouette", False)):
+        return False
+    if float(getattr(pctx, "protected_text_score", 0.0)) > 1e-6:
+        return False
+    if surface:
+        if surface.get("connected_component_crosses_bbox"):
+            return False
+        if surface.get("long_thin_component_crosses_bbox"):
+            return False
+        if surface.get("destructive_fill_unsafe"):
+            return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Gate tiers (V16.1).
@@ -151,6 +195,25 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                  "v18_safe_candidate_names": [n for n, _ in v18_safe]}
     if pctx is not None:
         v18_telem.update(pctx.to_record())
+    # V23 — surface classification + cover-background-only gate (patch plan
+    # §Patch 6, §Patch 8). The surface signals can only ADD a ban, never relax one.
+    v23_surface = None
+    if _v23_surface is not None:
+        try:
+            v23_surface = _v23_surface.classify_surface_v23(
+                img, bbox, product_mask, watermark_mask, roi_class)
+        except Exception:
+            v23_surface = None
+    v23_cover_allowed = _v23_cover_allowed(pctx, v23_surface)
+    v18_telem["v23_cover_allowed"] = bool(v23_cover_allowed)
+    if v23_surface is not None:
+        v18_telem["v23_surface_class"] = v23_surface.get("v23_surface_class", "")
+        v18_telem["v23_product_like_overlap"] = \
+            v23_surface.get("v23_product_like_overlap", 0.0)
+    # Accumulates V17 hard-fail tokens seen across candidates, fed to the V23
+    # failure-reason retry ladder before the destructive cover beam (patch plan
+    # §Patch 7).
+    v23_seen_hard = []
 
     # --- V19 — reverse-alpha recovery (patch plan §1.2, §4.3). Computed ONCE,
     # tried FIRST among repair candidates: it subtracts the semi-transparent
@@ -337,6 +400,8 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
                        "clean_repaired", "repair")
         state["candidate_failures"] += 1
         reject_reasons.append("repair_failed_final_gate")
+        v23_seen_hard.extend(k[4:] for k, v in gates.items()
+                             if k.startswith("v17_") and not v)
         if v14_patch.classify_failure(verdict) == "soft_fail":
             try:
                 rescued = v14_patch.near_miss_rescue(
@@ -392,7 +457,21 @@ def decide_final_status(img, bbox, product_mask, watermark_mask, qa_info,
     # product pixels they paint exactly the bands/blobs the audit rejects, so
     # offering them only wastes the beam. They remain available on a strict
     # pure-background box.
-    if not ban_destructive:
+    # V23 — failure-reason retry ladder (patch plan §Patch 7): once a candidate
+    # failed because a cover/fill landed on product (or any product damage), the
+    # cover/fill family is banned for this image and never retried. Combined with
+    # the V23 cover-background-only gate (patch plan §Patch 8), the destructive
+    # cover beam is offered only on a confirmed pure-background footprint.
+    v23_ban_cover = False
+    if v23_retry is not None:
+        try:
+            route = v23_retry.route_retry(reject_reasons, v23_seen_hard)
+            v23_ban_cover = bool(route.get("ban_cover"))
+            v18_telem["v23_retry_families"] = route.get("families", [])
+            v18_telem["v23_ban_cover"] = v23_ban_cover
+        except Exception:
+            v23_ban_cover = False
+    if not ban_destructive and v23_cover_allowed and not v23_ban_cover:
         if uniform is not None:
             cover_cands.insert(0, ("v16_uniform_background_fill", uniform))
         try:

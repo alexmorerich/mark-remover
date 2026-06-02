@@ -709,9 +709,27 @@ def build_safe_candidates(image, bbox, watermark_mask, product_mask,
             cands.append((name, img))
 
     roi = ctx.roi_class or ""
+    # V23 — build the precise alpha/stroke mask set once (patch plan §Patch 2);
+    # the component-aware mixed repair and thin-flex line restore consume it.
+    v23_mask_set = None
+    try:
+        import v23_masks
+        v23_mask_set = v23_masks.build_v23_mask_set(
+            image, bbox, watermark_mask, product_mask, roi)
+    except Exception:
+        v23_mask_set = None
     # ROI-specific specialized repair first (most surface-appropriate).
     if "specialized" in allowed:
         if roi in ("thin_flex_cable",) or ctx.flex_line_score > v13_gates.LONG_LINE_OVERRIDE:
+            # V23 — thin-flex / black-frame line-preserving restore (non-
+            # destructive reverse-alpha + line-continuity verification).
+            try:
+                import v23_flex_repair
+                _add("v23_thin_flex_line_restore",
+                     v23_flex_repair.v23_thin_flex_line_restore(
+                         image, bbox, watermark_mask, product_mask, v23_mask_set))
+            except Exception:
+                pass
             # V20 — reverse-alpha line-preserving repair first (non-destructive).
             _add("v20_thin_flex_reverse_alpha_line_preserve",
                  thin_flex_reverse_alpha_line_preserve(image, bbox,
@@ -734,6 +752,18 @@ def build_safe_candidates(image, bbox, watermark_mask, product_mask,
              repair_colored_surface_hue_matched(image, bbox, watermark_mask,
                                                 product_mask))
 
+    # V23 — component-aware mixed product/background repair (patch plan §Patch 3):
+    # per-fragment reverse-alpha on product + verified clone on background + a
+    # capped micro residue cleanup. Tried before the V20 segmented clone.
+    if "segmented" in allowed:
+        try:
+            import v23_mixed_repair
+            _add("v23_component_aware_mixed_repair",
+                 v23_mixed_repair.v23_component_aware_mixed_repair(
+                     image, bbox, watermark_mask, product_mask, v23_mask_set,
+                     roi, ctx))
+        except Exception:
+            pass
     # V20 — mixed product/background segmented repair (reverse-alpha on product,
     # clone-offset fill on pure background). Tried before the v14 fragment fill.
     if "segmented" in allowed:
@@ -1143,6 +1173,93 @@ def build_v21_records(rec: dict, status: str) -> dict:
             "micro_cleanup_attempted": micro_attempted,
             "micro_cleanup_result": micro_result,
         },
+    }
+
+
+# V23 reject buckets (patch plan §Patch 1). EXACT names — the report and CI key
+# off these, so they must not drift.
+V23_REJECT_BUCKETS = (
+    "residual_after_reverse_alpha",
+    "partial_glyph_residue",
+    "visible_band_on_nonwhite_surface",
+    "cover_or_fill_on_product",
+    "mixed_product_background_starved",
+    "thin_flex_continuity_risk",
+    "protected_text_overlap",
+    "dark_surface_blob_risk",
+    "metallic_gradient_flattening",
+    "no_precise_stroke_mask",
+    "false_positive_residual_suspect",
+    "unknown_safe_reject",
+)
+
+
+def classify_v23_reject_bucket(rec: dict) -> str:
+    """Map an auto-rejected record to exactly one V23 bucket (patch plan
+    §Patch 1). Pure function of signals already on ``rec`` — no decision change."""
+    hard = " ".join(str(r) for r in (rec.get("v17_hard_fail_reasons") or []))
+    reasons = " ".join(str(r) for r in (rec.get("reject_reasons") or []))
+    blob = hard + " " + reasons
+    rexp = rec.get("residual_explain") or {}
+    v21 = rec.get("v21_failure_taxonomy") or {}
+    residual_kind = v21.get("residual_kind", "")
+    surface = str(rec.get("v22_surface_class") or rec.get("v9_roi_class") or "")
+    mask_type = str(rec.get("mask_type", "") or "")
+
+    if "partial_glyph_residue" in blob or "alpha_footprint_residue" in blob:
+        return "partial_glyph_residue"
+    if "visible_band_on_nonwhite" in blob:
+        return "visible_band_on_nonwhite_surface"
+    if "protected_text" in blob:
+        return "protected_text_overlap"
+    if any(t in blob for t in ("cover_on_product", "visible_patch_on_product",
+                               "wedge", "slab")):
+        return "cover_or_fill_on_product"
+    if "thin_flex" in blob or "flex" in reasons or surface == "thin_flex_cable":
+        return "thin_flex_continuity_risk"
+    if "dark_surface" in blob or surface == "dark_smooth_product_surface":
+        return "dark_surface_blob_risk"
+    if "metallic" in blob or surface in ("metallic_or_reflective",
+                                         "glass_or_gradient"):
+        return "metallic_gradient_flattening"
+    if residual_kind in ("readable_text", "dot_chain", "low_contrast_ghost"):
+        return "residual_after_reverse_alpha"
+    if bool(rexp.get("possible_product_structure_false_positive")):
+        return "false_positive_residual_suspect"
+    if "logo_fallback" in mask_type or mask_type in ("", "logo"):
+        # A starved mixed region (product+background) with no precise stroke mask.
+        cr = (rec.get("v21_failure_taxonomy") or {}).get("changed_region_kind")
+        if cr == "mixed":
+            return "mixed_product_background_starved"
+        return "no_precise_stroke_mask"
+    return "unknown_safe_reject"
+
+
+def build_v23_records(rec: dict, status: str) -> dict:
+    """V23 (patch plan §Patch 1). Derive the sharper reject taxonomy from signals
+    already present on ``rec``. Pure post-processing — changes no decision."""
+    bucket = classify_v23_reject_bucket(rec) if status == "auto_rejected" \
+        else "published"
+    reasons = [str(r) for r in (rec.get("reject_reasons") or [])]
+    hard = [str(r) for r in (rec.get("v17_hard_fail_reasons") or [])]
+    top_gate = hard[0] if hard else (reasons[0] if reasons else "none")
+    v21 = rec.get("v21_failure_taxonomy") or {}
+    return {
+        "v23_reject_taxonomy": {
+            "bucket": bucket,
+            "primary_reason": (hard[0] if hard else
+                               v21.get("primary_reject_class", "none")),
+            "top_failed_method": str(rec.get("v9_final_method", "") or "none"),
+            "top_failed_gate": top_gate,
+            "roi_class": str(rec.get("v9_roi_class", "") or ""),
+            "mask_type": str(rec.get("mask_type", "") or
+                             rec.get("v23_mask_type", "") or "unknown"),
+            "product_like_overlap": round(float(
+                rec.get("v22_product_like_overlap", 0.0) or 0.0), 4),
+            "candidate_count": int(rec.get("v18_n_safe_candidates", 0) or 0)
+            + int(rec.get("reverse_alpha_variants_passed", 0) or 0),
+            "safe_candidate_count": int(rec.get("v18_n_safe_candidates", 0) or 0),
+        }
     }
 
 

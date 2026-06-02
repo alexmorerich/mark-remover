@@ -4252,6 +4252,15 @@ def process_image(rwm, path: Path, det: dict, out_root: Path,
     except Exception:
         pass
 
+    # --- V23 — sharper reject taxonomy (patch plan §Patch 1). Pure
+    # post-processing of signals already on ``rec``; never alters what is
+    # published. Buckets the 17 honest auto-rejects so the next round is
+    # targeted (residue / mixed-starved / thin-flex / surface / mask). ---------
+    try:
+        rec.update(v18_patch.build_v23_records(rec, status))
+    except Exception:
+        pass
+
     best_attempt_stub = attempts[-1] if attempts else None
     _write_terminal(out_root, debug_root, rec, img, masks,
                     candidate.repaired_image, best_attempt_stub,
@@ -4875,7 +4884,8 @@ def write_compare_pdf(out_root, records) -> Path:
 
     cell_w, cell_h, pad = 480, 320, 22
     page_w = pad * 3 + cell_w * 2
-    page_h = pad * 2 + 168 + cell_h + 28
+    # +18px header room for the V23 reject-bucket / cover-allowed line.
+    page_h = pad * 2 + 186 + cell_h + 28
 
     counts = {s: 0 for s in STATUS_ORDER}
     by_class = {}; by_route = {}; by_mask = {}; by_family = {}
@@ -4935,6 +4945,16 @@ def write_compare_pdf(out_root, records) -> Path:
            f"partial-glyph-residue={v22_glyph_leak}  (all must be 0)",
            font=font_sm,
            fill=("#0a4" if (v22_band_leak == v22_glyph_leak == 0) else "#a00"))
+
+    # V23 — published-safety must-be-zero summary (patch plan §14).
+    v23_leak = sum(
+        1 for r in pub_recs
+        if (r.get("v17_hard_fail_reasons") or []))
+    d.text((pad, pad + 84),
+           f"V23: published outputs with ANY hard-fail={v23_leak}  "
+           f"(must be 0); candidates added before destructive methods only",
+           font=font_sm,
+           fill=("#0a4" if v23_leak == 0 else "#a00"))
 
     y = pad + 94
     d.text((pad, y), f"total images:   {len(records)}",
@@ -5072,7 +5092,29 @@ def write_compare_pdf(out_root, records) -> Path:
                f"band={vb_s:.2f}  product_like={float(v22_pl or 0.0):.2f}",
                font=font_sm, fill=v22_color)
 
-        box_y = 168
+        # V23 — reject bucket + routing diagnostics (patch plan §Patch 9). On a
+        # published card it shows the V23 surface + cover-allowed decision; on an
+        # auto-rejected card it shows the bucket, top failed gate, and mask type.
+        v23_tax = r.get("v23_reject_taxonomy") or {}
+        v23_sc = r.get("v23_surface_class") or v22_sc
+        cover_ok = bool(r.get("v23_cover_allowed"))
+        ban_cover = bool(r.get("v23_ban_cover"))
+        cpr = float(r.get("v17_changed_product_ratio", 0.0) or 0.0)
+        if r["status"] == ST_AUTO_REJECTED:
+            v23_line = (f"V23: bucket={v23_tax.get('bucket','?')}  "
+                        f"gate={v23_tax.get('top_failed_gate','?')}  "
+                        f"mask={v23_tax.get('mask_type','?')}  "
+                        f"prod_like={v23_tax.get('product_like_overlap',0):.2f}  "
+                        f"cands={v23_tax.get('candidate_count',0)}")
+            v23_color = "#a00"
+        else:
+            v23_line = (f"V23: surface={v23_sc}  cover_allowed={cover_ok}  "
+                        f"ban_cover={ban_cover}  changed_product={cpr:.3f}  "
+                        f"method={v9_fm}")
+            v23_color = "#0a4"
+        d.text((pad, 170), v23_line, font=font_sm, fill=v23_color)
+
+        box_y = 186
         # V20 — auto_rejected shows the BEST ATTEMPT (best_attempt.jpg), clearly
         # labelled NOT PUBLISHED so it is never mistaken for a cleaned asset.
         if r["status"] == ST_CLEAN_REPAIRED:

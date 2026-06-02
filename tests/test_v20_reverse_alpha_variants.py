@@ -32,7 +32,13 @@ def _white_with_overlay():
 
 
 def test_variant_names_are_stable_and_deterministic():
-    assert len(ra.VARIANT_NAMES) == 8
+    # V20 registered 8 variants; V21 added 1 (texture-preserve) and V23 added 6
+    # surface-specific refinement variants (patch plan §Patch 5). The registry is
+    # additive — earlier names are preserved, so the count only grows.
+    assert len(ra.VARIANT_NAMES) == 14
+    for n in ("v20_reverse_alpha_ncc", "v21_reverse_alpha_texture_preserve_blend",
+              "v23_ra_local_alpha_plane", "v23_ra_baseline_component_cleanup"):
+        assert n in ra.VARIANT_NAMES
     img, box = _white_with_overlay()
     if box is None:
         return

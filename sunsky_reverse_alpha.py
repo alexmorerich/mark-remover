@@ -86,6 +86,15 @@ VARIANT_NAMES = (
     # residue on cardboard / smooth coloured / metallic backs without flattening
     # the surface. Screened by the same local pre-screen; audited authoritatively.
     "v21_reverse_alpha_texture_preserve_blend",
+    # V23 — surface-specific reverse-alpha refinement variants (patch plan
+    # §Patch 5). Each is a real-pixel recovery on top of the chosen placement,
+    # tried BEFORE any destructive method, screened + audited like every variant.
+    "v23_ra_local_alpha_plane",
+    "v23_ra_dark_surface_bias",
+    "v23_ra_metallic_gradient_locked",
+    "v23_ra_cardboard_texture_reinject",
+    "v23_ra_near_white_surface_cleanup",
+    "v23_ra_baseline_component_cleanup",
 )
 
 
@@ -693,6 +702,19 @@ def build_variant_beam(image, mark_box, *, watermark_mask=None, product_mask=Non
     # Explicit no-cleanup variant (alias of the ncc placement, kept for ranking
     # diversity / report parity).
     raw.append(("v20_reverse_alpha_no_cleanup", apply_placement(image, base), base))
+    # V23 — surface-specific reverse-alpha refinement variants (patch plan
+    # §Patch 5): local alpha plane, dark-surface bias, metallic-gradient locked,
+    # cardboard texture reinject, near-white cleanup, baseline component cleanup.
+    # Each is a real-pixel recovery on top of the chosen placement, appended
+    # BEFORE any destructive method and screened/ranked like every other variant.
+    try:
+        import v23_reverse_alpha_variants as _v23ra
+        raw.extend(_v23ra.build_v23_variants(
+            image, base, watermark_mask=watermark_mask,
+            product_mask=product_mask,
+            protected_text_mask=protected_text_mask))
+    except Exception:
+        pass
     # V21 — smooth-surface texture-preserving refinement (patch plan §Patch 5).
     # Bilateral filter the glyph halo of the reverse-alpha base: it suppresses
     # faint low-contrast residue while keeping high-frequency surface texture
