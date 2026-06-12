@@ -276,8 +276,13 @@ human eyeball check.
 |------|------|
 | `v27_clean.py` | The entrypoint. Detection, masking, LaMa inpaint, residual check, CLI for single and batch runs. |
 | `watermark-template.png` | Reference glyph of `sunsky-online.com`, retained for cross-checking; v27 uses OCR rather than template correlation. |
-| `output_v10_*/`, `output_baseline/` | Historical sample outputs from earlier iterations, kept for diff comparison. Not part of the v27 publish path. |
-| Older `vN_*.py` files | Earlier iterations preserved for reference. Not invoked by v27. |
+| `bench_assets/` | Catalog sample images used for the qualification bench. |
+
+> **Legacy engine.** The pre-v27 stack (V10–V23 — `mark_remover.py`,
+> `detector.py`, `progressive_repair.py`, the `vN_*.py` modules, and their
+> tests) was removed in the v27 cleanup. None of it was used by `v27_clean.py`.
+> It is preserved in git history under the **`legacy-v23-engine`** tag; restore
+> any file with `git checkout legacy-v23-engine -- <path>`.
 
 ### Design principle
 

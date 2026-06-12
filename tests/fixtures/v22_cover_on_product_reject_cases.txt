@@ -1,8 +1,0 @@
-# V22 §Patch 10 — regression: destructive cover/fill attempts on product pixels
-# must be REJECTED (not published). A cover may only be generated on proven pure
-# background. Dark touch panels, black frames, flex cables, metallic plates.
-charging-port-flex-cable-for-ipad-pro-12-9-inch-4g-2015-white-8.jpg
-charging-port-signal-flex-cable-for-iphone-xr-2.jpg
-lcd-display-fpc-connector-on-flex-cable-for-iphone-11-1.jpg
-touch-panel-for-apple-watch-series-3-38mm-2.jpg
-glass-mirror-surface-battery-back-cover-for-iphone-x-silver-4.jpg
