@@ -30,6 +30,7 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 
 | Module | Stage | Responsibility |
 |---|---|---|
+| `owner_agent.py` | OWNER (pipeline) | job runner: original → detect → repair/cover/copy/reject → final + `owner_manifest.jsonl`; bounded retry on Audit feedback |
 | `logo_finder.py` | DETECT | aggressive ensemble finder → graded presence + scored candidates + masks + routing |
 | `v27_clean.py` | DETECT (primitives) | multi-pass EasyOCR passes + fuzzy `sunsky` token regex |
 | `v28_clean.py` | REPAIR (integrated engine) | `detect_smart` → full-extent mask → crop+MPS LaMa → hard verify gate + recovery |
@@ -41,6 +42,9 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 | `scan_audit.py` | AUDIT (false-neg sweep) | re-checks the scan's "clean" verdict with a complementary ensemble; resumable, file-state tracked |
 | `bench_combine.py` | AUDIT (calibration) | labelled-set benchmark behind the detector design |
 
+> **Owner Agent workflow** (original → detect → repair/cover → final + manifest → retry on
+> Audit feedback): [`docs/OWNER_AGENT_WORKFLOW.md`](docs/OWNER_AGENT_WORKFLOW.md).
+>
 > **Audit-stage design** (watermark position id · cleaning strategies · cleaning-quality
 > review methods + criteria): [`docs/AUDIT_LOGO_FINDER.md`](docs/AUDIT_LOGO_FINDER.md).
 
