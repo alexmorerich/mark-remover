@@ -34,6 +34,15 @@ SUNSKY_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
+# Speed knobs (env-tunable; defaults reproduce original v27 behavior exactly):
+#   WM_OCR_BASE_CAP  downscale longest side to this BEFORE CLAHE+upscale (0=off).
+#                    Caps OCR cost on the large (~1600px) third of the catalog.
+#   WM_OCR_MAXPASS   cap the number of OCR passes (0=all 3). Fewer passes makes
+#                    the ~44% clean images (which run every pass) cheap. Pass
+#                    reduction can only LOWER recall, never add false positives.
+OCR_BASE_CAP = int(os.environ.get("WM_OCR_BASE_CAP", "0") or 0)
+OCR_MAXPASS = int(os.environ.get("WM_OCR_MAXPASS", "0") or 0)
+
 
 def clahe_upscale(bgr, scale=2.0):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
@@ -48,16 +57,22 @@ def clahe_upscale(bgr, scale=2.0):
 
 
 def _ocr_pass(reader, bgr, scale, params):
-    prep = clahe_upscale(bgr, scale=scale)
+    base, ds = bgr, 1.0
+    if OCR_BASE_CAP and max(bgr.shape[:2]) > OCR_BASE_CAP:
+        ds = OCR_BASE_CAP / max(bgr.shape[:2])
+        base = cv2.resize(bgr, (max(1, round(bgr.shape[1] * ds)), max(1, round(bgr.shape[0] * ds))),
+                          interpolation=cv2.INTER_AREA)
+    prep = clahe_upscale(base, scale=scale)
     rgb = cv2.cvtColor(prep, cv2.COLOR_BGR2RGB)
     raw = reader.readtext(rgb, detail=1, paragraph=False, **params)
+    eff = scale * ds  # net scale vs ORIGINAL pixels; map OCR coords back by /eff
     hits = []
     for box, text, conf in raw:
         if conf < 0.03:
             continue
         if not SUNSKY_TOKENS.search(text):
             continue
-        pts = np.array(box) / scale
+        pts = np.array(box) / eff
         x1, y1 = pts.min(axis=0); x2, y2 = pts.max(axis=0)
         hits.append((float(x1), float(y1), float(x2), float(y2), text, float(conf)))
     return hits
@@ -73,7 +88,7 @@ def detect_watermark_boxes(reader, bgr):
         (2.0, dict(contrast_ths=0.01, adjust_contrast=0.9,
                    text_threshold=0.3, low_text=0.15, link_threshold=0.2)),
     ]
-    for scale, params in passes:
+    for scale, params in (passes[:OCR_MAXPASS] if OCR_MAXPASS else passes):
         hits = _ocr_pass(reader, bgr, scale, params)
         if hits:
             return hits

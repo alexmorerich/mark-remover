@@ -1,304 +1,295 @@
-# Mark Remover — v28
+# Mark Remover
 
-A standalone eraser for the **`sunsky-online.com`** semi-transparent text
-watermark on B2B product photos. It locates the mark, inpaints it with LaMa,
-and — critically — **re-detects the mark on its own output and only publishes an
-image as `cleaned` when the watermark can no longer be found.** If anything
-survives, it widens and re-inpaints, or reports the image honestly. There are no
-silent dirty passes.
+Removes the **`sunsky-online.com`** semi-transparent text watermark from B2B product
+photos at catalog scale, leaving no readable residue and **no damage to clean images**.
 
-The single entrypoint is **`v28_clean.py`**. It reuses the OCR primitives and
-the LaMa wrapper from `v27_clean.py`; everything new (full-extent localization,
-per-channel detection, the verification gate, and GPU acceleration) lives in
-`v28_clean.py`.
+The system is a single-owner, three-stage pipeline with stable typed interfaces:
 
 ```
-                        ┌─────────────────────────────────────────────┐
- detect_smart ──► anchor ──► full extent ──► crop+LaMa ──► verify_clean ──► status
- (OCR ×passes,           (template match +    (MPS GPU,    (re-detect WIDE,   cleaned /
-  per-channel)            stroke-aware grow)   paste-back)  composite+channel) residual /
-       ▲                                                          │           no_mark
-       └──────────────── recover: widen mask, re-inpaint (≤2×) ◄──┘
+   DETECT                         REPAIR                         AUDIT
+ logo_finder.py        →   v28_clean.py / reclean.py     →   verify gate / final_audit.py
+ (find every mark,         (full-extent or canonical-band     (re-detect on the OUTPUT;
+  graded presence)          LaMa inpaint, or restore FP)       publish only if gone & safe)
+        │                          │                                  │
+        │  presence + bbox         │  backup every change             │  residual re-check
+        │  + masks + ROI + risk    │  (fully reversible)              │  + auto-reject queue
+        └──────────────────────────┴──────────────────────────────────┘
+                       one append-only manifest per image
 ```
 
-On a 100-image bench the v28 pipeline reports **100 / 100 re-detection-verified
-clean** (0 residual, 0 missed) at **~4.7 s/image** on an Apple M4 (single
-process, GPU).
+**Safety model — "aggressive to find, conservative to publish."** Detection chases recall
+freely because the zero-damage guarantee lives at the **audit gate**: every repair is
+backed up and reversible, and an image is published `cleaned` **only when the mark can no
+longer be detected on its own output**. Final safety is never assumed at detect time.
 
----
+**Governance.** One owner; `detect`, `repair`, and `audit` are separate modules behind a
+stable contract. Before changing repair, inspect the detection output schema; before
+changing detection, run the end-to-end benchmark. Every change preserves manifest
+compatibility, the final audit, and the auto-reject policy. The detect contract is
+[`docs/OWNER_LOGO_FINDER.md`](docs/OWNER_LOGO_FINDER.md).
 
-## Quick start
-
-```bash
-# Single image
-python3 v28_clean.py --input in.jpg --output out.jpg [--debug debug_dir]
-
-# Batch — JSON array of [n, slug, path] entries
-python3 v28_clean.py --batch items.json --out-dir cleaned/ --log cleaned/_log.json [--debug debug_dir]
-```
-
-Recommended environment (Apple Silicon):
-
-```bash
-export PYTORCH_ENABLE_MPS_FALLBACK=1   # let unsupported MPS ops fall back to CPU
-export OCR_DEVICE=mps                   # run EasyOCR on the GPU (10x vs CPU)
-export LAMA_DEVICE=mps                  # run LaMa on the GPU
-```
-
-**Dependencies:** Python 3, OpenCV (`cv2`), NumPy, Pillow, `easyocr`,
-`simple_lama_inpainting`, PyTorch. LaMa weights land at
-`~/.cache/torch/hub/checkpoints/big-lama.pt` on first run. `assets/sunsky_alpha.png`
-(the solved watermark alpha template, 36×240) ships with the repo and is loaded
-at import.
-
-`--debug <dir>` writes `<stem>_mask.png` (the final mask) and `<stem>_overlay.jpg`
-(the mask blended 45 % red over the source) per image, for human mask-placement
-review.
+| Module | Stage | Responsibility |
+|---|---|---|
+| `logo_finder.py` | DETECT | aggressive ensemble finder → graded presence + scored candidates + masks + routing |
+| `v27_clean.py` | DETECT (primitives) | multi-pass EasyOCR passes + fuzzy `sunsky` token regex |
+| `v28_clean.py` | REPAIR (integrated engine) | `detect_smart` → full-extent mask → crop+MPS LaMa → hard verify gate + recovery |
+| `reclean.py` | REPAIR (catalog scale) | canonical-band LaMa re-clean / restore false positives, resumable |
+| `run_bulk.py` | REPAIR (engine) | LaMa crop-inpaint, OCR reader, in-place write + backup |
+| `final_audit.py` | AUDIT | independent re-detection over repaired output, FP-graded |
+| `reconcile_manifest.py` | — | merge repair results into one authoritative manifest |
 
 ---
 
 ## 1. How the watermark position is identified
 
-The mark is the fixed string `sunsky-online.com`, but its **transparency**, the
-**surface texture** underneath, and the **random position** conspire to defeat a
-single detector. v28 localizes in four layers, each compensating for the
-previous one's blind spot.
+The watermark is a **fixed centre stamp**: across 700 reliable detections its vertical
+centre `cy/H` sat in `[0.469, 0.487]` (p5–p95), width ≈ `0.45·W`, height ≈ `0.06·H`. That
+tight geometric prior anchors everything. But transparency, the surface texture
+underneath, and OCR garbling defeat any single detector, so detection is an **ensemble**
+that is then **graded** rather than thresholded on one score.
 
-### 1.1 Multi-pass EasyOCR (CRAFT) detection — `detect_smart`
+### 1.1 Multi-representation preprocessing
+Each image is expanded into several views so no representation is a single point of
+failure: grayscale, CLAHE-enhanced gray, a **faint-stroke residual map**
+(`|gray − medianBlur|`, which makes a semi-transparent mark pop), a Canny edge map, and an
+HSV saturation map.
 
-`detect_smart()` runs up to three EasyOCR passes, each preceded by a **CLAHE
-contrast boost on the L channel + cubic upscale**, and **stops early at the
-first pass that captures the whole mark** (§1.4):
+### 1.2 The ensemble signals (`logo_finder.py`)
+| Signal | What it catches | Blind spot it covers |
+|---|---|---|
+| **OCR text** (`v27._ocr_pass`, sensitive, multi-pass + CLAHE + 2× upscale) | legible `sunsky-online.com` fragments | the primary, high-precision signal |
+| **Per-channel OCR** (saturation-gated) | a light mark over a saturated colour that vanishes in the luminance composite | colour-hidden marks |
+| **Canonical matte NCC** (b2bweb `watermark-canonical.png`, background-subtracted, multi-scale) | the glyph **shape** where OCR reads nothing | illegible / faint marks |
+| **Center prior** (Gaussian on distance from `cy/H≈0.475`) | location plausibility | rejects edge-of-frame text |
+| **Alpha-gray energy** | faint, low-saturation, thin horizontal stroke band | transparency signature |
+| **Edge / dot-chain rhythm** (column-projection autocorrelation) | the regular glyph pitch of `…online.com` | distinguishes logo rhythm from random texture |
 
-| Pass | Scale | CRAFT params | Purpose |
-|-----:|------:|-------------|---------|
-| 1 | 2.0× | EasyOCR defaults | Catches the majority of faint marks on smooth backgrounds. |
-| 2 | 3.0× | `text_threshold=0.4, low_text=0.2, link_threshold=0.3` | Recovers very faint marks on near-white surfaces. |
-| 3 | 2.0× | `text_threshold=0.3, low_text=0.15, link_threshold=0.2` | Broad search on busy pages where 1–2 found nothing. |
+Detection runs **multi-scale** and merges overlapping candidates.
 
-Each recognition is kept only if `conf ≥ 0.03` **and** its text matches the
-fuzzy regex below. Coordinates are scaled back to native resolution.
+### 1.3 Full-extent recovery (`v28_clean.py`)
+OCR usually returns only a **fragment**; masking just that leaves a readable `…online.com`
+tail. The integrated engine establishes the **whole** extent:
+* `_mark_fully_captured` — treats a read as complete only if it contains the genuine tail
+  (`com`/`onlin`) **or** the union box is already ≥ 6.7× text-height wide (the mark aspect).
+  A truncated `sunsky-onl` is explicitly *not* full — the bug that caused partial removal.
+* `locate_full_box` — template-matches the known geometry (`assets/sunsky_alpha.png`, aspect
+  6.67) against an absolute-local-contrast **stroke map** of a band around the anchor; the
+  search is sized from the **image**, not the OCR fragment, and constrained to cover the anchor.
+* `grow_extent_tint` — extends the box along the visible mark, **stroke-aware** (a pixel
+  counts only if lighter than local background *and* on a high-frequency stroke), so it
+  follows glyphs but not smooth reflective product features. Growth capped to 4× height/side.
 
-### 1.2 Fuzzy regex for OCR-garbled `sunsky-online.com`
+### 1.4 Graded scoring → presence (the precision guard)
+Each candidate gets a weighted score
+(`0.40·text + 0.22·template + 0.15·center + 0.10·alpha + 0.07·dot_chain + 0.06·edge`, minus
+product-text and random-texture penalties) and is graded:
 
-OCR rarely reads the mark cleanly — observed garblings include `sunsky-Snline:=`,
-`onlme com`, `Snline c8n`, `hline com`, `Gunsky-onjine con`. The matcher
-(`SUNSKY_TOKENS` in `v27_clean.py`) is a union of permissive token patterns
-(`s..k.?`, `onl..e`, `nline`, `.c..m`, `c8n`, `sky`, …); any one fragment match
-qualifies a box. Matched boxes are unioned into one anchor (`union_bbox`).
+`CONFIRMED_WATERMARK · LIKELY_WATERMARK · UNCERTAIN_WATERMARK · NO_WATERMARK · UNSUITABLE_IMAGE`
 
-### 1.3 Per-channel recall booster (coloured backgrounds)
+The key precision guard is **text grading**. `v27`'s sunsky regex is deliberately
+over-permissive (it also matches `sky`, `cn`, `c8n` — noise common in product captions), so
+the finder classifies each OCR hit:
+* **STRONG** (`sunsky` / `online` / `.com`) → can be `CONFIRMED`
+* **MED** (`onl` / `nline` / `.c0m`) → `LIKELY`
+* **NOISE** (bare `cn` / `rcn` / `sky`) → downgraded, **never `CONFIRMED`**
 
-A mark rendered light-grey **on a saturated colour** (e.g. white-on-blue on a
-translucent phone) can be nearly invisible in the composite image and missed by
-every pass above — the classic "complete miss". `detect_smart` therefore falls
-back to **`_ocr_channels`**, which OCRs each **B, G, R channel separately**. The
-mark's contrast against a coloured surface collapses in the composite but
-survives in the complementary channel (the blue channel is what recovers the
-white-on-blue case). This fires only when the composite passes find nothing, so
-it costs nothing on the common case.
+This is what stopped the noise-token false positives that earlier damaged clean photos.
+Validated on known sets: known-watermarked **6/6 CONFIRMED**, re-cleaned images **6/6
+NO_WATERMARK**, restored false positives graded NO/UNCERTAIN — never CONFIRMED.
 
-### 1.4 Full-extent recovery — `_mark_fully_captured`, `locate_full_box`, `grow_extent_tint`
-
-OCR usually returns only a **fragment** of the mark, and masking just that
-fragment leaves a readable tail (the "`…online.com` ghost"). v28 establishes the
-**full** extent:
-
-- **`_mark_fully_captured`** decides whether OCR already read the whole string:
-  true only if the recognized text contains the genuine tail (`com` / `onlin`)
-  **or** the union box is already ≥ 6.7× text-height wide (the mark's aspect).
-  A *truncated* read like `sunsky-onl` is explicitly **not** treated as full —
-  this was the bug that caused partial removal.
-- If not fully captured, **`locate_full_box`** template-matches the known mark
-  geometry (`assets/sunsky_alpha.png`, aspect **6.67**) against an
-  **absolute-local-contrast stroke map** of a band around the anchor. The search
-  band and scale sweep are sized from the **image**, not the OCR fragment (OCR
-  may catch a tiny sliver of a wide mark), and the match is constrained to cover
-  the anchor. Accepted at correlation ≥ `ACCEPT` (0.24).
-- **`grow_extent_tint`** then extends the box left/right along the actually
-  visible mark. It is **stroke-aware**: a pixel counts only if it is *both*
-  lighter than the local background *and* sits on a high-frequency stroke — so
-  the grow follows glyphs but **not** smooth reflective product features (which
-  previously caused runaway white-blob inpaints). Growth is **capped** to
-  4× box-height per side.
-
-### 1.5 No detection → `no_mark`
-
-If every layer above finds nothing, the image is reported `no_mark` and left
-untouched. v28 has no mark-presence prior beyond detection.
+### 1.5 Output contract
+Per candidate `logo_finder` emits `bbox`, `score`, `evidence` (the per-signal breakdown),
+`roi_class`, `risk_level`, `recommended_action` (`repair`/`cover`/`reject`), and four repair
+masks (below). `CONFIRMED` and `LIKELY` are actionable; `UNCERTAIN` routes to conservative
+cover/review, never ignored. Full schema in `docs/OWNER_LOGO_FINDER.md`. If nothing fires,
+the image is `NO_WATERMARK` and left untouched.
 
 ---
 
 ## 2. The mark-cleaning strategies
 
-### 2.1 Full-extent filled mask — `build_mask`
+### 2.1 Full-extent filled mask (`v28_clean.build_mask`)
+The padded full-extent box is rasterized as a **filled white rectangle** (a stroke-only
+mask leaves the anti-aliased glyph halo readable) and dilated. Horizontal pad is a fraction
+of mark width (10 %, min 14 px) so the faint `.com` tail and leading `s` are always covered;
+vertical pad 35 %.
 
-The padded full-extent box is rasterized as a **filled white rectangle** (not
-stroke pixels — a stroke-only mask leaves the anti-aliased glyph halo readable),
-then dilated. The horizontal pad is a **fraction of mark width** (10 %, min
-14 px) so the faint `.com` tail and leading `s` that template matching tends to
-under-cover are always inside the mask; vertical pad is 35 % of height.
+### 2.2 Crop-region LaMa inpaint (`lama_inpaint_crop` / `run_bulk._lama_crop_inpaint`)
+The mask is ~1 % of image area, so a crop is taken around it (+24 px context), LaMa runs
+**only on that crop**, and **only the masked pixels are pasted back** — every unmasked pixel
+stays byte-identical to the source. This is the biggest speed lever (full-image 5.5 s → crop
+0.1 s, ~55×) and improves fidelity. LaMa is the right inpainter because ≈ 95 % of catalog
+marks sit on flat / smooth-gradient backgrounds, its strongest regime, and it does not
+hallucinate geometry or text.
 
-### 2.2 Crop-region LaMa inpaint — `lama_inpaint_crop`
+### 2.3 Canonical-band re-clean (`reclean.py`, catalog scale)
+For bulk re-processing, because the mark is a fixed centre stamp, repair masks a **generous
+centred band** (`x∈[0.23,0.77]·W`, `y∈[0.43,0.52]·H`, dilated) and inpaints from the
+**pristine backup** — coverage no longer depends on perfect detection, eliminating the
+partial-clean failure mode entirely, and re-cleaning is deterministic/repeatable.
 
-The mask is typically **~1 % of the image area**, so inpainting the whole frame
-is ~98 % wasted work. `lama_inpaint_crop` crops a small region around the mask
-(+24 px context), runs LaMa **only on that crop**, and **pastes back only the
-masked pixels** — every unmasked pixel stays byte-identical to the source. This
-is the single biggest speed lever (full-image 5.5 s → crop 0.1 s, ~55×) and also
-improves fidelity (no global recomposition).
+### 2.4 ROI-routed masks (`logo_finder`)
+The finder classifies the surface (`plain_white`, `near_white`, `metallic_or_reflective`,
+`mixed_background_product`, `thin_flex_cable`, `complex_product_detail`, …) and emits four
+masks so repair matches the surface:
 
-LaMa is the right inpainter here because ≈ 95 % of catalog marks sit on a flat
-or smooth-gradient background (white trays, coloured backs), LaMa's strongest
-regime, and it does not hallucinate geometry or text.
+| Mask | Use |
+|---|---|
+| `stroke_mask` | tight stroke-level erase on busy product surface (minimal disturbance) |
+| `soft_mask` | dilated stroke for anti-alias halo on simple surfaces |
+| `line_mask` | full text-line erase |
+| `cover_mask` | generous canonical band — fallback when stroke repair is unsafe |
 
-### 2.3 GPU (MPS) acceleration — `make_reader`, `get_fast_lama`
+Repair-friendly ROIs → **repair (inpaint)**; risky ROIs (`flex_cable`/`complex_detail`/
+`text_area`/`glass`) → **cover**, restoring plausible background without large-area erasure
+that could damage cables, labels, screws, ports, or silhouettes.
 
-Both conv-heavy nets run on the Apple-Silicon GPU:
+### 2.5 Restore (false-positive handling)
+A flagged image with **no real watermark** (noise-token match) is not inpainted — its
+pristine backup is copied back, undoing any needless repair. First-class repair action,
+routed by the same text grading used in detection.
 
-- **LaMa** via `SimpleLama(device="mps")` (`LAMA_DEVICE`).
-- **EasyOCR** — its `gpu=` flag only knows CUDA, so `make_reader` moves the
-  CRAFT detector and recognizer onto MPS by hand (`r.detector.to("mps")` …),
-  ~10× faster than CPU (12 s → 1.2 s per `readtext`).
+### 2.6 GPU (MPS) acceleration
+Both conv-heavy nets run on the Apple-Silicon GPU: LaMa via `SimpleLama(device="mps")`;
+EasyOCR's CRAFT detector + recognizer moved onto MPS by hand (`make_reader`), ~10× over CPU.
+On CPU these nets are **memory-bandwidth bound**, so multi-process CPU workers do not scale —
+moving work to the idle GPU is what removes the bottleneck.
 
-This matters because on CPU these nets are **memory-bandwidth bound**, so
-multi-process CPU workers do *not* scale (they saturate the bus). Moving the work
-to the otherwise-idle GPU is what removes the bottleneck. `LAMA_DEVICE=cpu` /
-`OCR_DEVICE=cpu` force CPU when needed.
-
-### 2.4 What v28 deliberately does *not* do
-
-- **No reverse-alpha / per-pixel α solve**, no covers, clones, or synthetic
-  fills — inpaint only.
-- **No diffusion inpainting** — LaMa is chosen for faithfulness over generation.
-- **No product-mask / protected-text gate.** A filled rectangle on product
-  surface is a known risk; the `--debug` overlay is the human check. For the
-  brand-safe production path with those gates, see the b2bweb pipeline.
+### 2.7 Deliberately *not* done
+No reverse-alpha / per-pixel α solve, no diffusion inpainting (LaMa chosen for faithfulness
+over generation). A filled rectangle on product surface is a known risk; the ROI router +
+`cover` action + the `--debug` overlay + the audit gate are the mitigations.
 
 ---
 
-## 3. Cleaning-quality review: methods & criteria
+## 3. Cleaning-quality review — methods & criteria
 
-The review runs **on the bytes that would be written**, and the resulting status
-is recorded verbatim. The guiding rule: **an image is `cleaned` only if the mark
-can no longer be detected on the output.**
+Quality is enforced at the **audit gate**, never assumed. Detection is allowed to be wrong;
+the audit guarantees the published image is both **watermark-free** and **undamaged**. The
+guiding rule: **an image is `cleaned` only if the mark can no longer be detected on the
+output.**
 
-### 3.1 Hard verification gate — `verify_clean`
+### 3.1 Hard verification gate (`v28_clean.verify_clean`)
+After inpainting, the mark is **re-detected on the cleaned output** over a region *wider*
+than the mask (+0.6× width, +1× height — residue can survive just outside, as in the
+`.com`-tail case), using **both** the composite **and** each colour channel. It is
+non-circular: a fresh multi-modal detection on the new pixels, not a re-read of cached
+state. An empty result means verified clean.
 
-After inpainting, `verify_clean` re-detects the watermark on the **cleaned**
-image over a region **wider than the mask** (+0.6× mark-width horizontally, +1×
-height vertically — residue can survive *just outside* the mask, as in the
-`.com`-tail case), using **both** the composite image **and** each colour channel
-(the §1.3 recall booster, so faint residue is caught). It returns the surviving
-watermark hits in image coordinates; an empty list means verified clean.
+### 3.2 Inline residual audit (`reclean.audit_band`, catalog scale)
+After each bulk repair, OCR re-runs on the **canonical band** of the result; a surviving
+sunsky fragment ⇒ `status: residual`. Band-only makes it faster and more sensitive than a
+full-frame pass.
 
-This is "non-circular": it does a **fresh** multi-modal detection on the new
-pixels, not a re-read of cached state, so a hit proves the mark is still findable
-on the output.
+### 3.3 Recovery loop
+If verification returns residue, the cleaner widens the box to cover it, re-grows, builds a
+harder mask (16 % horizontal / 50 % vertical pad, larger dilation), re-inpaints, and
+re-verifies — **up to 2×** — before any status is assigned.
 
-### 3.2 Recovery loop
+### 3.4 auto-reject policy
+Terminal states are `cleaned` / `restored` / `residual` / `no_mark` — never silent publish.
+Any `residual` is written to a **review queue** (`_reclean_review.txt`) and **auto-rejected**
+from publication. Nothing visibly watermarked or uncertain ships.
 
-If `verify_clean` returns residue, the cleaner **widens** the box to cover the
-residue, re-grows, builds a harder mask (16 % horizontal pad, 50 % vertical,
-larger dilation), re-inpaints, and re-verifies — **up to 2×**. Recovery resolves
-the rare under-cover before any status is assigned.
+### 3.5 Reversibility = zero-damage guarantee
+Every repaired image has a pristine backup (`_wm_backup/`). Because every change is
+reversible, aggressive detection is safe: a wrongly-repaired clean image can always be
+restored. This is the structural reason the detect stage can chase recall.
 
-### 3.3 Per-image status taxonomy
+### 3.6 Independent final audit (`final_audit.py`)
+A random sample of the repaired files on disk is run through the **full 3-pass detector**,
+independent of the inline check. A detection counts as a **real** residual only if it carries
+a strong sunsky/online-com fragment (bare noise tokens are product text, not watermark), so
+it measures true residual rate, not OCR noise. Reports the rate with a 95 % CI and a
+PASS/REVIEW verdict.
 
-| `status` | Meaning |
-|---------|---------|
-| `no_mark` | No detector layer found the mark — image left untouched. |
-| `cleaned` | Mark detected, inpainted, **and** the final `verify_clean` returned empty (zero re-detections). |
-| `residual` | Mark detected and inpainted, but re-detection still flags it after recovery. Written to `--out-dir`, but flagged — **never presented as clean**. |
-| `ok=False` | `cv2.imdecode` could not read the input. |
+### 3.7 Per-image record fields
+`status`, `method` (`ocr_full`/`template`/`ocr_pad`), `anchor`/`full_box` (mask-placement
+audit), `loc_score`, `retry` (recovery passes), `residue_after` (re-detection count — **the
+hard gate**, 0 ⇔ `cleaned`), `residual_after`, `bbox_padded`, `backup`, `elapsed_s`. Stages
+append, never overwrite, so any failure is attributable. `reconcile_manifest.py` merges
+repair results into one authoritative `_wm_process.jsonl` (pre-reclean manifest backed up
+first; rewrite atomic).
 
-### 3.4 Per-image record fields
-
-Each clean writes a JSON record (printed on `--input`, accumulated to `--log` on
-`--batch`):
-
-| Field | Meaning |
-|-------|---------|
-| `status` | §3.3 classification. |
-| `method` | `ocr_full` (OCR read the whole mark), `template` (recovered via template match), or `ocr_pad`. |
-| `anchor` / `full_box` | OCR union box / final masked extent — mask-placement audit. |
-| `loc_score` | Template-match correlation for the localization. |
-| `retry` | Number of recovery passes (§3.2). |
-| `residue_after` | Re-detection count on the final output — **the hard gate** (0 ⇔ `cleaned`). |
-| `resid_score` | Template residual correlation (informational; not the gate — it over-flags smudges and clean white backgrounds). |
-| `elapsed_s` | Per-image wall time. |
-
-### 3.5 Run-level acceptance criteria
-
+### 3.8 Run-level acceptance criteria
 ```
-residue_after == 0     for every record         →  no re-detectable mark
-status ∈ {cleaned, no_mark}                      →  no published residual
-retry rate                                        →  tracked, not gated; high rate
-                                                     flags a §1 detection regression
-mask overlay (human spot-check, --debug)          →  mask not over product text / edges
-side-by-side before/after PDF                     →  final human eyeball
+residue_after / residual_after == 0   for every record   →  no re-detectable mark
+status ∈ {cleaned, restored, no_mark}                     →  no published residual
+false positives ≤ baseline                                →  re-cleaned output reads NO_WATERMARK
+independent final-audit real-residual rate ≈ 0 (95% CI)   →  precision confirmed
+retry rate                                                →  tracked, not gated (high ⇒ §1 regression)
+before/after PDF + --debug mask overlay                   →  final human eyeball
 ```
 
-### 3.6 Scope & honest limits
-
-- v28 is the **lab / standalone cleaner**, qualified on benches whose marks sit
-  on flat or smooth-gradient backgrounds (≈ 95 % of the catalog).
-- The verification gate is **OCR-readability based**: it reliably catches
-  *readable* residue but a sub-readable faint ghost can pass. Combined with the
-  full-extent mask this is rare in practice.
-- A faint mark on a busy, low-contrast background may still defeat detection
-  (`no_mark`); the per-channel booster (§1.3) is the mitigation.
-- On dark textured flex cables LaMa can leave a faint cosmetic **smudge** in the
-  masked footprint — no readable text, but visible on close inspection.
-- A filled rectangle can erase product detail if the mark overlaps geometry;
-  there is no product-protection gate (see §2.4).
+### 3.9 Honest limits
+The verification gate is OCR-readability based: it reliably catches *readable* residue, but
+a sub-readable faint ghost can pass (rare with the full-extent mask). A faint mark on a busy,
+low-contrast background may defeat detection (`no_mark`); the per-channel booster is the
+mitigation. On dark textured flex cables LaMa can leave a faint cosmetic smudge (no readable
+text). These are why the ROI router prefers `cover` on risky surfaces and the audit is the
+final arbiter.
 
 ---
 
 ## 4. Performance & scaling
 
-**Measured (Apple M4, single process, GPU):** ~4.7 s/image average (min ~1.1 s,
-max ~69 s on the hardest channel-search cases). Per-image cost is dominated by
-**EasyOCR** (detection + verification); LaMa is negligible after cropping
-(~0.05 s).
+**Measured (Apple M4, single process, GPU):** ~4.7 s/image (min ~1.1 s, max ~69 s on the
+hardest channel-search cases), dominated by EasyOCR; LaMa is ~0.05 s after cropping. Catalog
+re-clean (canonical band, no per-image detect) runs faster (~1 img/s sustained).
 
-| Lever | Effect | Notes |
-|---|---|---|
-| Crop-region inpaint (§2.2) | LaMa 5.5 s → 0.1 s (~55×) | already in v28 |
-| GPU/MPS for OCR + LaMa (§2.3) | OCR 12 s → 1.2 s (~10×); per-image 38 s → ~5 s | already in v28 |
-| Horizontal scale-out | **linear** | embarrassingly parallel; shard images across N GPUs/machines |
-| OCR batching | 2–4× | feed K images per CRAFT/CRNN forward pass to saturate the GPU |
-| Thoroughness tuning | 1.5–2× | composite-only verify unless coloured surface; skip channel passes when not needed |
-| Lighter watermark detector | 1.5–2× | replace general EasyOCR with template/matched-filter for the common case, OCR as fallback |
-| Bigger GPU (M-Max/Ultra, A100/L4) | 2–5× | conv nets scale with GPU |
-
-**Throughput targets for 10 000 images:**
-
-| Setup | Time |
+| Lever | Effect |
 |---|---|
-| One M4, v28 as-is | ~13 h |
-| One M4 + batching + tuning | ~3–4 h |
-| One cloud A100 + batching | ~1–2 h |
-| Scale-out, 10–20 GPU instances | ~15–30 min |
+| Crop-region inpaint | LaMa 5.5 s → 0.1 s (~55×) |
+| GPU/MPS for OCR + LaMa | per-image 38 s → ~5 s (~8×) |
+| Horizontal scale-out | linear — shard across N GPUs |
+| OCR batching | 2–4× (feed K images per CRAFT/CRNN pass) |
 
-CPU multi-processing is **not** a lever — the nets are memory-bandwidth bound on
-CPU. The reliable speedups are GPU utilization (batching) and horizontal
-scale-out.
+**10 000 images:** one M4 as-is ~13 h; + batching/tuning ~3–4 h; one A100 + batching ~1–2 h;
+10–20 GPU scale-out ~15–30 min. CPU multi-processing is **not** a lever (bandwidth-bound).
 
 ---
 
-## 5. File map
+## Usage
 
-| File | Role |
-|------|------|
-| `v28_clean.py` | The entrypoint: detection, full-extent localization, crop+MPS LaMa inpaint, verification gate, recovery, CLI. |
-| `v27_clean.py` | Reused primitives: EasyOCR passes (`_ocr_pass`), fuzzy regex (`SUNSKY_TOKENS`), `union_bbox`, `pad_bbox`, base LaMa wrapper. |
-| `assets/sunsky_alpha.png` | Solved 36×240 alpha template of the mark (aspect 6.67), used by `locate_full_box`. |
-| `assets/sunsky_alpha_meta.json` | Template provenance (canonical size, peak α, logo luma). |
+```bash
+# DETECT — graded find on one image (prints the contract; --masks writes mask PNGs)
+python3 logo_finder.py --input in.jpg --json out.json --masks maskdir --device mps
+python3 logo_finder.py --batch paths.txt --out logo_finds.jsonl --device mps
 
-### Design principle
+# REPAIR (integrated per-image engine: detect → full-extent → inpaint → verify)
+python3 v28_clean.py --input in.jpg --output out.jpg [--debug dbg]
+python3 v28_clean.py --batch items.json --out-dir cleaned/ --log cleaned/_log.json
 
-> Localize the **whole** mark (OCR + per-channel recall + template + stroke-aware
-> growth), inpaint **only** its footprint on the GPU, then **prove** it is gone
-> by re-detecting on the output. Publish `cleaned` only when nothing is found;
-> otherwise recover or report the truth.
+# REPAIR (catalog scale: routed re-clean / restore from backups, resumable)
+python3 reclean.py --run --csv reclean_routing.csv --action reclean --device mps --apply
+python3 reclean.py --run --csv reclean_routing.csv --action restore --apply
+
+# AUDIT — independent residual check over the repaired output
+python3 final_audit.py --n 200 --device mps
+```
+
+Recommended on Apple Silicon: `export PYTORCH_ENABLE_MPS_FALLBACK=1 OCR_DEVICE=mps LAMA_DEVICE=mps`.
+**Dependencies:** Python 3, OpenCV, NumPy, Pillow, `easyocr`, `simple_lama_inpainting`,
+PyTorch. LaMa weights land at `~/.cache/torch/hub/checkpoints/big-lama.pt` on first run.
+
+## Operational notes
+* **MPS stability:** long runs use a fresh process per N images (chunking) to bound Metal
+  memory; the manifest is the resume checkpoint (re-launch skips done work).
+* **One GPU job at a time:** two concurrent OCR/LaMa jobs split the GPU and reintroduce Metal
+  instability — run detect/repair/audit serially under the single owner.
+* **State on disk:** progress, heartbeat, run log, and per-image records are persisted so any
+  long job is resumable and never depends on chat.
+
+## Repository layout
+```
+logo_finder.py            DETECT — Owner Logo Finder (ensemble + graded presence + masks)
+v27_clean.py              DETECT primitives — multi-pass OCR + fuzzy sunsky regex
+v28_clean.py              REPAIR — integrated GPU cleaner (full-extent mask + hard verify gate)
+reclean.py                REPAIR — canonical-band re-clean / restore (catalog scale, resumable)
+run_bulk.py               REPAIR engine — LaMa crop-inpaint, reader, write+backup
+final_audit.py            AUDIT — independent residual re-detection
+reconcile_manifest.py     manifest merge into one authoritative source
+assets/watermark-canonical.png   canonical matte (shape signal, logo_finder)
+assets/sunsky_alpha.png          solved alpha template aspect 6.67 (v28 full-extent)
+docs/OWNER_LOGO_FINDER.md        the DETECT contract
+```

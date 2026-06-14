@@ -9,3 +9,23 @@ build/
 
 # V10 benchmark scratch outputs
 output_*/
+
+# run state / logs / scratch (machine-specific, regenerable)
+logs/
+state/
+reclean_debug/
+*.log
+*.pdf
+failures.csv
+paseo.json
+_reclean_review.txt
+*.pre_reclean.bak
+
+# data manifests & path lists (catalog-specific, not code)
+*.jsonl
+cleaned_*.txt
+reclean_routing.csv
+reclean_pairs.csv
+
+# local drafts / one-off ops scripts
+run_pipeline_DRAFT.py
