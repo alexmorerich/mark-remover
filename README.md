@@ -299,3 +299,106 @@ assets/watermark-canonical.png   canonical matte (shape signal, logo_finder)
 assets/sunsky_alpha.png          solved alpha template aspect 6.67 (v28 full-extent)
 docs/OWNER_LOGO_FINDER.md        the DETECT contract
 ```
+
+<!-- ─────────────────────────────────────────────────────────────────────────
+     AUDIT STAGE (audit agent) — appended section, self-contained.
+     Owner sections are above; edit only within this block to avoid conflicts.
+     Full design: docs/AUDIT_LOGO_FINDER.md
+──────────────────────────────────────────────────────────────────────────── -->
+
+# Audit Stage — Logo Finder & scan sweep  *(audit agent)*
+
+The audit is the **last gate before publish**, kept independent of the cleaner so a
+detector or repair regression can never silently weaken it. It does **not** detect, mask,
+or repair — it re-verifies the finished bytes and answers one question: *would a customer
+still notice a watermark, patch, blur, gray block, broken cable, damaged text, or
+unnatural repair?* If yes → reject. **It is stricter than the owner and never trusts the
+owner's "it's clean" — it re-checks from pixels.** When not clearly safe, reject.
+
+Two tools, two scopes:
+
+| Tool | Scope |
+|---|---|
+| `audit.py` | per-image `(original, final)` **publish gate** — residual + artifact + damage on the final |
+| `scan_audit.py` | **false-negative sweep** — re-checks the images the scan called *clean* for missed marks |
+
+Full design (position id · cleaning strategies · quality-review methods + criteria):
+[`docs/AUDIT_LOGO_FINDER.md`](docs/AUDIT_LOGO_FINDER.md).
+
+### A. Identifying the watermark on the *output*  *(position, audit view)*
+
+The audit re-localises any residual mark independently — it does not reuse the owner's
+box. Signals combine so no single detector decides:
+
+- **Fresh multi-modal OCR** over a band *wider* than the mask (residue survives just
+  outside it, e.g. the `.com` tail), composite **and** per-channel (white-on-colour).
+- **Template correlation** against the solved alpha (shape, where OCR reads nothing).
+- **Dot-chain** (`dot_chain_score`) — periodic horizontal rhythm of faint repeated marks.
+- **Ghost-text** (`ghost_text_score`) — faint transparent-gray silhouette on one text row.
+
+The two shape detectors are deliberately conservative (speckle-removed, *concentration*-
+scored, not absolute density) so flat noise and product texture do not false-reject.
+
+### B. Quality-review methods
+
+On the edit footprint re-derived from the original↔final **pixel diff** (not a trusted
+mask), over a surface-**ROI**-aware risk policy:
+
+| Detector | Catches |
+|---|---|
+| residual watermark | OCR + template + dot-chain + ghost-text traces on the final |
+| repair artifact | rectangular seam, flat block, colour mismatch, texture mismatch |
+| product damage | structure destroyed — *ring-gated*: only a smooth hole **inside textured product** (erasing a mark off a flat tray is not "damage") |
+| protected text | product SKU/label text beside the mark that vanished |
+| false-positive | edit off-target / unnecessary / larger than a mark footprint |
+
+**Risk policy.** Low-risk surfaces (white/near-white tray) tolerate minor uncertainty;
+**high-risk** (thin flex, text/label, metallic, glass/gradient, dark, complex detail)
+escalate any warning to a reject. Product safety outranks watermark removal; visual
+quality outranks pass rate.
+
+### C. Decision contract (`audit_results.jsonl`)
+
+```json
+{
+  "audit_decision": "PASS | PASS_WITH_MINOR_BACKGROUND_ARTIFACT | REJECT_RESIDUAL_WATERMARK |
+                     REJECT_VISIBLE_PATCH | REJECT_PRODUCT_DAMAGE | REJECT_PROTECTED_TEXT_DAMAGE |
+                     REJECT_UNNATURAL_IMAGE | REJECT_UNCERTAIN",
+  "publish_allowed": true,
+  "scores": { "residual_logo_score":0, "dot_chain_score":0, "ghost_text_score":0,
+              "patch_visibility_score":0, "product_damage_score":0, "texture_mismatch_score":0,
+              "color_delta_score":0, "edge_damage_score":0, "protected_text_damage_score":0 },
+  "evidence": [ {"type":"residual_watermark|visible_patch|product_damage|protected_text_damage|texture_mismatch",
+                 "bbox":[x,y,w,h], "severity":"low|medium|high", "reason":"..."} ],
+  "recommended_next_action": "publish | retry_repair | try_cover | auto_reject"
+}
+```
+
+`recommended_next_action` routes the reject: residual → `retry_repair`, visible patch →
+`try_cover`, product/text damage or uncertainty → `auto_reject` (no manual queue).
+
+### D. Criteria
+
+```
+Gate 1  owner verify   residue_after == 0 on every cleaned record       (verify_clean)
+Gate 2  scan sweep     0 missed marks on the scan's "clean" set         (scan_audit.py)
+Gate 3  publish gate   publish_allowed == true for every published img  (audit.py)
+        every reject carries evidence + a next action (auto-routed)
+```
+
+Mandatory rejects (no exceptions): missing/corrupt/invalid input → `REJECT_UNCERTAIN`; any
+visible residual watermark; any visible patch on product; any product-text or structure
+damage; any off-target / unnecessary large edit.
+
+### Run
+
+```bash
+python3 audit.py --selftest                                   # dependency-light reject-path proof
+python3 audit.py --v28-log cleaned/_log.json --out-dir au/ --html
+python3 audit.py --manifest pairs.json --out-dir au/          # owner→audit handoff
+python3 scan_audit.py --set A --scan _wm_scan.jsonl --out-dir auA/   # false-negative sweep (resumable)
+```
+
+Validated: selftest 7/7; real clean pairs 8/8 publish-allowed (0 false rejects);
+adversarial finals (watermark left in, half-clean `.com` tail, gray cover, off-target)
+6/6 rejected with the correct class + next action.
