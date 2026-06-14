@@ -134,7 +134,7 @@ def _light_stroke_frac(bgr, box):
         return 0.0
     g = _gray(bgr[y1:y2, x1:x2]).astype(np.float32)
     h = max(3, (y2 - y1))
-    bg = cv2.medianBlur(_gray(bgr[y1:y2, x1:x2]), max(3, int(0.6 * h) | 1)).astype(np.float32)
+    bg = cv2.medianBlur(_gray(bgr[y1:y2, x1:x2]), min(15, max(3, int(0.6 * h) | 1))).astype(np.float32)
     hf = cv2.absdiff(g, cv2.GaussianBlur(g, (0, 0), max(1.0, h * 0.12)))
     light = ((g - bg) > 6) & ((g - bg) < 80) & (hf > 4)
     return float(light.mean())
@@ -261,7 +261,7 @@ def _faint_mask(crop):
     makes this robust to uniform sensor/JPEG noise (single-pixel specks vanish; connected
     glyph strokes survive) — without it, flat noise reads as a dense 'ghost' everywhere."""
     g = _gray(crop).astype(np.float32)
-    bg = cv2.medianBlur(_gray(crop), max(3, (crop.shape[0] // 2) | 1)).astype(np.float32)
+    bg = cv2.medianBlur(_gray(crop), min(15, max(3, (crop.shape[0] // 2) | 1))).astype(np.float32)
     dev = np.abs(g - bg)
     faint = ((dev > 4) & (dev < 30)).astype(np.uint8)
     faint = cv2.morphologyEx(faint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
@@ -1029,8 +1029,17 @@ def run_manifest(items, out_dir, html=False, no_ocr=False):
         if meta is None and it.get("meta_path") and os.path.exists(it["meta_path"]):
             meta = json.load(open(it["meta_path"]))
         t0 = time.time()
-        rec = audit_pair(it.get("original"), it.get("final"), meta=meta,
-                         mask_path=it.get("mask"), reader=reader)
+        try:
+            rec = audit_pair(it.get("original"), it.get("final"), meta=meta,
+                             mask_path=it.get("mask"), reader=reader)
+        except Exception as e:
+            # never let one bad image stall the orchestrated batch — fail safe to a
+            # publishable=False auto-reject so the run completes and the orchestrator
+            # can move on (it halts only if an item is MISSING from audit_results).
+            rec = {"audit_decision": "REJECT_UNCERTAIN", "publish_allowed": False,
+                   "scores": _empty_scores(), "evidence": [],
+                   "recommended_next_action": "auto_reject",
+                   "notes": f"audit_error: {type(e).__name__}: {str(e)[:200]}"}
         rec["id"] = rid
         rec["original_path"] = it.get("original")
         rec["final_path"] = it.get("final")
