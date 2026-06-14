@@ -142,8 +142,13 @@ def orchestrate(job, device):
         for i in pending:
             imgs[i]["state"] = OWNER_RUNNING
         _save_state(job, st)
-        run_owner(job, device, feedback=is_retry)
-        owner = _read_jsonl_latest(jp(job, "owner_manifest.jsonl"))
+        owner = {}
+        for attempt in range(1, 21):                    # owner is resumable; relaunch if it died mid-batch
+            run_owner(job, device, feedback=is_retry)   # (MPS can crash ~every 1100 imgs — don't false-reject)
+            owner = _read_jsonl_latest(jp(job, "owner_manifest.jsonl"))
+            if all(i in owner for i in pending):
+                break
+            print(f"  owner incomplete {sum(i in owner for i in pending)}/{len(pending)} — relaunch {attempt}", flush=True)
 
         to_audit = []
         for i in pending:
@@ -161,13 +166,17 @@ def orchestrate(job, device):
 
         # ── AUDIT validates (veto authority) ──
         if to_audit:
-            run_audit(job, to_audit, device)
-            audit = _read_jsonl_latest(jp(job, "audit_results.jsonl"))
-            missing = [it["id"] for it in to_audit if it["id"] not in audit]
-            if missing:                                 # audit crashed → HALT, never mass-reject
-                print(f"ERROR: audit returned no result for {len(missing)}/{len(to_audit)} items "
-                      f"(see logs/audit.log). Halting — items stay AUDIT_RUNNING and re-audit on "
-                      f"the next run. Infra failure must not reject recoverable images.", flush=True)
+            audit = {}
+            for attempt in range(1, 21):                # audit resumable per round; relaunch if it died mid-batch
+                run_audit(job, to_audit, device)
+                audit = _read_jsonl_latest(jp(job, "audit_results.jsonl"))
+                if all(it["id"] in audit for it in to_audit):
+                    break
+                print(f"  audit incomplete {sum(it['id'] in audit for it in to_audit)}/{len(to_audit)} "
+                      f"— relaunch {attempt}", flush=True)
+            else:                                       # still incomplete → HALT, never mass-reject
+                print("ERROR: audit could not complete after retries (see logs/audit.log). Halting — "
+                      "items stay AUDIT_RUNNING and re-audit next run. Infra failure must not reject.", flush=True)
                 _save_state(job, st)
                 return report(job, st)
             feedback = []
