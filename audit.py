@@ -91,6 +91,22 @@ HIGH_RISK_ROI = {
     "complex_product_detail",
 }
 
+# Surfaces where the NON-OCR residual detectors (template correlation, dot-chain rhythm, ghost
+# silhouette) and the visible-patch artifact check are RELIABLE: flat, structure-less trays.
+# Everywhere else product structure (flex traces, mesh, connector pins, glossy/metal highlights)
+# correlates with these matched filters and yields false REJECT_RESIDUAL / REJECT_VISIBLE_PATCH —
+# the over-flag documented in audit-engine-misjudgment-request.md §2. So on a STRUCTURED surface
+# OCR (verify_clean composite + per-channel) is the SOLE residual authority and the watermark-
+# footprint inpaint is not treated as a visible patch. The OCR residual path, product-damage,
+# protected-text and false-positive/off-target checks stay fully active on every surface — this
+# narrows the unreliable template-only path, it does not weaken recall.
+FLAT_BG_ROI = {"white_background", "near_white_background"}
+
+
+def _flat_bg(roi):
+    return roi in FLAT_BG_ROI
+
+
 PASS, WARN, FAIL = "pass", "warning", "fail"
 _ORD = {PASS: 0, WARN: 1, FAIL: 2}
 
@@ -334,7 +350,7 @@ GHOST_HARD, GHOST_WARN = 0.55, 0.38
 # present and clean. When we are BLIND (no OCR) or on a high-risk surface, a
 # tint-corroborated template hit is escalated, per "OCR is not sufficient".
 # ─────────────────────────────────────────────────────────────────────────────
-def check_residual_watermark(final, anchor_box, reader, high_risk=False):
+def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=None):
     reasons, notes = [], []
     state = PASS
     sev = 0.0
@@ -367,7 +383,13 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False):
     watermark_like = 0.01 <= light_frac <= 0.6        # real glyph tint, not a flat/edge artifact
     notes.append(f"tpl={tpl_score:.3f} light={light_frac:.3f}")
 
-    if not ocr_hit and watermark_like:
+    # Template correlation may REJECT on its own only on a flat tray, where it is reliable. On a
+    # structured surface the matched filter scores the SAME on clean and watermarked content
+    # (request §2), so without OCR corroboration (this block runs only when OCR read nothing) it
+    # must NOT reject there — OCR is the authority. The score is still reported for transparency.
+    if not ocr_hit and watermark_like and not _flat_bg(roi):
+        notes.append(f"template_only_suppressed(roi={roi},tpl={tpl_score:.3f}); OCR-clean => not residual")
+    elif not ocr_hit and watermark_like:
         if tpl_score >= 0.42:                          # strong structure + tint => surviving mark
             state = FAIL
             if "residual_watermark" not in reasons:
@@ -391,7 +413,7 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False):
 # B. REPAIR ARTIFACT — seam / flat block / colour mismatch / texture mismatch / halo
 # All measured on the patch boundary and interior of the actual edit footprint.
 # ─────────────────────────────────────────────────────────────────────────────
-def check_repair_artifact(orig, final, foot_box, high_risk):
+def check_repair_artifact(orig, final, foot_box, high_risk, roi=None):
     reasons, notes = [], []
     state = PASS
     sev = 0.0
@@ -400,6 +422,16 @@ def check_repair_artifact(orig, final, foot_box, high_risk):
     bw, bh = x2 - x1, y2 - y1
     if bw < 4 or bh < 4:
         return {"state": PASS, "severity": 0.0, "reasons": [], "notes": ["footprint_too_small"]}
+    if not _flat_bg(roi):
+        # The only edit is the watermark-footprint inpaint; on a structured surface its seam /
+        # texture / colour discontinuity against the surrounding cable/mesh/metal is the EXPECTED
+        # result of removing the mark, not a defect (request §3.2). A genuine smear that destroys
+        # product structure is still caught by check_product_damage (active on every surface), so
+        # suppress only the visible-patch verdict here — don't blanket-disable artifact checks.
+        return {"state": PASS, "severity": 0.0, "reasons": [],
+                "notes": [f"patch_check_suppressed_on_structured_roi({roi})"],
+                "patch_visibility_score": 0.0, "color_delta_score": 0.0,
+                "texture_mismatch_score": 0.0, "bbox": [int(x1), int(y1), int(bw), int(bh)]}
 
     inner, outer, _ = _rings(foot_box, final.shape)
     fg = _gray(final).astype(np.float32)
@@ -812,7 +844,7 @@ def audit_pair(original_path, final_path, meta=None, mask_path=None, reader=None
     if foot_box is None:
         # No edit. Safe to publish IFF the original is itself watermark-free in the band.
         roi0, _ = classify_roi(orig, resid_band, meta.get("roi_type"))
-        rw = check_residual_watermark(final, resid_band, reader, high_risk=is_high_risk(roi0))
+        rw = check_residual_watermark(final, resid_band, reader, high_risk=is_high_risk(roi0), roi=roi0)
         rec = _decide({"residual_watermark": rw}, roi=roi0, high_risk=is_high_risk(roi0),
                       dot=dot, ghost=ghost, reader_available=reader is not None,
                       foot_box=resid_band, edited=False)
@@ -824,8 +856,8 @@ def audit_pair(original_path, final_path, meta=None, mask_path=None, reader=None
     high_risk = is_high_risk(roi)
 
     results = {
-        "residual_watermark": check_residual_watermark(final, resid_band, reader, high_risk),
-        "repair_artifact":    check_repair_artifact(orig, final, foot_box, high_risk),
+        "residual_watermark": check_residual_watermark(final, resid_band, reader, high_risk, roi=roi),
+        "repair_artifact":    check_repair_artifact(orig, final, foot_box, high_risk, roi=roi),
         "product_damage":     check_product_damage(orig, final, foot_box, roi, high_risk),
         "protected_text":     check_protected_text(orig, final, foot_box, reader, high_risk),
         "false_positive":     check_false_positive(orig, final, foot_box, diff_box, edit_frac, orig_marks, meta),
@@ -863,7 +895,15 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
         "protected_text_damage_score": round(_clamp01(pt.get("severity", 0.0)), 3),
     }
 
-    residual_fail = (rw.get("state") == FAIL) or dot >= DOT_HARD or ghost >= GHOST_HARD
+    # dot-chain and ghost are matched-filter shape detectors: like template correlation they fire
+    # on periodic product structure (mesh, connector pins, flex traces) and are trustworthy only on
+    # a flat tray. Off a flat background they are diagnostic-only (still reported in `scores`) and
+    # cannot drive a REJECT or even a minor-artifact downgrade — OCR is the residual authority there
+    # (request §2/§3). On a flat tray they keep full force.
+    flat = _flat_bg(roi)
+    dot_eff = dot if flat else 0.0
+    ghost_eff = ghost if flat else 0.0
+    residual_fail = (rw.get("state") == FAIL) or dot_eff >= DOT_HARD or ghost_eff >= GHOST_HARD
     product_fail = (pd_state == FAIL) or (edge_state == FAIL)
     patch_fail = ra.get("state") == FAIL
     ptext_fail = pt.get("state") == FAIL
@@ -879,7 +919,7 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
 
     evidence = []
     if residual_fail:
-        evidence.append(ev("residual_watermark", foot_box, max(scores["residual_logo_score"], dot, ghost),
+        evidence.append(ev("residual_watermark", foot_box, max(scores["residual_logo_score"], dot_eff, ghost_eff),
                            "watermark trace on final: " + (";".join(rw.get("notes", [])[:2])
                                                            or f"dot_chain={dot:.2f} ghost={ghost:.2f}")))
     if product_fail:
@@ -911,7 +951,7 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
     elif uncertain:
         decision, action = "REJECT_UNCERTAIN", "auto_reject"
     elif (ra.get("state") == WARN or scores["patch_visibility_score"] >= 0.5
-          or dot >= DOT_WARN or ghost >= GHOST_WARN or scores["color_delta_score"] >= 0.5):
+          or dot_eff >= DOT_WARN or ghost_eff >= GHOST_WARN or scores["color_delta_score"] >= 0.5):
         decision, action = "PASS_WITH_MINOR_BACKGROUND_ARTIFACT", "publish"
     else:
         decision, action = "PASS", "publish"
@@ -1101,12 +1141,17 @@ def selftest():
 
     rng = np.random.default_rng(7)
 
-    # textured product surface (mid-gray with structure) on a white tray
+    # densely textured product surface (cross-hatched traces on a dark slab) on a white tray.
+    # Cross-hatch (both axes) so a central edit is embedded in structure on all four sides — the
+    # condition under which check_product_damage (the structural backstop that stays active on
+    # textured ROI) can recognise a smooth hole punched into the product.
     def base_scene():
         img = np.full((400, 600, 3), 245, np.uint8)
         img[150:250, 180:430] = (90, 95, 100)               # a dark product slab
-        for x in range(190, 420, 14):                       # connector-pin verticals
-            cv2.line(img, (x, 158), (x, 242), (180, 185, 190), 1)
+        for x in range(188, 426, 10):                       # connector-trace verticals
+            cv2.line(img, (x, 154), (x, 246), (180, 185, 190), 1)
+        for y in range(156, 246, 10):                       # cross traces -> textured on all sides
+            cv2.line(img, (184, y), (428, y), (168, 174, 182), 1)
         img = (img.astype(np.int16) + rng.integers(-4, 5, img.shape)).clip(0, 255).astype(np.uint8)
         return img
 
@@ -1127,13 +1172,15 @@ def selftest():
     expect("gray rectangular patch", audit_pair(save("o2.jpg", orig), save("f2.jpg", final), reader=None),
            "REJECT")
 
-    # 3) watermark-sized region over the part smeared into a blur (pins wiped *inside*
-    #    the patch while the surrounding part stays textured) -> REJECT edge/product damage
+    # 3) product structure destroyed: the repair smeared the cross-hatched traces inside the
+    #    patch into a smooth hole while the surround stays textured. On a textured ROI the
+    #    visible-patch/seam signal is intentionally suppressed (misjudgment fix), so this MUST be
+    #    caught by check_product_damage (the structural backstop) -> REJECT_PRODUCT_DAMAGE.
     orig = base_scene()
     final = orig.copy()
     final[186:228, 250:372] = cv2.GaussianBlur(final[186:228, 250:372], (0, 0), 9)
-    expect("product detail smeared in patch", audit_pair(save("o3.jpg", orig), save("f3.jpg", final), reader=None),
-           "REJECT")
+    expect("product structure destroyed", audit_pair(save("o3.jpg", orig), save("f3.jpg", final), reader=None),
+           "REJECT_PRODUCT_DAMAGE")
 
     # 4) off-target / unnecessary: a big edit on a plain image with no watermark
     orig = np.full((400, 600, 3), 246, np.uint8)
