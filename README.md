@@ -37,6 +37,12 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 | `run_bulk.py` | REPAIR (engine) | LaMa crop-inpaint, OCR reader, in-place write + backup |
 | `final_audit.py` | AUDIT | independent re-detection over repaired output, FP-graded |
 | `reconcile_manifest.py` | — | merge repair results into one authoritative manifest |
+| `audit.py` | AUDIT (logo-finder) | per-image `(original,final)` publish gate → decision class + 9 scores + evidence + next-action; residual / dot-chain / ghost-text / patch / product-damage / protected-text |
+| `scan_audit.py` | AUDIT (false-neg sweep) | re-checks the scan's "clean" verdict with a complementary ensemble; resumable, file-state tracked |
+| `bench_combine.py` | AUDIT (calibration) | labelled-set benchmark behind the detector design |
+
+> **Audit-stage design** (watermark position id · cleaning strategies · cleaning-quality
+> review methods + criteria): [`docs/AUDIT_LOGO_FINDER.md`](docs/AUDIT_LOGO_FINDER.md).
 
 ---
 
