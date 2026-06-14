@@ -30,3 +30,6 @@ reclean_pairs.csv
 
 # local drafts / one-off ops scripts
 run_pipeline_DRAFT.py
+
+# local benchmark data + phase results (machine-specific, large)
+benchmark/

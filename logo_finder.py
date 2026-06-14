@@ -86,6 +86,10 @@ def _ocr_band(reader, bgr):
             for ch in cv2.split(crop):
                 c3 = cv2.cvtColor(ch, cv2.COLOR_GRAY2BGR)
                 hits += v27._ocr_pass(reader, c3, 2.0, _SENS)
+    if not hits:                                            # faint recovery: aggressive contrast stretch
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)          # CLAHE6 + MINMAX surfaces faint/low-alpha marks
+        st = cv2.normalize(cv2.createCLAHE(6.0, (8, 8)).apply(g), None, 0, 255, cv2.NORM_MINMAX)
+        hits = v27._ocr_pass(reader, cv2.cvtColor(st, cv2.COLOR_GRAY2BGR), 2.0, _SENS)
     return [(x1, yy0 + y0, x2, yy1 + y0, t, c) for (x1, yy0, x2, yy1, t, c) in hits]
 
 
