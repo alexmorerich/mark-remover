@@ -64,6 +64,8 @@ LARGE_EDIT_FRAC   = 0.06    # an edit footprint bigger than ~6% of frame is susp
 # A. residual watermark
 RESID_TPL_HARD    = v28e.CLEAN     # 0.30 template corr on final band => mark structure readable
 RESID_TPL_WARN    = v28e.ACCEPT    # 0.24 => possible faint ghost
+RESID_SENSITIVE_CONF = 0.10        # leak-fix: min finder-OCR conf for a SUNSKY fragment on textured
+                                   # ROI to count as residual (catches 'bnline am'@0.23-class marks)
 
 # B. repair artifact
 SEAM_HARD         = 26.0    # mean gradient along the patch perimeter (sharp rectangular seam)
@@ -350,6 +352,33 @@ GHOST_HARD, GHOST_WARN = 0.55, 0.38
 # present and clean. When we are BLIND (no OCR) or on a high-risk surface, a
 # tint-corroborated template hit is escalated, per "OCR is not sufficient".
 # ─────────────────────────────────────────────────────────────────────────────
+def _canonical_band(shape):
+    """The sunsky stamp is a FIXED centre mark (cy/H~0.478, ~0.34*W wide). Cropping the sensitive
+    residual OCR to this tight centre band — NOT the detected resid_band, which for a leak case is
+    derived from the very detection that under-read the mark — is what lets the finder's upscale
+    surface a texture-garbled mark: on the full frame it stays sub-0.1, on this band it reads 0.13."""
+    H, W = shape[:2]
+    return [int(0.33 * W), int(0.42 * H), int(0.67 * W), int(0.56 * H)]
+
+
+def _sensitive_resid_ocr(final, reader):
+    """Detection-grade residual OCR (the finder's multi-pass CLAHE + per-channel) on the canonical
+    centre band of the FINAL. Returns (max_sunsky_conf, hit). On textured/dark surfaces a real mark
+    can garble verify_clean's default pass to nothing while this still reads a SUNSKY fragment
+    (e.g. 'unskv Snlinecam'@0.13 on an earpiece mesh). 0.0 when nothing sunsky-like is read."""
+    crop = _resid_band_crop(final, _canonical_band(final.shape))
+    if crop.size == 0 or min(crop.shape[:2]) < 12:
+        return 0.0, None
+    try:
+        hits = v28e.detect_smart(reader, crop)
+    except Exception:
+        return 0.0, None
+    if not hits:
+        return 0.0, None
+    best = max(hits, key=lambda h: h[5])
+    return float(best[5]), best
+
+
 def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=None):
     reasons, notes = [], []
     state = PASS
@@ -372,6 +401,24 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=Non
             notes.append(f"ocr_resid={len(hits)}:{txt}")
     else:
         notes.append("ocr_unavailable")
+
+    # (1b) LEAK-FIX (audit-engine-leak-fix-request.md §3): on a structured surface the template path
+    # is suppressed (misjudgment patch) and trusts OCR — but verify_clean is LESS sensitive than the
+    # finder's detection OCR and can read nothing on a texture-garbled mark, leaking a visible
+    # watermark to PASS. So when verify_clean is empty on textured/dark ROI, re-check the centre band
+    # with the finder's sensitive OCR; any SUNSKY fragment at conf >= RESID_SENSITIVE_CONF is a
+    # weak-but-present mark => REJECT. Genuinely-clean texture reads nothing sunsky-like and stays PASS.
+    if reader is not None and not ocr_hit and not _flat_bg(roi):
+        sconf, shit = _sensitive_resid_ocr(final, reader)
+        if sconf >= RESID_SENSITIVE_CONF:
+            ocr_hit = True
+            state = FAIL
+            if "residual_watermark" not in reasons:
+                reasons.append("residual_watermark")
+            sev = max(sev, 1.0 + sconf)
+            notes.append(f"sensitive_ocr_resid:{(shit[4] or '')[:14]}@{sconf:.2f}")
+        else:
+            notes.append(f"sensitive_ocr_clean(max={sconf:.2f})")
 
     # (2) template correlation, gated on watermark-like light strokes in the match
     tpl_score, tpl_box = 0.0, None
