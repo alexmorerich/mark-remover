@@ -41,16 +41,19 @@ def build():
     wm = [r for r in recs if r.get("status") == "flagged"
           and any(STRONG.search(str(m)) for m in (r.get("matches") or []))]
     random.seed(11); random.shuffle(wm)
-    got = {k: 0 for k in QUOTA}; items = []
+    got = {k: 0 for k in QUOTA}; items = []; seen = set()
     for r in wm:
         b = os.path.basename(r["path"]); p = os.path.join(BK, b)
         if not os.path.exists(p):
             continue
+        iid = os.path.splitext(b)[0]
+        if iid in seen:                                    # unique ids only (the [:60] truncation collided → 4 dups)
+            continue
         c = cat(b.lower())
         if got[c] >= QUOTA[c]:
             continue
-        got[c] += 1
-        items.append({"id": os.path.splitext(b)[0][:60], "original": p, "final": p})
+        seen.add(iid); got[c] += 1
+        items.append({"id": iid, "original": p, "final": p})
         if sum(got.values()) >= sum(QUOTA.values()):
             break
     os.makedirs(os.path.dirname(ITEMS), exist_ok=True)
