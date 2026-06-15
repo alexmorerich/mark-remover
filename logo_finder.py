@@ -90,6 +90,12 @@ def _ocr_band(reader, bgr):
         g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)          # CLAHE6 + MINMAX surfaces faint/low-alpha marks
         st = cv2.normalize(cv2.createCLAHE(6.0, (8, 8)).apply(g), None, 0, 255, cv2.NORM_MINMAX)
         hits = v27._ocr_pass(reader, cv2.cvtColor(st, cv2.COLOR_GRAY2BGR), 2.0, _SENS)
+    if not hits:                                            # texture suppression: subtract a large-scale
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)          # background so a faint mark on mesh/flex/patterned
+        sm = cv2.resize(g, (max(8, g.shape[1] // 4), max(8, g.shape[0] // 4)))   # surfaces (median k-safe via ÷4)
+        bg = cv2.resize(cv2.medianBlur(sm, 15), (g.shape[1], g.shape[0]))
+        d = cv2.normalize(cv2.absdiff(g, bg), None, 0, 255, cv2.NORM_MINMAX)
+        hits = v27._ocr_pass(reader, cv2.cvtColor(d, cv2.COLOR_GRAY2BGR), 2.5, _SENS)
     return [(x1, yy0 + y0, x2, yy1 + y0, t, c) for (x1, yy0, x2, yy1, t, c) in hits]
 
 
