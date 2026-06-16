@@ -33,3 +33,6 @@ run_pipeline_DRAFT.py
 
 # local benchmark data + phase results (machine-specific, large)
 benchmark/
+
+# scan-stage QA split (symlinks into the live library; rebuilt from the ledger)
+scan_split/
