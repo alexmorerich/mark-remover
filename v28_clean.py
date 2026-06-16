@@ -78,8 +78,11 @@ def locate_full_box(bgr, anchor):
         tw = int(round(th * ASPECT))
         if th >= bh or tw >= bw:
             continue
-        tpl = cv2.resize(ALPHA, (tw, th)).astype(np.float32)
-        r = cv2.matchTemplate(lc, tpl, cv2.TM_CCOEFF_NORMED)
+        try:
+            tpl = cv2.resize(ALPHA, (tw, th)).astype(np.float32)
+            r = cv2.matchTemplate(lc, tpl, cv2.TM_CCOEFF_NORMED)
+        except cv2.error:
+            continue                                              # degenerate scale/region: skip, don't drop the whole check
         lo, hi = max(0, acx - tw + 1), min(r.shape[1] - 1, acx)   # box must contain anchor cx
         if lo > hi:
             continue

@@ -383,6 +383,7 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=Non
     reasons, notes = [], []
     state = PASS
     sev = 0.0
+    resid_box = None        # set when a residual location is recovered (drives the retry re-inpaint)
 
     # (1) fresh multi-modal OCR over a region wider than the mask (composite + per-channel)
     ocr_hit = False
@@ -435,7 +436,33 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=Non
     # (request §2), so without OCR corroboration (this block runs only when OCR read nothing) it
     # must NOT reject there — OCR is the authority. The score is still reported for transparency.
     if not ocr_hit and watermark_like and not _flat_bg(roi):
-        notes.append(f"template_only_suppressed(roi={roi},tpl={tpl_score:.3f}); OCR-clean => not residual")
+        # Template SEES structure here but is unreliable on a structured surface — it scores the same
+        # on clean product texture (request §2), so it is suppressed and cannot reject. BUT a faint
+        # PARTIAL residual (e.g. a surviving '.com' tail) that OCR is blind to lives EXACTLY here and
+        # would leak to PASS — the Phase-4 metallic leak. When the suppressed signal is non-trivial
+        # (tpl>=HARD + watermark-like tint), ARBITRATE with the finder: the pipeline's detection
+        # ensemble, run on the SAVED final. It separates a real residual from product texture where
+        # template/dot/ghost cannot (0 FP across 181 cleaned finals; the leak read LIKELY@0.43,
+        # deterministic) — and auditing the saved bytes closes the gap where the owner's in-memory
+        # self-check passes but JPEG re-encode tips detection over threshold. A hit -> retry (a
+        # retry_hint drives a region re-inpaint, proven to clear it), NEVER a hard reject on this path.
+        if tpl_score >= RESID_TPL_HARD:
+            try:
+                import logo_finder as _lf
+                fr = _lf.find(final, reader)
+                if fr.get("presence") in ("CONFIRMED_WATERMARK", "LIKELY_WATERMARK") and fr.get("candidates"):
+                    state = FAIL
+                    if "residual_watermark" not in reasons:
+                        reasons.append("residual_watermark")
+                    sev = max(sev, 1.5)
+                    resid_box = [int(v) for v in fr["candidates"][0]["_box"]]
+                    notes.append(f"finder_resid:{fr['presence']}@{resid_box}")
+                else:
+                    notes.append(f"finder_arbitrated_clean(tpl={tpl_score:.3f})")
+            except Exception as e:
+                notes.append(f"finder_check_err:{type(e).__name__}")
+        else:
+            notes.append(f"template_only_suppressed(roi={roi},tpl={tpl_score:.3f}); OCR-clean => not residual")
     elif not ocr_hit and watermark_like:
         if tpl_score >= 0.42:                          # strong structure + tint => surviving mark
             state = FAIL
@@ -453,7 +480,7 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=Non
 
     return {"state": state, "severity": sev, "reasons": reasons,
             "template_resid": round(float(tpl_score), 3),
-            "light_frac": round(float(light_frac), 3), "notes": notes}
+            "light_frac": round(float(light_frac), 3), "notes": notes, "resid_box": resid_box}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1009,8 +1036,16 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
             note_bits.append(f"{nm}[" + ";".join(blk["notes"][:2]) + "]")
     notes = f"roi={roi} high_risk={high_risk} dot={dot:.2f} ghost={ghost:.2f}. " + " ".join(note_bits)
 
-    return {"audit_decision": decision, "publish_allowed": decision in ("PASS", "PASS_WITH_MINOR_BACKGROUND_ARTIFACT"),
-            "scores": scores, "evidence": evidence, "recommended_next_action": action, "notes": notes}
+    out = {"audit_decision": decision, "publish_allowed": decision in ("PASS", "PASS_WITH_MINOR_BACKGROUND_ARTIFACT"),
+           "scores": scores, "evidence": evidence, "recommended_next_action": action, "notes": notes}
+    # Tell the Owner WHERE the mark still is so the retry does a region-targeted re-inpaint instead of
+    # re-detecting (the first pass leaked precisely because detection under-read it). Prefer the finder's
+    # recovered box (set on the structured arbitration path); fall back to the edit footprint.
+    if decision == "REJECT_RESIDUAL_WATERMARK" and action == "retry_repair":
+        hint_box = rw.get("resid_box") or foot_box
+        if hint_box:
+            out["retry_hint"] = {"box": [int(v) for v in hint_box]}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
