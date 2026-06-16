@@ -193,7 +193,12 @@ def orchestrate(job, device):
                     imgs[i]["retry_count"] += 1
                     if action in RETRYABLE_ACTIONS and imgs[i]["retry_count"] <= st["max_retry"]:
                         imgs[i]["state"] = RETRY
-                        feedback.append({"id": i, "verdict": AUDIT2FAIL.get(dec, "FAIL_UNCERTAIN")})
+                        fl = {"id": i, "verdict": AUDIT2FAIL.get(dec, "FAIL_UNCERTAIN")}
+                        hint = ar.get("retry_hint")          # additive; Audit emits it ONLY on retry_repair
+                        if hint and hint.get("box"):         # tell the Owner WHERE the mark still is
+                            imgs[i]["retry_box"] = [int(v) for v in hint["box"]]  # stash on state (resumable)
+                            fl["retry_box"] = imgs[i]["retry_box"]                # rides audit_feedback.jsonl → Owner
+                        feedback.append(fl)
                     else:
                         imgs[i]["state"] = REJECT
                         _reject_file(job, imgs[i])

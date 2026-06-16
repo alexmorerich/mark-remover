@@ -67,7 +67,7 @@ def _mark_present(bgr, reader):
 
 
 # ── Steps 1–5 for one image. Returns (record, image_or_'COPY'_or_None, dest, mask) ──
-def process_one(img_path, job, reader, attempt=0, fail_reason=None):
+def process_one(img_path, job, reader, attempt=0, fail_reason=None, retry_box=None):
     iid = os.path.splitext(os.path.basename(img_path))[0]
     rec = {"id": iid, "original": os.path.relpath(img_path, job), "final": None,
            "owner_status": None, "method": None, "watermark_status": None,
@@ -84,6 +84,31 @@ def process_one(img_path, job, reader, attempt=0, fail_reason=None):
     res = lf.find(bgr, reader)
     ws = WM_STATUS.get(res["presence"], "no_watermark")
     rec["watermark_status"] = ws
+
+    # ── Retry with audit hint: region-targeted residual re-inpaint ──────────────
+    # On a FAIL_RESIDUAL_WATERMARK retry the Audit reports WHERE it still sees the
+    # mark (retry_box, full-image px == original dims). The first pass leaked here
+    # precisely because the detector under-read this mark, so the retry must NOT
+    # depend on re-detection — note we re-inpaint even when lf.find now reports
+    # no_watermark (it would otherwise copy the dirty original straight through).
+    # Union the hint with any fresh detection, pad wide, and re-inpaint through
+    # clean_image's reuse-box path (skips re-detect, runs its aggressive 2nd pass on
+    # residual). Audit re-audits the result — a surviving mark still REJECTs and
+    # MAX_RETRY still caps. Retry-path only: retry_box is None on the first pass, so
+    # first-pass finals are byte-identical.
+    if retry_box is not None and fail_reason == "FAIL_RESIDUAL_WATERMARK":
+        det = res["candidates"][0]["_box"] if res.get("candidates") else None
+        base = rb.union_bbox([tuple(det), tuple(retry_box)]) if det else list(retry_box)
+        bbox_p = rb.pad_bbox(base, bgr.shape, pad_frac_x=0.30, pad_frac_y=0.50, pad_px_min=12)
+        cleaned, cinfo = rb.clean_image(bgr, bbox_p=bbox_p)    # bbox_p passed → no re-detect
+        if cleaned is None:                                    # box was passed, so this is defensive
+            cleaned = bgr
+        rec.update(owner_status="cleaned", method="repair_hint",
+                   notes=f"residual retry @ audit hint {[int(v) for v in retry_box]} "
+                         f"-> bbox_p={bbox_p} residual_after={cinfo.get('residual_after')}")
+        rec["retry_hint_box"] = [int(v) for v in retry_box]
+        rec["bbox_padded"] = list(bbox_p)
+        return rec, cleaned, "final", None
 
     if ws == "no_watermark":
         rec.update(owner_status="copied_no_watermark", method="copy",
@@ -212,6 +237,7 @@ def handle_feedback(job, device):
         iid, verdict = item["id"], item.get("verdict", "")
         if verdict == "PASS" or verdict not in FAIL_REASONS:
             continue
+        retry_box = item.get("retry_box")                      # audit hint (residual retries only); None otherwise
         prev = latest.get(iid, {})
         attempt = int(prev.get("attempt", 0)) + 1
         src = os.path.join(job, prev.get("original", os.path.join("originals", iid + ".jpg")))
@@ -224,7 +250,8 @@ def handle_feedback(job, device):
                 shutil.copy2(src, os.path.join(dirs["rejected"], os.path.basename(src)))
             mf.write(json.dumps(rec) + "\n"); tally["auto_rejected"] += 1
             continue
-        rec, img, dest, mask = process_one(src, job, reader, attempt=attempt, fail_reason=verdict)
+        rec, img, dest, mask = process_one(src, job, reader, attempt=attempt,
+                                           fail_reason=verdict, retry_box=retry_box)
         _save(rec, img, dest, mask, dirs, src, job)
         mf.write(json.dumps(rec) + "\n")
         tally[rec["owner_status"]] += 1
