@@ -22,6 +22,7 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import logo_finder as lf
 import run_bulk as rb
+import product_preserve_clean as ppc
 
 MAX_RETRY = 2
 IMG_EXT = (".jpg", ".jpeg", ".png", ".webp")
@@ -64,6 +65,17 @@ def repair_strategy(roi):
 def _mark_present(bgr, reader):
     """Light internal quality gate — is a watermark still findable on this image?"""
     return lf.find(bgr, reader)["presence"] in ("CONFIRMED_WATERMARK", "LIKELY_WATERMARK")
+
+
+def _mark_mostly_on_white(bgr):
+    """The watermark band is predominantly white background — i.e. the mark sits mostly on white
+    with thin/discrete product structure in it (flex cables, screws, components, pointer arrows).
+    These are exactly the cases LaMa inpaint DESTROYS, so route them to structure-preserving
+    recovery. Large product surfaces filling the band (screens/plates) stay on the inpaint path."""
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    H = g.shape[0]
+    band = g[int(0.42 * H):int(0.56 * H)]
+    return band.size > 0 and float((band > 238).mean()) >= 0.55
 
 
 # ── Steps 1–5 for one image. Returns (record, image_or_'COPY'_or_None, dest, mask) ──
@@ -144,9 +156,23 @@ def process_one(img_path, job, reader, attempt=0, fail_reason=None, retry_box=No
             return rec, None, "reject", None
         mask_key = "stroke_mask"
 
-    # Step 4: generate the final
+    # Step 4: generate the final.
     masks = lf._masks(bgr.shape, box, roi)
-    final = rb._lama_crop_inpaint(bgr, masks[mask_key])[0]
+    # White-background SKUs: RECOVER the surface under the semi-transparent mark instead of
+    # inpainting it. LaMa inpaint fills/hallucinates and destroys thin product geometry sitting in
+    # the mark band — flex cables broken, gold contacts erased, screws/components smeared, pointer
+    # arrowheads removed (the canonical_band damage class). product_preserve_clean whitens the mark
+    # on white (solid shapes protected) and re-darkens it where it crosses a dark cable — no inpaint,
+    # structure preserved. Fall back to inpaint only if a residual survives; non-white / large-surface
+    # SKUs and retries keep the inpaint path unchanged.
+    if not fail_reason and _mark_mostly_on_white(bgr):
+        final = ppc.clean(bgr)
+        method = "structure_preserve"
+        if _mark_present(final, reader):
+            final = rb._lama_crop_inpaint(bgr, masks[mask_key])[0]
+            method = "inpaint"
+    else:
+        final = rb._lama_crop_inpaint(bgr, masks[mask_key])[0]
 
     # Step 4 internal quality gate: mark must be gone; else escalate to cover, else reject
     if _mark_present(final, reader):
