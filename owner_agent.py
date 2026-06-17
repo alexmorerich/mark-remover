@@ -195,7 +195,8 @@ def _save(rec, img, dest, mask, dirs, src_path, job):
         if isinstance(img, str) and img == "COPY":
             shutil.copy2(src_path, outp)                       # no re-encode for clean images
         else:
-            rb._imwrite_atomic(outp, img)
+            img = ppc.band_residual_cleanup(img)              # universal residual sweep: kill faint
+            rb._imwrite_atomic(outp, img)                     # mark the finder is blind to before publish
         rec["final"] = os.path.relpath(outp, job)
         if mask is not None:
             cv2.imwrite(os.path.join(dirs["masks"], rec["id"] + ".png"), mask)

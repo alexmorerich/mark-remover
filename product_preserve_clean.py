@@ -95,6 +95,29 @@ def clean_dark_cable_on_white(bgr, dark_thr=DARK):
     return out
 
 
+def band_residual_cleanup(bgr):
+    """Universal final residual sweep over the FIXED watermark band, for marks that the primary
+    clean (LaMa or structure-preserve) under-removed and the finder is blind to (faint gray on
+    white / metal — the residual class). Whitens any surviving mark on the white background (solid
+    product shapes protected) and re-darkens it on a uniform near-black surface. Idempotent on
+    already-clean images; mid-tone / coloured / metallic surfaces are left untouched (no damage)."""
+    H, W = bgr.shape[:2]
+    y1, y2 = int(BAND_Y0 * H), int(BAND_Y1 * H)
+    out = bgr.copy()
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    band = np.zeros((H, W), bool)
+    band[y1:y2] = True
+    solid = _solid_mask(g, band)
+    out[band & (~solid) & (g < 248)] = (255, 255, 255)                 # surviving mark on white bg
+    blk = bgr[(g < 70) & band]
+    if len(blk) > 40:                                                   # a real uniform-black surface is present
+        cc = np.median(blk, axis=0)
+        darku = cv2.morphologyEx(((g < 160) & band).astype(np.uint8), cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        out[band & (darku > 0) & (g > int(cc.mean()) + 22) & (g < 170)] = cc   # mark lightening black
+    return out
+
+
 def _alpha_meta():
     meta = json.load(open(_META))
     a0 = cv2.imread(_ALPHA, cv2.IMREAD_GRAYSCALE).astype(np.float32)
