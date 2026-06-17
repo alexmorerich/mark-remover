@@ -36,3 +36,6 @@ benchmark/
 
 # scan-stage QA split (symlinks into the live library; rebuilt from the ledger)
 scan_split/
+
+# sample QA image sets (artifacts, not source)
+sample_cleaned_*
