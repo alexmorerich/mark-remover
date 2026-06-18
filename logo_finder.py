@@ -43,7 +43,10 @@ _SENS = dict(contrast_ths=0.01, adjust_contrast=0.9, text_threshold=0.4,
 # STRONG: unmistakable sunsky-online.com fragments.  MED: plausible online/.com pieces.
 # NOISE: bare tokens v27's permissive regex also matches but which are usually product text.
 _STRONG = re.compile(r"s[uo0]ns[kh]|nline|onlin|sky-?o|onl[il]ne|\.com|online\.?com", re.I)
-_MED = re.compile(r"\bonl|nlin|line|sky[-\s]|\.c[o0]|[o0]nne|hline", re.I)
+# NOTE: `[o0]nne` was removed — it matched "C-onne-ct" ("Connect The Cable") and graded
+# legit product captions as MED, so the owner inpainted over them. "online" never OCRs to
+# "onne", so dropping it costs zero watermark recall.
+_MED = re.compile(r"\bonl|nlin|line|sky[-\s]|\.c[o0]|hline", re.I)
 _NOISE = re.compile(r"^[\W_]*(c[0-9]?n|rcn|c8n|cemn|stock\w*|sky|sansky\s+\w+)[\W_]*$", re.I)
 
 MATTE_PATH = os.environ.get("CANON_MATTE", os.path.join(
@@ -109,6 +112,21 @@ def _text_grade(text):
     if _MED.search(t):
         return 0.55, "online/.com"
     return 0.25, None
+
+
+def _is_product_caption(src, strength, conf, ev):
+    """True when an OCR fragment is confidently-read PRODUCT CAPTION text, not the mark.
+
+    The SUNSKY mark is a faint domain string anchored at cy/H≈0.475. A crisp OCR read that is
+    NOT an unmistakable sunsky/online fragment (graded below STRONG), sits away from that centre,
+    and has no matte+rhythm corroboration is product caption text — e.g. "Connect The Cable",
+    "Dust-proof Earspeaker Mesh". find() DROPs these so the owner never inpaints over a caption.
+    Real marks bypass three ways: STRONG text (strength==1.0), a near-centre box, or matte+dot-
+    chain corroboration.
+    """
+    return (src == "ocr" and strength < 1.0 and conf >= 0.45
+            and ev["center_prior_score"] < 0.15
+            and not (ev["template_score"] >= 0.45 and ev["dot_chain_score"] >= 0.30))
 
 
 # ───────────────────────────── 3. canonical matte (shape) ─────────────────────────
@@ -312,6 +330,12 @@ def find(bgr, reader=None, category=None):
         if ev["edge_score"] > 0.6 and ev["dot_chain_score"] < 0.2 and ev["text_fragment_score"] < 0.3:
             score -= 0.10                                   # random product texture
         score = max(0.0, min(1.0, score))
+
+        # Precision guard — DROP confidently-read product captions (see _is_product_caption).
+        # `continue` rather than relabel so a caption can never be chosen as the repair target
+        # over a real, lower-scored centre mark on the same image.
+        if _is_product_caption(c["src"], c["strength"], c["conf"], ev):
+            continue
 
         # presence (text grading is the precision guard)
         legible = c["strength"] >= 1.0 and c["conf"] >= 0.30
