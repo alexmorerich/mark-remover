@@ -3,7 +3,27 @@
 Removes the **`sunsky-online.com`** semi-transparent text watermark from B2B product
 photos at catalog scale, leaving no readable residue and **no damage to clean images**.
 
-The system is a single-owner, three-stage pipeline with stable typed interfaces:
+The codebase has **two layers**: a typed **multi-agent layer** (`agents/` + `shared/contract.py`
++ `integration/`), built so six coder agents can develop in parallel, that wraps a set of stable
+**production engines** (`logo_finder` · LaMa · `audit`) doing the real pixel work. The agent layer
+is the spec-shaped front; the engines are the proven back. Neither rewrites the other.
+
+**Agent layer** — six responsibility-isolated wrappers, one directory each, talking only through
+`shared/contract.py`:
+
+```text
+  image ─▶ detector ─(no mark)─▶ SKIP
+             │ mask · type · score
+             ▼
+        orchestrator ──route (select_tier)──▶ classic · neural · diffusion  cleaner
+        (retry owner)  ▲                          tier 1   tier 2    tier 3
+             │ escalate 1→2→3                          └─────────┬─────────┘
+             └──────────────── fail ───────────────────────── validator ──pass──▶ PASS
+                           retries exhausted ─▶ MANUAL_REVIEW
+  integration/ assembles the six + guards shared/contract.py · tests/contract_tests/ is the boundary
+```
+
+**Engine layer** — underneath, the stable engines run the single-owner, three-stage pipeline:
 
 ```
    DETECT                         REPAIR                         AUDIT
@@ -28,6 +48,27 @@ changing detection, run the end-to-end benchmark. Every change preserves manifes
 compatibility, the final audit, and the auto-reject policy. The detect contract is
 [`docs/OWNER_LOGO_FINDER.md`](docs/OWNER_LOGO_FINDER.md).
 
+**Parallel development.** The six agents each own one directory and never edit another's code;
+they couple only through `shared/contract.py`, which changes solely on a `contract/*` branch
+reviewed by the `integration/` owner (enforced via [`.github/CODEOWNERS`](.github/CODEOWNERS)).
+`integration/` is the neutral coordinator that assembles the agents and merges their branches;
+`tests/contract_tests/` is the boundary every agent must keep green. See
+[`agents/README.md`](agents/README.md) and [`integration/README.md`](integration/README.md).
+
+## Quickstart
+
+```bash
+python3 cli.py IMG.jpg --device mps [--out clean.jpg]     # run the pipeline on one image
+python3 tests/contract_tests/test_contract.py             # contract tests (pure Python, no GPU)
+python3 -m integration.e2e IMAGES_DIR --n 20 --device cpu # end-to-end terminal-state tally
+```
+
+The agent layer (`Detector` · `Orchestrator` · `Classic`/`Neural`/`Diffusion` cleaner · `Validator`)
+maps onto the engines below as: detector → `logo_finder`; classic-cleaner → `product_preserve_clean`
++ OpenCV Telea; neural-cleaner → `run_bulk` LaMa; validator → `audit.py`. Outcomes are `PASS` ·
+`SKIP` · `MANUAL_REVIEW` (the single failure exit; on disk it is CONTRACT_v1's `auto_rejected`,
+original restored from backup).
+
 | Module | Stage | Responsibility |
 |---|---|---|
 | `orchestrator.py` | ORCHESTRATOR | deterministic state machine (not an AI agent): drives Owner→Audit, owns `state.json` + retry + publish/reject, resumable, fail-safe |
@@ -42,7 +83,7 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 | `audit.py` | AUDIT (logo-finder) | per-image `(original,final)` publish gate → decision class + 9 scores + evidence + next-action; residual / dot-chain / ghost-text / patch / product-damage / protected-text |
 | `scan_audit.py` | AUDIT (false-neg sweep) | re-checks the scan's "clean" verdict with a complementary ensemble; resumable, file-state tracked |
 | `bench_combine.py` | AUDIT (calibration) | labelled-set benchmark behind the detector design |
-| `agents/` + `shared/` | ALL (typed layer) | six responsibility-isolated wrapper agents over the engines above (detector · orchestrator · classic/neural/diffusion cleaner · validator) behind `shared/contract.py`; single retry owner, `select_tier` routing, `PASS`/`SKIP`/`MANUAL_REVIEW` |
+| `agents/` + `shared/` + `integration/` | ALL (typed layer) | six responsibility-isolated wrapper agents (detector · orchestrator · classic/neural/diffusion cleaner · validator) behind `shared/contract.py`, assembled + contract-guarded by `integration/`; single retry owner, `select_tier` routing, `PASS`/`SKIP`/`MANUAL_REVIEW`. Covered by `tests/contract_tests/` |
 
 > **Production architecture** (Owner produces · Audit validates · Orchestrator decides —
 > deterministic, file-only, no Manager Agent): [`docs/ORCHESTRATOR_ARCHITECTURE.md`](docs/ORCHESTRATOR_ARCHITECTURE.md).
@@ -54,6 +95,9 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 > `shared/contract.py` for parallel development — canonical `Detector`/`Orchestrator`/`Cleaner`-tiers/
 > `Validator` interfaces, escalation ladder, `MANUAL_REVIEW`≡`auto_rejected`; wraps the engines above
 > without rewriting them): [`agents/README.md`](agents/README.md).
+>
+> **Integration / merge coordination** (the neutral area that assembles the six agents, runs the
+> end-to-end smoke, and guards `shared/contract.py`): [`integration/README.md`](integration/README.md).
 >
 > **Audit-stage design** (watermark position id · cleaning strategies · cleaning-quality
 > review methods + criteria): [`docs/AUDIT_LOGO_FINDER.md`](docs/AUDIT_LOGO_FINDER.md).
