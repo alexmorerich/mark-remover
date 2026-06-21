@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from shared.contract import (CleanRequest, CleanResult, Cleaner, DetectionResult, QAReport,
                              Status, WatermarkType)
-from agents.orchestrator import Orchestrator, PipelineConfig, build_default_pipeline
+from agents.orchestrator import Orchestrator, PipelineConfig
+from integration import build_default_pipeline
 
 
 # ───────────────────────── fakes (no heavy backends) ─────────────────────────

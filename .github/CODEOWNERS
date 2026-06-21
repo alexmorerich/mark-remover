@@ -1,0 +1,12 @@
+# Code ownership — the shared contract is the one cross-agent coupling point.
+# It changes only via a contract/* branch reviewed by the integration owner (integration/README.md §4).
+# Enable branch protection → "Require review from Code Owners" to make this binding.
+
+/shared/                @alexmorerich
+/shared/contract.py     @alexmorerich
+/integration/           @alexmorerich
+
+# The six agents each own their own directory (parallel development, agents/README.md §2).
+# Add per-agent owners here as coders are assigned, e.g.:
+#   /agents/detector/        @detector-owner
+#   /agents/validator/       @validator-owner

@@ -12,7 +12,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agents.orchestrator import build_default_pipeline
+from integration import build_default_pipeline
 from shared.contract import Status
 
 

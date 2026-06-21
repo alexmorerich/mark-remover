@@ -33,9 +33,18 @@ agents/
   validator/           # QA checks only
 shared/
   contract.py          # shared typed record / enum / interface — changes need coordination (§4)
+integration/           # NEUTRAL coordinator (not one of the six): assembly + merge + contract guard
+  pipeline.py          # the only module that imports all six agents and wires them together
+  e2e.py               # post-merge end-to-end smoke over real images
 tests/
   contract_tests/      # integration boundary; every agent must keep it green
 ```
+
+> **Why `integration/` is separate from `agents/orchestrator/`.** The orchestrator is a *runtime*
+> agent — one of the six — that routes a single image. Integration is the *build/merge-time*
+> coordinator that assembles all six and guards the contract. Keeping assembly in `integration/`
+> means no agent directory imports another, and the coder on `orchestrator` is not also the
+> integrator of everyone else's work. See [`integration/README.md`](../integration/README.md).
 
 > **Naming note.** Python package directories use underscores (`classic_cleaner`) because hyphens
 > are not valid import identifiers; the agent **charters** and the canonical agent **names**
@@ -115,22 +124,26 @@ Before any commit, all of these must hold (and are asserted in `tests/contract_t
 
 > If the contract tests pass, each agent's output composes with the others.
 
-### 3.4 Integration merges serially
+### 3.4 The `integration/` area merges serially
+
+The neutral integration owner (not any single agent — see [`integration/README.md`](../integration/README.md)) merges:
 
 1. Merge **low-risk single-agent fixes** first (small diff, no interface change).
-2. Run **end-to-end** tests.
-3. Merge interface-touching changes last.
+2. Run `tests/contract_tests/` **and** `integration/e2e.py` (end-to-end on a sample).
+3. Merge interface-touching changes last, one at a time.
 
 ---
 
 ## 4. Changing `shared/contract.py`
 
-`shared/contract.py` is the one shared coupling point — touching it affects every agent.
+`shared/contract.py` is the one shared coupling point — touching it affects every agent. The
+**`integration/` owner is its guardian** (enforced by [`.github/CODEOWNERS`](../.github/CODEOWNERS)).
 
 - ❌ Don't slip a contract change into a normal bug branch.
 - ✅ Open a dedicated `contract/<change>` branch: edit `contract.py` + `contract_tests` there, merge
   it first, then every agent rebases onto it.
-- ✅ Contract changes are reviewed — never a silent single-agent edit.
+- ✅ Contract changes are reviewed by the integration owner — never a silent single-agent edit.
+  (`shared/` is owned in CODEOWNERS; enable branch protection → *Require review from Code Owners*.)
 
 ---
 
