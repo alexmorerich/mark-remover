@@ -42,12 +42,18 @@ compatibility, the final audit, and the auto-reject policy. The detect contract 
 | `audit.py` | AUDIT (logo-finder) | per-image `(original,final)` publish gate → decision class + 9 scores + evidence + next-action; residual / dot-chain / ghost-text / patch / product-damage / protected-text |
 | `scan_audit.py` | AUDIT (false-neg sweep) | re-checks the scan's "clean" verdict with a complementary ensemble; resumable, file-state tracked |
 | `bench_combine.py` | AUDIT (calibration) | labelled-set benchmark behind the detector design |
+| `agents/` + `shared/` | ALL (typed layer) | six responsibility-isolated wrapper agents over the engines above (detector · orchestrator · classic/neural/diffusion cleaner · validator) behind `shared/contract.py`; single retry owner, `select_tier` routing, `PASS`/`SKIP`/`MANUAL_REVIEW` |
 
 > **Production architecture** (Owner produces · Audit validates · Orchestrator decides —
 > deterministic, file-only, no Manager Agent): [`docs/ORCHESTRATOR_ARCHITECTURE.md`](docs/ORCHESTRATOR_ARCHITECTURE.md).
 >
 > **Owner Agent workflow** (original → detect → repair/cover → final + manifest → retry on
 > Audit feedback): [`docs/OWNER_AGENT_WORKFLOW.md`](docs/OWNER_AGENT_WORKFLOW.md).
+>
+> **Multi-agent typed layer** (six responsibility-isolated wrapper agents behind
+> `shared/contract.py` for parallel development — canonical `Detector`/`Orchestrator`/`Cleaner`-tiers/
+> `Validator` interfaces, escalation ladder, `MANUAL_REVIEW`≡`auto_rejected`; wraps the engines above
+> without rewriting them): [`agents/README.md`](agents/README.md).
 >
 > **Audit-stage design** (watermark position id · cleaning strategies · cleaning-quality
 > review methods + criteria): [`docs/AUDIT_LOGO_FINDER.md`](docs/AUDIT_LOGO_FINDER.md).
