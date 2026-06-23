@@ -68,8 +68,69 @@ If generation would alter product identity:
 - Do not replace the original input.
 - Do not remove real product markings or labels.
 
+## Failure Codes
+
+Set `CleanResult.meta["failure_reason"]` to one of the following `FailureReason` enum members
+(imported from `shared.contract`) when refusing a request. The Orchestrator reads this value to
+decide whether to terminate to MANUAL_REVIEW rather than retrying.
+
+```python
+from shared.contract import FailureReason
+
+# diffusion model may hallucinate product-specific features not in the original
+FailureReason.SEMANTIC_PRODUCT_RISK      # "semantic_product_risk"
+
+# completing the inpaint would alter the product's visual identity or brand markings
+FailureReason.PRODUCT_IDENTITY_CHANGE    # "product_identity_change"
+
+# high probability the model invents new background or product content
+FailureReason.HALLUCINATION_RISK         # "hallucination_risk"
+```
+
+Refused `CleanResult` shape:
+```json
+{
+  "agent": "diffusion-cleaner",
+  "status": "refused",
+  "failure_reason": "semantic_product_risk"
+}
+```
+
 ## Definition of done
 
 - Output includes seed, model, prompt/config reference, and mask path.
 - Unmasked regions remain visually and structurally consistent with the original.
 - Refusal is preferred over product hallucination.
+
+
+
+---
+
+### 3. `agents/diffusion_cleaner/agent.md`
+
+```markdown
+# Diffusion Cleaner Agent
+
+## Mission
+Tier 3 cleaner. Final resort for complex background reconstruction.
+
+## Tier Contract
+- **Tier:** 3 (Generative)
+- **Scope:** Complex, large-scale watermark removal where texture continuity is otherwise impossible.
+- **Constraints:** Must preserve original product identity 100%.
+
+## Product-Preserve Prompt Template
+When invoking the diffusion backend, strictly enforce:
+> "Inpaint only the masked region. Preserve the product exactly as in original: same shape, color, ports, labels, and geometry. Reconstruct only background texture consistent with surroundings. NO new objects, NO new text, NO new shadows. Maintain identical resolution and framing."
+
+## Outputs (Status)
+Append a `cleaner` block:
+```json
+{
+  "agent": "diffusion-cleaner",
+  "status": "cleaned",
+  "output_path": "...",
+  "method": "diffusion_inpaint",
+  "model": "sd_or_imagen",
+  "seed": 12345
+}

@@ -17,8 +17,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from shared.contract import (CleanRequest, CleanResult, Cleaner, DetectionResult, QAReport,
-                             Status, WatermarkType)
+from shared.contract import (CleanRequest, CleanResult, Cleaner, DetectionResult, FailureReason,
+                             QAReport, Status, WatermarkType)
 from agents.orchestrator import Orchestrator, PipelineConfig
 from integration import build_default_pipeline
 
@@ -276,6 +276,231 @@ class TestCleanerBoundary(unittest.TestCase):
         res = c.clean(req)
         self.assertTrue(np.array_equal(img, before))
         self.assertEqual(res.meta["method"], "telea")
+
+
+# ───────────────────────── FailureReason taxonomy ─────────────────────────
+class TestFailureReasonTaxonomy(unittest.TestCase):
+    """Boundary tests for the FailureReason enum added in contract.py.
+
+    These guard the integration surface: if a member is renamed or removed,
+    agent code that references it by name will break at the import boundary —
+    this test catches that before any engine runs.
+    """
+
+    # ── presence: every chartered member must exist ───────────────────────
+    def test_classic_tier_reasons_present(self):
+        self.assertIs(FailureReason.MASK_OVER_PRODUCT_DETAIL,
+                      FailureReason("mask_over_product_detail"))
+        self.assertIs(FailureReason.BACKGROUND_TOO_COMPLEX,
+                      FailureReason("background_too_complex"))
+        self.assertIs(FailureReason.UNSAFE_FOR_CLASSIC,
+                      FailureReason("unsafe_for_classic"))
+
+    def test_neural_tier_reasons_present(self):
+        self.assertIs(FailureReason.SEMANTIC_RISK, FailureReason("semantic_risk"))
+        self.assertIs(FailureReason.PRODUCT_DAMAGE, FailureReason("product_damage"))
+        self.assertIs(FailureReason.MASK_TOO_SMALL, FailureReason("mask_too_small"))
+
+    def test_diffusion_tier_reasons_present(self):
+        self.assertIs(FailureReason.SEMANTIC_PRODUCT_RISK,
+                      FailureReason("semantic_product_risk"))
+        self.assertIs(FailureReason.PRODUCT_IDENTITY_CHANGE,
+                      FailureReason("product_identity_change"))
+        self.assertIs(FailureReason.HALLUCINATION_RISK,
+                      FailureReason("hallucination_risk"))
+
+    def test_shared_mask_too_large_present(self):
+        """MASK_TOO_LARGE is shared between Classic (Tier 1) and Neural (Tier 2)."""
+        self.assertIs(FailureReason.MASK_TOO_LARGE, FailureReason("mask_too_large"))
+
+    # ── str subtype: values are JSON-safe strings ─────────────────────────
+    def test_all_members_are_str_instances(self):
+        for reason in FailureReason:
+            self.assertIsInstance(reason, str,
+                                  f"{reason!r} must be a str for JSON/JSONL serialisation")
+
+    def test_value_equals_name_lower(self):
+        """Snake-case values must match the lower-cased member name (no typos)."""
+        for reason in FailureReason:
+            self.assertEqual(reason.value, reason.name.lower())
+
+    # ── meta dict round-trip: the pattern cleaners will use ───────────────
+    def test_embeds_in_clean_result_meta(self):
+        import numpy as np
+        img = np.zeros((4, 4, 3), np.uint8)
+        result = CleanResult(img, tier_used=1,
+                             meta={"failure_reason": FailureReason.MASK_TOO_LARGE})
+        stored = result.meta["failure_reason"]
+        self.assertEqual(stored, "mask_too_large")
+        self.assertIsInstance(stored, FailureReason)
+
+    # ── no duplicate values (aliases would silently hide a member) ────────
+    def test_no_alias_members(self):
+        all_values = [r.value for r in FailureReason]
+        self.assertEqual(len(all_values), len(set(all_values)),
+                         "FailureReason must not contain alias members (duplicate values)")
+
+
+# ───────────────────────── region-targeted escalation (the unified retry semantics) ─────────────────────────
+class BoxValidator:
+    """Fake validator that returns a retry_box (a retryable residual) on the first ``box_calls``
+    validate()s, then either passes on ``pass_on_call`` or keeps failing. Lets a test drive the
+    orchestrator's Phase-1 (intra-tier) vs Phase-2 (escalation) split deterministically."""
+    def __init__(self, box=(10, 10, 8, 8), box_calls=0, pass_on_call=None):
+        self.calls = 0
+        self.box = list(box)
+        self.box_calls = box_calls
+        self.pass_on_call = pass_on_call
+
+    def validate(self, original, cleaned, mask):
+        self.calls += 1
+        if self.pass_on_call is not None and self.calls == self.pass_on_call:
+            return QAReport(True, 1.0, 1.0, 1.0)
+        return QAReport(False, 0.5, 0.5, 0.5,
+                        retry_box=list(self.box) if self.calls <= self.box_calls else None)
+
+
+class RecordingCleaner(Cleaner):
+    """Records the retry_box seen on every clean() call; optionally refuses with a fixed reason."""
+    def __init__(self, tier, name=None, refuse_reason=None):
+        self.tier = tier
+        self.name = name or f"rec-{tier}"
+        self.boxes = []
+        self.refuse_reason = refuse_reason
+
+    def clean(self, req):
+        self.boxes.append(req.retry_box)
+        if self.refuse_reason is not None:
+            return CleanResult(req.image, self.tier, status="refused",
+                               meta={"failure_reason": self.refuse_reason})
+        return CleanResult(req.image, self.tier, meta={})
+
+
+def _orch_rec(validator, **cfg):
+    cleaners = {t: RecordingCleaner(t) for t in range(1, 4)}
+    return Orchestrator(FakeDetector(_det()), cleaners, validator, PipelineConfig(**cfg)), cleaners
+
+
+class TestRegionTargetedRetry(unittest.TestCase):
+    def test_retry_box_re_runs_same_tier_and_is_dispatched(self):
+        # two residual-with-box failures, then pass → all on tier 1; the box rides the retries
+        o, cs = _orch_rec(BoxValidator(box=(10, 10, 8, 8), box_calls=2, pass_on_call=3))
+        out = o.process(_img())
+        self.assertIs(out.status, Status.PASS)
+        self.assertEqual([t["tier"] for t in out.trace], [1, 1, 1])         # never escalated
+        self.assertEqual(cs[1].boxes, [None, [10, 10, 8, 8], [10, 10, 8, 8]])  # 1st None, retries carry box
+        self.assertEqual(cs[2].boxes + cs[3].boxes, [])                      # stronger tiers untouched
+
+    def test_intra_tier_budget_exhausts_then_escalates(self):
+        # every fail carries a box → 1 initial + 2 local retries per tier, then climb the ladder
+        o, cs = _orch_rec(BoxValidator(box_calls=99, pass_on_call=None), max_intra_tier_retries=2)
+        out = o.process(_img())
+        self.assertIs(out.status, Status.MANUAL_REVIEW)
+        self.assertEqual([t["tier"] for t in out.trace], [1, 1, 1, 2, 2, 2, 3, 3, 3])
+        self.assertEqual(len(cs[1].boxes), 3)                               # initial + 2 local
+
+    def test_intra_tier_retry_count_is_configurable(self):
+        o, cs = _orch_rec(BoxValidator(box_calls=99, pass_on_call=None), max_intra_tier_retries=1)
+        out = o.process(_img())
+        self.assertEqual([t["tier"] for t in out.trace], [1, 1, 2, 2, 3, 3])  # initial + 1 local per tier
+
+    def test_no_box_is_pure_escalation(self):
+        o, cs = _orch_rec(BoxValidator(box_calls=0, pass_on_call=None))      # never a box → legacy ladder
+        out = o.process(_img())
+        self.assertEqual([t["tier"] for t in out.trace], [1, 2, 3])
+        self.assertEqual(cs[1].boxes, [None])                               # never asked to focus
+
+
+class TestCleanerRefusal(unittest.TestCase):
+    def test_nonretryable_refusal_terminates_without_validate_or_escalation(self):
+        v = FakeValidator(pass_on_call=None)                                # must NOT be consulted
+        cleaners = {1: RecordingCleaner(1, refuse_reason=FailureReason.PRODUCT_DAMAGE),
+                    2: RecordingCleaner(2), 3: RecordingCleaner(3)}
+        out = Orchestrator(FakeDetector(_det()), cleaners, v, PipelineConfig()).process(_img())
+        self.assertIs(out.status, Status.MANUAL_REVIEW)
+        self.assertEqual(out.attempts, 1)
+        self.assertEqual(v.calls, 0)                                        # refusal skips QA
+        self.assertEqual(len(cleaners[2].boxes) + len(cleaners[3].boxes), 0)  # no escalation
+        self.assertEqual(out.trace[0]["verdict"], "refused")
+        self.assertEqual(out.trace[0]["failure_reason"], FailureReason.PRODUCT_DAMAGE)
+
+    def test_retryable_refusal_escalates(self):
+        cleaners = {1: RecordingCleaner(1, refuse_reason=FailureReason.BACKGROUND_TOO_COMPLEX),
+                    2: RecordingCleaner(2), 3: RecordingCleaner(3)}
+        out = Orchestrator(FakeDetector(_det()), cleaners, _AlwaysPass(0.9), PipelineConfig()).process(_img())
+        self.assertIs(out.status, Status.PASS)
+        self.assertEqual([t["tier"] for t in out.trace], [1, 2])           # skipped the dead tier
+        self.assertEqual(out.trace[0]["verdict"], "refused")
+
+    def test_operational_refusal_at_top_tier_is_manual_review(self):
+        # diffusion-style infra refusal: escalatable, but nothing above it → MANUAL_REVIEW
+        cleaners = {1: RecordingCleaner(1, refuse_reason=FailureReason.BACKGROUND_TOO_COMPLEX),
+                    2: RecordingCleaner(2, refuse_reason=FailureReason.MASK_TOO_LARGE),
+                    3: RecordingCleaner(3, refuse_reason="infrastructure_missing")}
+        out = Orchestrator(FakeDetector(_det()), cleaners, _AlwaysPass(0.9), PipelineConfig()).process(_img())
+        self.assertIs(out.status, Status.MANUAL_REVIEW)
+        self.assertEqual([t["tier"] for t in out.trace], [1, 2, 3])
+
+
+class TestRetryabilityTaxonomy(unittest.TestCase):
+    """The authoritative branch source the orchestrator consults (shared/contract.py)."""
+    def test_product_and_semantic_risks_are_non_retryable(self):
+        from shared.contract import NON_RETRYABLE_FAILURE_REASONS
+        for r in (FailureReason.PRODUCT_DAMAGE, FailureReason.MASK_OVER_PRODUCT_DETAIL,
+                  FailureReason.SEMANTIC_RISK, FailureReason.SEMANTIC_PRODUCT_RISK,
+                  FailureReason.PRODUCT_IDENTITY_CHANGE, FailureReason.HALLUCINATION_RISK):
+            self.assertIn(r, NON_RETRYABLE_FAILURE_REASONS)
+            self.assertFalse(r.is_retryable)
+
+    def test_capability_limits_are_retryable(self):
+        for r in (FailureReason.BACKGROUND_TOO_COMPLEX, FailureReason.UNSAFE_FOR_CLASSIC,
+                  FailureReason.MASK_TOO_SMALL, FailureReason.MASK_TOO_LARGE):
+            self.assertTrue(r.is_retryable)
+
+    def test_operational_reason_is_not_in_nonretryable_set(self):
+        from shared.contract import NON_RETRYABLE_FAILURE_REASONS
+        self.assertNotIn("infrastructure_missing", NON_RETRYABLE_FAILURE_REASONS)
+
+    def test_contract_additive_fields_default_none(self):
+        self.assertIsNone(QAReport(True, 1.0, 1.0, 1.0).retry_box)
+        req = CleanRequest(_img(), _det().mask, WatermarkType.UNKNOWN, tier=1, attempt=0)
+        self.assertIsNone(req.retry_box)
+
+
+class TestNeuralFocusMask(unittest.TestCase):
+    """Pure-numpy: the neural cleaner's box restriction (no LaMa needed)."""
+    def test_restricts_strictly_inside_box(self):
+        from agents.neural_cleaner.cleaner import _focus_mask
+        mask = np.zeros((40, 40), np.uint8); mask[10:20, 4:36] = 255
+        r = _focus_mask(mask, [20, 10, 16, 10]); ys, xs = np.where(r > 0)
+        self.assertTrue(xs.min() >= 20 and xs.max() < 36 and ys.min() >= 10 and ys.max() < 20)
+
+    def test_falls_back_to_box_rect_when_disjoint(self):
+        from agents.neural_cleaner.cleaner import _focus_mask
+        mask = np.zeros((40, 40), np.uint8); mask[10:20, 20:30] = 255
+        r = _focus_mask(mask, [0, 0, 5, 5]); ys, xs = np.where(r > 0)
+        self.assertEqual((int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())), (0, 4, 0, 4))
+
+
+class TestDiffusionRefusalAdapter(unittest.TestCase):
+    """The real diffusion adapter must refuse EXPLICITLY (never an unchanged-image no-op) when no
+    backend is installed — the configuration here and on CI."""
+    def test_refuses_infrastructure_missing_without_backend(self):
+        from agents.diffusion_cleaner import DiffusionCleaner
+        img = _img((40, 40, 3)); before = img.copy()
+        mask = np.zeros((40, 40), np.uint8); mask[10:20, 10:20] = 255
+        req = CleanRequest(img, mask, WatermarkType.UNKNOWN, tier=3, attempt=0, bbox=[10, 10, 20, 20])
+        res = DiffusionCleaner().clean(req)
+        try:
+            import diffusers  # noqa: F401
+            import torch
+            backend = torch.cuda.is_available() or torch.backends.mps.is_available()
+        except Exception:
+            backend = False
+        if not backend:
+            self.assertEqual(res.status, "refused")
+            self.assertEqual(res.meta["failure_reason"], "infrastructure_missing")
+        self.assertTrue(np.array_equal(img, before), "diffusion cleaner mutated the input")
 
 
 if __name__ == "__main__":

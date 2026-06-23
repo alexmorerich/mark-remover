@@ -52,6 +52,91 @@ class Status(str, Enum):
         return {"PASS": "published", "SKIP": "clean", "MANUAL_REVIEW": "auto_rejected"}[self.value]
 
 
+class FailureReason(str, Enum):
+    """Centralized taxonomy of cleaner-tier failure codes.
+
+    When a cleaner cannot safely complete a request it sets
+    ``CleanResult.meta["failure_reason"]`` to one of these values.
+    The Orchestrator inspects this to decide whether to escalate to the next
+    tier, bypass a tier, or terminate to MANUAL_REVIEW.
+
+    Being a ``str`` subclass makes every member JSON-serialisable and safe to
+    embed in ``CleanResult.meta`` or JSONL trace records without conversion.
+    """
+
+    # ── Tier 1 · Classic Cleaner ─────────────────────────────────────────────
+    MASK_OVER_PRODUCT_DETAIL = "mask_over_product_detail"
+    """Classic (Tier 1): mask intersects a labeled product-detail region; inpainting
+    would erase content the QA gate would flag as product damage."""
+
+    BACKGROUND_TOO_COMPLEX = "background_too_complex"
+    """Classic (Tier 1): background is textured, gradient, or metallic — Telea/NS
+    inpainting is unreliable and the result would not pass the fidelity check."""
+
+    UNSAFE_FOR_CLASSIC = "unsafe_for_classic"
+    """Classic (Tier 1): general-purpose bail-out; Classic declines the request
+    without a more specific reason (e.g. unusual watermark geometry)."""
+
+    # ── Tier 2 · Neural Cleaner ──────────────────────────────────────────────
+    SEMANTIC_RISK = "semantic_risk"
+    """Neural (Tier 2): the inpaint region overlaps semantic product features;
+    completing the fill would alter the product's perceived meaning or category."""
+
+    PRODUCT_DAMAGE = "product_damage"
+    """Neural (Tier 2): prior-tier output or the current attempt has introduced
+    (or is predicted to introduce) visible structural damage to the product."""
+
+    MASK_TOO_SMALL = "mask_too_small"
+    """Neural (Tier 2): the mask region is too narrow for the Neural diffuser's
+    minimum receptive field; result would be artefact-prone."""
+
+    # ── Tiers 1 + 2 · Classic and Neural ────────────────────────────────────
+    MASK_TOO_LARGE = "mask_too_large"
+    """Classic (Tier 1) + Neural (Tier 2): mask covers an unsafe proportion of the
+    image area — Classic would lose too much background context; Neural risks
+    hallucinating replacement content over a large region."""
+
+    # ── Tier 3 · Diffusion Cleaner ───────────────────────────────────────────
+    SEMANTIC_PRODUCT_RISK = "semantic_product_risk"
+    """Diffusion (Tier 3): the diffusion model may hallucinate product-specific
+    features (labels, ports, connectors) that were not present in the original."""
+
+    PRODUCT_IDENTITY_CHANGE = "product_identity_change"
+    """Diffusion (Tier 3): completing the inpaint would alter the product's visual
+    identity or brand markings beyond the watermark region."""
+
+    HALLUCINATION_RISK = "hallucination_risk"
+    """Diffusion (Tier 3): high probability that the diffusion model invents new
+    background or product content rather than faithfully restoring the scene."""
+
+    @property
+    def is_retryable(self) -> bool:
+        """Whether the orchestrator may keep trying (escalate to a stronger tier) after a
+        cleaner refuses with this reason.
+
+        Capability/complexity limits (a weaker tier simply cannot do this job) ARE retryable —
+        a stronger tier may succeed. Product- and semantic-integrity risks are NOT: any further
+        automated inpainting would risk irreversible product damage, so they terminate straight
+        to MANUAL_REVIEW. See ``NON_RETRYABLE_FAILURE_REASONS`` for the authoritative set.
+        """
+        return self not in NON_RETRYABLE_FAILURE_REASONS
+
+
+# The authoritative branch source the Orchestrator consults: reasons on which it must NOT escalate
+# (escalating a generative tier into a product-integrity risk only deepens the damage). Everything
+# NOT listed here is a tier-capability limit a stronger tier may still clear. Operational refusals
+# that are not enum members (e.g. a cleaner's "infrastructure_missing") are likewise absent here, so
+# they remain escalatable — the orchestrator skips the dead tier and terminates only if none is left.
+NON_RETRYABLE_FAILURE_REASONS: frozenset = frozenset({
+    FailureReason.MASK_OVER_PRODUCT_DETAIL,   # Tier 1: mask sits on labeled product detail
+    FailureReason.SEMANTIC_RISK,              # Tier 2: fill would alter product meaning
+    FailureReason.PRODUCT_DAMAGE,             # Tier 2: damage present / predicted
+    FailureReason.SEMANTIC_PRODUCT_RISK,      # Tier 3: may hallucinate product-specific features
+    FailureReason.PRODUCT_IDENTITY_CHANGE,    # Tier 3: would alter visual identity / branding
+    FailureReason.HALLUCINATION_RISK,         # Tier 3: likely invents new content
+})
+
+
 @dataclass
 class DetectionResult:
     """detector → orchestrator. ``has_watermark is False`` short-circuits to SKIP."""
@@ -76,6 +161,9 @@ class CleanRequest:
     prior_qa: Optional["QAReport"] = None
     bbox: Optional[list] = None
     roi_type: str = "unknown"
+    retry_box: Optional[list] = None     # [x, y, w, h] region hint for an intra-tier local re-inpaint;
+    #                                      None on the first attempt at a tier. When present, the cleaner
+    #                                      MUST focus repair strictly inside this box (region-targeted retry).
 
 
 @dataclass
@@ -102,6 +190,9 @@ class QAReport:
     notes: str = ""
     retryable: bool = True
     decision: str = ""                   # production audit_decision when available
+    retry_box: Optional[list] = None     # [x, y, w, h] of the residual region to re-target on a local
+    #                                      retry; set ONLY on a retryable failure the same tier could still
+    #                                      clear with a focused re-inpaint. None ⇒ no local hint (escalate).
 
     @property
     def verdict(self) -> str:

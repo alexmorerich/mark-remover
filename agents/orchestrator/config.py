@@ -24,7 +24,9 @@ SIMPLE_ROIS = (
 
 @dataclass
 class PipelineConfig:
-    max_retries: int = 3                  # cleaner invoked at most this many times
+    max_retries: int = 3                  # tier-escalation budget: how many rungs of the ladder may be tried
+    max_intra_tier_retries: int = 2       # Phase-1 local re-inpaint budget at the CURRENT tier (per tier),
+    #                                       spent before escalating when the validator returns a retry_box
     qa_threshold: float = 0.70            # global QA gate; passed = qa_score >= this
     device: str = "mps"
 

@@ -65,8 +65,66 @@ If the case is outside this agent's safe range:
 - Do not decide pass/fail; the Validator owns QA.
 - Do not retry yourself; return one result for the Orchestrator to route.
 
+## Failure Codes
+
+Set `CleanResult.meta["failure_reason"]` to one of the following `FailureReason` enum members
+(imported from `shared.contract`) when refusing a request. The Orchestrator reads this value to
+decide whether to escalate or terminate.
+
+```python
+from shared.contract import FailureReason
+
+# mask intersects a labeled product-detail region
+FailureReason.MASK_OVER_PRODUCT_DETAIL   # "mask_over_product_detail"
+
+# background is textured/metallic — Telea/NS fill would fail QA fidelity
+FailureReason.BACKGROUND_TOO_COMPLEX     # "background_too_complex"
+
+# mask covers too large a proportion of the image area; context window unreliable
+FailureReason.MASK_TOO_LARGE             # "mask_too_large"  (shared with Neural Tier 2)
+
+# general-purpose bail-out for any other unsafe condition
+FailureReason.UNSAFE_FOR_CLASSIC         # "unsafe_for_classic"
+```
+
+Refused `CleanResult` shape:
+```json
+{
+  "agent": "classic-cleaner",
+  "status": "refused",
+  "failure_reason": "mask_over_product_detail"
+}
+```
+
 ## Definition of done
 
 - Output image exists when `status=cleaned`.
 - `changed_pct` is measured against the original.
 - The mask used by the cleaner is saved for Validator and manual-review diagnostics.
+
+
+# Classic Cleaner Agent
+
+## Mission
+Tier 1 cleaner. Remove straightforward watermarks using deterministic OpenCV-style methods.
+
+## Tier Contract
+- **Tier:** 1 (Fast-path)
+- **Scope:** Simple backgrounds, low-risk masks, thin semi-transparent text.
+- **Constraints:** Cannot handle complex textures, glass, metal, or high-density product details.
+
+## Inputs
+- `original_image`: path
+- `mask_path`, `bbox`, `watermark_type`, `score`: from Detector
+- `retry_context`: (if any)
+
+## Outputs (Status)
+Append a `cleaner` block:
+```json
+{
+  "agent": "classic-cleaner",
+  "status": "cleaned",
+  "output_path": "...",
+  "method": "opencv_telea_inpaint",
+  "changed_pct": 0.42
+}

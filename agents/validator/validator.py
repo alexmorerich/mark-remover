@@ -56,6 +56,21 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
+def _mask_xywh(m: np.ndarray):
+    """Bounding box of the truthy region as the agents-layer retry_box ``[x, y, w, h]``; None if empty."""
+    ys, xs = np.where(np.asarray(m) > 0)
+    if len(xs) == 0:
+        return None
+    x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    return [x1, y1, x2 - x1, y2 - y1]
+
+
+def _xyxy_to_xywh(box):
+    """audit emits a residual hint box as [x1,y1,x2,y2]; the agents-layer retry_box is [x,y,w,h]."""
+    x1, y1, x2, y2 = (int(round(float(v))) for v in box)
+    return [x1, y1, max(0, x2 - x1), max(0, y2 - y1)]
+
+
 class Validator:
     """Heuristic QA gate. ``validate(original, cleaned, mask) -> QAReport``."""
 
@@ -92,9 +107,15 @@ class Validator:
             failed.append("structure_damage")
         if outside_fid < self.qa_threshold:
             failed.append("color_shift")
+        # Region hint for a Phase-1 intra-tier retry: emit whenever residual remains (removal failed) —
+        # that residual IS what a focused re-inpaint on the same tier should re-attack. Withhold it for a
+        # PURE fidelity failure (mark removed but surroundings damaged): re-running this tier there would
+        # only re-damage, so the orchestrator escalates instead. The local retry budget (≤2) bounds it.
+        retry_box = _mask_xywh(m) if removal < self.qa_threshold else None
         return QAReport(passed=qa >= self.qa_threshold, qa_score=qa,
                         removal_score=removal, fidelity_score=fidelity, failed_checks=failed,
-                        notes=f"heuristic removal={removal:.2f} fidelity={fidelity:.2f}")
+                        notes=f"heuristic removal={removal:.2f} fidelity={fidelity:.2f}",
+                        retry_box=retry_box)
 
 
 class AuditValidator(Validator):
@@ -141,7 +162,18 @@ class AuditValidator(Validator):
                                       s.get("edge_damage_score", 0.0), s.get("protected_text_damage_score", 0.0)))
         action = rec.get("recommended_next_action", "auto_reject")
         failed = [e.get("type", "") for e in rec.get("evidence", []) if e.get("type")]
+        retryable = action in self._RETRYABLE_ACTIONS
+        # Region-targeted retry hint: prefer audit's own residual box (it pinpoints where the mark still
+        # is — emitted only on a retry_repair verdict); otherwise, on any retryable residual failure with
+        # intact surroundings, fall back to the mask bbox. None ⇒ the orchestrator escalates the tier.
+        hint = (rec.get("retry_hint") or {}).get("box")
+        if hint:
+            retry_box = _xyxy_to_xywh(hint)
+        elif retryable and removal < self.qa_threshold:
+            retry_box = _mask_xywh(_boolmask(mask))
+        else:
+            retry_box = None
         return QAReport(passed=bool(rec.get("publish_allowed")), qa_score=min(removal, fidelity),
                         removal_score=removal, fidelity_score=fidelity, failed_checks=failed,
                         notes=rec.get("notes", ""), decision=rec.get("audit_decision", ""),
-                        retryable=action in self._RETRYABLE_ACTIONS)
+                        retryable=retryable, retry_box=retry_box)
