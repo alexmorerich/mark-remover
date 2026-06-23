@@ -19,7 +19,7 @@ import time
 
 import numpy as np
 
-from shared.contract import CleanRequest, CleanResult, Cleaner
+from shared.contract import CleanRequest, CleanResult, Cleaner, FailureReason
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -46,6 +46,8 @@ def _focus_mask(mask: np.ndarray, box) -> np.ndarray:
 class NeuralCleaner(Cleaner):
     tier = 2
     name = "neural-cleaner"
+    supports_retry_box = True            # focuses the inpaint on the validator's residual region
+    MAX_AREA_FRAC = 0.55                 # mask over this frac → LaMa would hallucinate; decline → diffusion
 
     def __init__(self, device: str = "mps"):
         self._device = device
@@ -66,12 +68,21 @@ class NeuralCleaner(Cleaner):
         mask = np.asarray(req.mask)
         if mask.dtype != np.uint8:
             mask = (mask > 0).astype(np.uint8) * 255
+
+        # ── mask-too-large bail-out (retryable → orchestrator escalates to the diffusion tier) ──
+        if mask.size and float((mask > 0).mean()) > self.MAX_AREA_FRAC:
+            return CleanResult(req.image, self.tier, status="refused",
+                               meta={"agent": self.name, "failure_reason": FailureReason.MASK_TOO_LARGE,
+                                     "note": f"mask covers >{self.MAX_AREA_FRAC:.0%} — escalate to diffusion"})
+
         method = "lama_crop_inpaint"
         if req.retry_box is not None:                       # intra-tier retry: focus on the residual
             mask = _focus_mask(mask, req.retry_box)
             method = "lama_crop_inpaint_box"
-        out, did = rb._lama_crop_inpaint(req.image, mask)   # returns a fresh array; input untouched
-        return CleanResult(out, self.tier, status="cleaned",
+        src = req.image.copy()                              # enforce the no-mutation red line ourselves,
+        out, did = rb._lama_crop_inpaint(src, mask)         # rather than trusting the engine not to in-place
+        status = "cleaned" if did else "noop"              # nothing inpainted → let the orchestrator escalate
+        return CleanResult(out, self.tier, status=status,
                            meta={"agent": self.name, "method": method,
                                  "engine": "run_bulk", "did_inpaint": bool(did),
                                  "retry_box": list(req.retry_box) if req.retry_box is not None else None,

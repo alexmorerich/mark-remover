@@ -43,7 +43,9 @@ class Orchestrator:
 
     @property
     def MAX_RETRIES(self) -> int:
-        return self.config.max_retries
+        """Escalation budget in ladder rungs. Defaults to the full ladder (len(tiers)) when the config
+        leaves it None, so registering a tier extends reach with no config edit (open/closed)."""
+        return self.config.max_retries if self.config.max_retries is not None else len(self._tiers())
 
     def _tiers(self) -> list:
         return sorted(self.cleaners)
@@ -128,6 +130,16 @@ class Orchestrator:
                 escalation += 1; intra_retries = 0; retry_box = None; prev_tier = tier
                 continue
 
+            # ── a cleaner may report NOOP (engine ran, changed nothing — empty / degenerate mask) ──
+            # Validating an unchanged image is pointless (removal must fail); escalate straight away.
+            if result.status == "noop":
+                trace.append({"attempt": attempt, "tier": tier, "cleaner": self.cleaners[tier].name,
+                              "verdict": "noop", "note": result.meta.get("note", "")})
+                if tier >= top_tier or escalation + 1 >= self.MAX_RETRIES:
+                    break
+                escalation += 1; intra_retries = 0; retry_box = None; prev_tier = tier
+                continue
+
             qa = self.validator.validate(image, result.image, det.mask)
             # per-tier threshold can only TIGHTEN — never resurrects a validator fail.
             thr = self.config.tier_qa_threshold.get(tier)
@@ -143,7 +155,10 @@ class Orchestrator:
                 break
 
             # ── Phase 1: local re-inpaint on the SAME tier when the validator pointed at a region ──
-            if qa.retry_box is not None and intra_retries < self.MAX_INTRA_TIER_RETRIES:
+            # Only for cleaners that ACT on the box — a region-blind tier (classic) would re-run
+            # identically, so spending the intra-tier budget there is guaranteed-wasted; escalate instead.
+            supports_box = getattr(self.cleaners[tier], "supports_retry_box", False)
+            if qa.retry_box is not None and supports_box and intra_retries < self.MAX_INTRA_TIER_RETRIES:
                 intra_retries += 1
                 retry_box = list(qa.retry_box)
                 prev_tier = tier                        # stay on this tier; escalation unchanged
@@ -154,5 +169,7 @@ class Orchestrator:
                 break
             escalation += 1; intra_retries = 0; retry_box = None; prev_tier = tier
 
-        return PipelineOutcome(Status.MANUAL_REVIEW,
-                               result.image if result is not None else image, len(trace), qa, trace)
+        # MANUAL_REVIEW ≡ on-disk `auto_rejected` = ORIGINAL restored from backup (Status.terminal_label).
+        # Return the original, never the last failed/damaged attempt — so a caller that writes
+        # outcome.image cannot publish a damaged image. The failed attempt's scores live in `trace`.
+        return PipelineOutcome(Status.MANUAL_REVIEW, image, len(trace), qa, trace)

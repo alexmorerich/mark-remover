@@ -147,19 +147,25 @@ class AuditValidator(Validator):
     def validate(self, original: Image, cleaned: Image, mask: Mask) -> QAReport:
         import tempfile
         audit, cv2 = self._engine(), self._cv2
-        d = self._tmp or tempfile.mkdtemp(prefix="contract_qa_")
-        op, fp, mp = (os.path.join(d, n) for n in ("orig.png", "final.png", "mask.png"))
-        cv2.imwrite(op, original)
-        cv2.imwrite(fp, cleaned)
-        cv2.imwrite(mp, np.asarray(mask, np.uint8))
-        rec = audit.audit_pair(op, fp, meta=None, mask_path=mp, reader=self._reader)
+        # One fresh, auto-removed temp dir PER CALL (rooted at self._tmp when given): no leaked dirs
+        # over a bulk run, and no shared-filename race between concurrent validations.
+        if self._tmp:
+            os.makedirs(self._tmp, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="contract_qa_", dir=self._tmp) as d:
+            op, fp, mp = (os.path.join(d, n) for n in ("orig.png", "final.png", "mask.png"))
+            cv2.imwrite(op, original)
+            cv2.imwrite(fp, cleaned)
+            cv2.imwrite(mp, np.asarray(mask, np.uint8))
+            rec = audit.audit_pair(op, fp, meta=None, mask_path=mp, reader=self._reader)
 
+        # Missing sub-scores default to MAX RISK (1.0 → score 0.0): a publish gate must fail SAFE on
+        # audit schema drift, never silently treat an unreported risk as "clean".
         s = rec.get("scores", {})
-        removal = _clamp01(1.0 - max(s.get("residual_logo_score", 0.0), s.get("dot_chain_score", 0.0),
-                                     s.get("ghost_text_score", 0.0)))
-        fidelity = _clamp01(1.0 - max(s.get("patch_visibility_score", 0.0), s.get("product_damage_score", 0.0),
-                                      s.get("texture_mismatch_score", 0.0), s.get("color_delta_score", 0.0),
-                                      s.get("edge_damage_score", 0.0), s.get("protected_text_damage_score", 0.0)))
+        removal = _clamp01(1.0 - max(s.get("residual_logo_score", 1.0), s.get("dot_chain_score", 1.0),
+                                     s.get("ghost_text_score", 1.0)))
+        fidelity = _clamp01(1.0 - max(s.get("patch_visibility_score", 1.0), s.get("product_damage_score", 1.0),
+                                      s.get("texture_mismatch_score", 1.0), s.get("color_delta_score", 1.0),
+                                      s.get("edge_damage_score", 1.0), s.get("protected_text_damage_score", 1.0)))
         action = rec.get("recommended_next_action", "auto_reject")
         failed = [e.get("type", "") for e in rec.get("evidence", []) if e.get("type")]
         retryable = action in self._RETRYABLE_ACTIONS

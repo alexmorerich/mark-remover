@@ -17,11 +17,10 @@ import time
 
 import numpy as np
 
-from shared.contract import CleanRequest, CleanResult, Cleaner
+from shared.contract import CleanRequest, CleanResult, Cleaner, FailureReason
+from shared.roi import TEXTURED_ROIS, WHITE_ROIS
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_WHITE_ROIS = ("white_bg", "white_background", "plain_white", "near_white",
-               "near_white_background", "pure_background", "low_texture_background")
 
 
 def _mask_bbox(mask):
@@ -34,10 +33,17 @@ def _mask_bbox(mask):
 class ClassicCleaner(Cleaner):
     tier = 1
     name = "classic-cleaner"
+    supports_retry_box = False           # deterministic: a focused re-inpaint reproduces the same
+    #                                      result, so the orchestrator must not spend intra-tier retries here
+    MAX_AREA_FRAC = 0.50                  # mask over half the image → decline (too little context to recover)
 
     def __init__(self):
         self._ppc = None
         self._cv2 = None
+
+    def _refuse(self, image, reason, note) -> CleanResult:
+        return CleanResult(image, self.tier, status="refused",
+                           meta={"agent": self.name, "failure_reason": reason, "note": note})
 
     def _engine(self):
         if self._ppc is None:
@@ -60,15 +66,29 @@ class ClassicCleaner(Cleaner):
         bgr = req.image.copy()                      # never mutate the original (contract red line)
         roi = (req.roi_type or "").lower()
         t0 = time.time()
-        if roi in _WHITE_ROIS:
+
+        # ── mask-too-large bail-out (retryable → orchestrator escalates to a stronger tier) ──
+        m = np.asarray(req.mask)
+        if m.size and float((m > 0).mean()) > self.MAX_AREA_FRAC:
+            return self._refuse(req.image, FailureReason.MASK_TOO_LARGE,
+                                f"mask covers >{self.MAX_AREA_FRAC:.0%} of the image — too much for classic")
+
+        if roi in WHITE_ROIS:
             out, method = ppc.clean(bgr), "structure_preserve"
         else:
             glyph = getattr(ppc, "glyph_clean", None)   # texture-safe path, if the damage-fix has landed
             box = req.bbox or _mask_bbox(req.mask)
             if glyph is not None and box is not None:
                 out, method = glyph(bgr, box), "glyph_telea"
+            elif roi in TEXTURED_ROIS:
+                # ── textured / dark / specular surface and no texture-safe engine in this build: plain
+                # Telea would SCAR the product (the historical damage path). Decline → escalate to neural
+                # (LaMa), which is texture-safe. Retryable reason, so the orchestrator climbs the ladder. ──
+                return self._refuse(req.image, FailureReason.BACKGROUND_TOO_COMPLEX,
+                                    f"textured roi '{roi}' needs a texture-safe engine (glyph_clean) "
+                                    "absent in this build — escalate to neural")
             else:
-                out, method = self._telea(bgr, req.mask), "telea"
+                out, method = self._telea(bgr, req.mask), "telea"   # low-texture / simple / unknown surface
         return CleanResult(out, self.tier, status="cleaned",
                            meta={"agent": self.name, "method": method,
                                  "engine": "product_preserve_clean/cv2",

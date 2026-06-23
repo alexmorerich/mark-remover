@@ -15,7 +15,8 @@ import unittest
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_REPO_ROOT_T = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _REPO_ROOT_T)
 
 from shared.contract import (CleanRequest, CleanResult, Cleaner, DetectionResult, FailureReason,
                              QAReport, Status, WatermarkType)
@@ -175,7 +176,9 @@ class TestPerTierThreshold(unittest.TestCase):
 
 class TestOpenClosed(unittest.TestCase):
     def test_new_tier_via_registration_only(self):
-        o, _ = _orch(n_tiers=3, validator=FakeValidator(pass_on_call=4), max_retries=4)
+        # No max_retries override: the escalation budget derives from the ladder length, so registering
+        # a 4th tier makes it reachable with NO config edit (truly registration-only / open-closed).
+        o, _ = _orch(n_tiers=3, validator=FakeValidator(pass_on_call=4))
         o.register_cleaner(FakeCleaner(4, name="fake-diffusion-2"))
         out = o.process(_img())
         self.assertIs(out.status, Status.PASS)
@@ -262,8 +265,25 @@ class TestCleanerBoundary(unittest.TestCase):
         self.assertEqual(res.tier_used, 1)
         self.assertIsInstance(res, CleanResult)
 
-    def test_classic_cleaner_telea_fallback_on_textured_roi(self):
-        # forces the built-in cv2 Telea path (committed-safe; no dependency on uncommitted glyph_clean)
+    def test_classic_refuses_textured_roi_without_glyph(self):
+        # P0 fix: textured surface + no texture-safe engine ⇒ REFUSE (escalate to neural), never the
+        # product-scarring plain-Telea path. Skips when glyph_clean is present (texture-safe path covers it).
+        from agents.classic_cleaner import ClassicCleaner
+        img, mask = self._white_with_mark()
+        before = img.copy()
+        c = ClassicCleaner()
+        c._engine()
+        if hasattr(c._ppc, "glyph_clean"):
+            self.skipTest("glyph_clean present — texture-safe path covers textured ROIs")
+        req = CleanRequest(img, mask, WatermarkType.SEMI_TRANSPARENT_TEXT, tier=1, attempt=0,
+                           bbox=[16, 34, 64, 46], roi_type="metallic_or_reflective")
+        res = c.clean(req)
+        self.assertEqual(res.status, "refused")
+        self.assertEqual(res.meta["failure_reason"], FailureReason.BACKGROUND_TOO_COMPLEX)
+        self.assertTrue(np.array_equal(img, before), "refusal must not mutate the input")
+
+    def test_classic_telea_on_simple_surface(self):
+        # low-texture / simple non-white surface still takes the plain-Telea fallback (Telea-safe)
         from agents.classic_cleaner import ClassicCleaner
         img, mask = self._white_with_mark()
         before = img.copy()
@@ -272,10 +292,11 @@ class TestCleanerBoundary(unittest.TestCase):
         if hasattr(c._ppc, "glyph_clean"):
             self.skipTest("glyph_clean present — fallback path not exercised")
         req = CleanRequest(img, mask, WatermarkType.SEMI_TRANSPARENT_TEXT, tier=1, attempt=0,
-                           bbox=[16, 34, 64, 46], roi_type="metallic_or_reflective")
+                           bbox=[16, 34, 64, 46], roi_type="simple_product_surface")
         res = c.clean(req)
-        self.assertTrue(np.array_equal(img, before))
+        self.assertEqual(res.status, "cleaned")
         self.assertEqual(res.meta["method"], "telea")
+        self.assertTrue(np.array_equal(img, before))
 
 
 # ───────────────────────── FailureReason taxonomy ─────────────────────────
@@ -361,7 +382,11 @@ class BoxValidator:
 
 
 class RecordingCleaner(Cleaner):
-    """Records the retry_box seen on every clean() call; optionally refuses with a fixed reason."""
+    """Records the retry_box seen on every clean() call; optionally refuses with a fixed reason.
+    Box-aware by default (supports_retry_box=True) so it exercises the orchestrator's Phase-1 path;
+    a test may set the instance attr False to model a region-blind tier (classic)."""
+    supports_retry_box = True
+
     def __init__(self, tier, name=None, refuse_reason=None):
         self.tier = tier
         self.name = name or f"rec-{tier}"
@@ -501,6 +526,116 @@ class TestDiffusionRefusalAdapter(unittest.TestCase):
             self.assertEqual(res.status, "refused")
             self.assertEqual(res.meta["failure_reason"], "infrastructure_missing")
         self.assertTrue(np.array_equal(img, before), "diffusion cleaner mutated the input")
+
+
+class TestManualReviewImage(unittest.TestCase):
+    """MANUAL_REVIEW must surface the ORIGINAL image (auto_rejected ≡ original restored), never the
+    last failed/damaged attempt — so a caller that writes outcome.image cannot publish damage."""
+    def test_manual_review_returns_original_not_damaged(self):
+        class DamagingCleaner(Cleaner):
+            def __init__(self, tier):
+                self.tier = tier
+                self.name = f"dmg-{tier}"
+            def clean(self, req):
+                return CleanResult(np.zeros_like(req.image), self.tier)   # "damaged" output
+        cleaners = {t: DamagingCleaner(t) for t in (1, 2, 3)}
+        o = Orchestrator(FakeDetector(_det()), cleaners, FakeValidator(pass_on_call=None), PipelineConfig())
+        img = _img()
+        out = o.process(img)
+        self.assertIs(out.status, Status.MANUAL_REVIEW)
+        self.assertTrue(np.array_equal(out.image, img), "must return the original")
+        self.assertFalse(np.array_equal(out.image, np.zeros_like(img)), "must not return the damaged attempt")
+
+
+class TestRegionBlindCleaner(unittest.TestCase):
+    """A region-blind tier (supports_retry_box=False, e.g. classic) must NOT consume intra-tier
+    retries — a focused retry would reproduce the same result. The orchestrator escalates instead."""
+    def test_region_blind_tier_skips_phase1(self):
+        cleaners = {t: RecordingCleaner(t) for t in range(1, 4)}
+        for c in cleaners.values():
+            c.supports_retry_box = False
+        v = BoxValidator(box_calls=99, pass_on_call=None)        # every fail carries a box
+        out = Orchestrator(FakeDetector(_det()), cleaners, v, PipelineConfig()).process(_img())
+        self.assertIs(out.status, Status.MANUAL_REVIEW)
+        self.assertEqual([t["tier"] for t in out.trace], [1, 2, 3])   # pure escalation, no [1,1,1]
+        self.assertEqual(cleaners[1].boxes, [None])                   # tier 1 tried once, never re-focused
+
+
+class TestNeuralBoundary(unittest.TestCase):
+    """The neural cleaner must enforce the no-mutation red line ITSELF (defensive copy), not trust the
+    engine — proven with a hostile fake engine that tries to scribble on its input in place. No LaMa."""
+    def test_neural_cleaner_does_not_mutate_original(self):
+        from agents.neural_cleaner.cleaner import NeuralCleaner
+        c = NeuralCleaner()
+
+        class _HostileRB:
+            @staticmethod
+            def _lama_crop_inpaint(bgr, mask):
+                bgr[:] = 0                                   # try to mutate the input in place
+                return np.zeros_like(bgr), True
+        c._rb = _HostileRB()                                 # inject; bypasses the lazy run_bulk import
+        img = _img((40, 40, 3))
+        before = img.copy()
+        mask = np.zeros((40, 40), np.uint8)
+        mask[10:20, 10:20] = 255
+        req = CleanRequest(img, mask, WatermarkType.UNKNOWN, tier=2, attempt=0)
+        res = c.clean(req)
+        self.assertTrue(np.array_equal(img, before), "neural cleaner mutated the input")
+        self.assertEqual(res.tier_used, 2)
+
+
+class TestRoiVocabulary(unittest.TestCase):
+    """The detector is the single producer of roi_class; shared/roi.py is the single consumer vocab.
+    These pin them together so they can never drift (the bug this refactor fixed)."""
+    def test_finder_emitted_rois_all_classified(self):
+        from shared.roi import WHITE_ROIS, TEXTURED_ROIS, TELEA_SAFE_ROIS, FINDER_EMITTED_ROIS
+        classified = WHITE_ROIS | TEXTURED_ROIS | TELEA_SAFE_ROIS
+        self.assertEqual(FINDER_EMITTED_ROIS - classified, set(),
+                         "every roi_class the finder emits must be classified by the agents layer")
+
+    def test_finder_source_returns_are_registered(self):
+        import re
+        from shared.roi import FINDER_EMITTED_ROIS
+        path = os.path.join(_REPO_ROOT_T, "logo_finder.py")
+        if not os.path.exists(path):
+            self.skipTest("logo_finder.py not present")
+        with open(path) as fh:
+            src = fh.read()
+        i = src.find("def _roi_class")
+        j = src.find("\ndef ", i + 1)
+        body = src[i:j] if j != -1 else src[i:]
+        returned = set(re.findall(r'return "([a-z_]+)"', body))
+        self.assertTrue(returned, "could not parse _roi_class returns")
+        self.assertEqual(returned - FINDER_EMITTED_ROIS, set(),
+                         f"logo_finder emits roi_class not registered in shared/roi.py: "
+                         f"{returned - FINDER_EMITTED_ROIS}")
+
+
+class TestAuditValidatorDefaults(unittest.TestCase):
+    """A publish gate must FAIL SAFE on audit schema drift: a missing sub-score reads as max risk
+    (score 0.0), never as 'clean'. Driven with injected fakes — no real audit / cv2 / OCR."""
+    def test_missing_scores_default_pessimistic(self):
+        from agents.validator import AuditValidator
+        v = AuditValidator()
+
+        class _FakeAudit:
+            @staticmethod
+            def audit_pair(op, fp, meta=None, mask_path=None, reader=None):
+                return {"scores": {}, "publish_allowed": False, "evidence": [],
+                        "recommended_next_action": "auto_reject"}
+
+        class _FakeCv2:
+            @staticmethod
+            def imwrite(p, im):
+                return True
+        v._audit, v._cv2 = _FakeAudit(), _FakeCv2()          # inject; bypasses the lazy audit import
+        img = np.full((8, 8, 3), 255, np.uint8)
+        mask = np.zeros((8, 8), np.uint8)
+        mask[2:6, 2:6] = 255
+        r = v.validate(img, img, mask)
+        self.assertEqual(r.removal_score, 0.0)
+        self.assertEqual(r.fidelity_score, 0.0)
+        self.assertFalse(r.passed)
 
 
 if __name__ == "__main__":

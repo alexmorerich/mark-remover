@@ -61,6 +61,7 @@ def _focus_xyxy(mask: np.ndarray, retry_box):
 class DiffusionCleaner(Cleaner):
     tier = 3
     name = "diffusion-cleaner"
+    supports_retry_box = True            # focuses the generative inpaint on the validator's residual region
 
     def __init__(self):
         self._probed = False

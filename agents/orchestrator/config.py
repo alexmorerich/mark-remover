@@ -9,22 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# ROIs where the surface under the mark is textured / structured / specular — start at a stronger
-# tier rather than burning a tier-1 attempt unlikely to pass.
-COMPLEX_ROIS = (
-    "metal", "metallic_or_reflective", "glass", "glass_or_gradient", "transparent_or_glossy",
-    "thin_flex_cable", "flex_cable", "screen_lcd", "complex_product_detail",
-    "dark_product_surface", "mixed_background_product",
-)
-SIMPLE_ROIS = (
-    "white_bg", "white_background", "plain_white", "near_white", "near_white_background",
-    "pure_background", "low_texture_background", "simple_product_surface",
-)
+# ROIs where the surface under the mark is textured / structured / specular → start at a stronger
+# tier rather than burning a tier-1 attempt unlikely to pass. Single-sourced in shared/roi.py so the
+# detector (producer), this router, and the classic cleaner can never drift apart.
+from shared.roi import COMPLEX_ROIS
 
 
 @dataclass
 class PipelineConfig:
-    max_retries: int = 3                  # tier-escalation budget: how many rungs of the ladder may be tried
+    max_retries: int | None = None        # tier-escalation budget (rungs of the ladder). None ⇒ the FULL
+    #                                       ladder (len(tiers)): registering a tier extends reach with no
+    #                                       config edit (open/closed). Set an int to cap below the ladder.
     max_intra_tier_retries: int = 2       # Phase-1 local re-inpaint budget at the CURRENT tier (per tier),
     #                                       spent before escalating when the validator returns a retry_box
     qa_threshold: float = 0.70            # global QA gate; passed = qa_score >= this
@@ -39,8 +34,4 @@ class PipelineConfig:
 
     tier_qa_threshold: dict = field(default_factory=dict)   # per-tier overrides; can only TIGHTEN
 
-    complex_rois: tuple = COMPLEX_ROIS
-    simple_rois: tuple = SIMPLE_ROIS
-
-    def qa_threshold_for(self, tier: int) -> float:
-        return self.tier_qa_threshold.get(tier, self.qa_threshold)
+    complex_rois: frozenset = COMPLEX_ROIS
