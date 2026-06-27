@@ -32,10 +32,14 @@ Mask = np.ndarray
 
 
 class WatermarkType(str, Enum):
+    """What KIND of mark it is. This is explainable metadata carried on the record, NOT a routing key —
+    the orchestrator routes on roi_type / risk / score, so a cleaner never branches on this. The detector
+    currently distinguishes the three it can tell apart by signal; CORNER_STAMP and TILED are part of the
+    domain taxonomy but not yet emitted (they stay defined so the detector can adopt them additively)."""
     SEMI_TRANSPARENT_TEXT = "semi_transparent_text"   # the sunsky-online.com mark
     OPAQUE_LOGO = "opaque_logo"
-    CORNER_STAMP = "corner_stamp"
-    TILED = "tiled"
+    CORNER_STAMP = "corner_stamp"                      # forward taxonomy — not yet emitted by the detector
+    TILED = "tiled"                                    # forward taxonomy — not yet emitted by the detector
     UNKNOWN = "unknown_mark"
 
 
@@ -121,6 +125,14 @@ class FailureReason(str, Enum):
         """
         return self not in NON_RETRYABLE_FAILURE_REASONS
 
+    # Implementation status (2026-06): the deterministic cleaners emit only the reasons they can
+    # decide WITHOUT ML — Classic: BACKGROUND_TOO_COMPLEX (textured surface, no texture-safe engine),
+    # MASK_TOO_LARGE; Neural: MASK_TOO_LARGE; Diffusion: the operational "infrastructure_missing"
+    # string. The semantic / product-damage reasons (SEMANTIC_RISK, PRODUCT_DAMAGE,
+    # SEMANTIC_PRODUCT_RISK, PRODUCT_IDENTITY_CHANGE, HALLUCINATION_RISK, MASK_OVER_PRODUCT_DETAIL,
+    # MASK_TOO_SMALL, UNSAFE_FOR_CLASSIC) are taxonomy the VALIDATOR catches post-hoc today; they
+    # stay defined so a cleaner can adopt them later with no contract change (open/closed).
+
 
 # The authoritative branch source the Orchestrator consults: reasons on which it must NOT escalate
 # (escalating a generative tier into a product-integrity risk only deepens the damage). Everything
@@ -168,11 +180,17 @@ class CleanRequest:
 
 @dataclass
 class CleanResult:
-    """cleaner → orchestrator. The cleaner returns a result; it never self-publishes."""
+    """cleaner → orchestrator. The cleaner returns a result; it never self-publishes.
+
+    ``status="refused"`` is a first-class outcome: the cleaner declined the job (no backend, or a
+    capability / product-risk bail-out) and set ``meta["failure_reason"]``. The orchestrator branches
+    on it — escalate on a retryable reason, terminate to MANUAL_REVIEW on a non-retryable one — without
+    wasting a validate pass on an unchanged image. ``status="noop"`` means the engine ran but changed
+    nothing (e.g. empty mask); the orchestrator escalates rather than re-validating an identical image."""
     image: Image
     tier_used: int
-    status: str = "cleaned"              # cleaned · covered · noop
-    meta: dict = field(default_factory=dict)   # agent, method, engine, timing
+    status: str = "cleaned"              # cleaned · covered · noop · refused
+    meta: dict = field(default_factory=dict)   # agent, method, engine, timing; failure_reason when refused
 
 
 @dataclass
@@ -226,6 +244,11 @@ class Cleaner(ABC):
     registration, not an orchestrator edit (open/closed)."""
     tier: int
     name: str
+    supports_retry_box: bool = False
+    """Whether this cleaner acts on ``CleanRequest.retry_box`` (region-targeted local re-inpaint).
+    A region-blind cleaner (e.g. the deterministic classic tier, which re-runs identically whatever
+    the box) leaves this False, so the orchestrator does NOT spend Phase-1 intra-tier retries on it —
+    a focused retry would only reproduce the same result. Cleaners that honor the box set it True."""
 
     @abstractmethod
     def clean(self, req: CleanRequest) -> CleanResult:
