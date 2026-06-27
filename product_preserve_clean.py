@@ -107,15 +107,113 @@ def band_residual_cleanup(bgr):
     g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     band = np.zeros((H, W), bool)
     band[y1:y2] = True
-    solid = _solid_mask(g, band)
-    out[band & (~solid) & (g < 248)] = (255, 255, 255)                 # surviving mark on white bg
+    bvals = g[band]
+    if bvals.size == 0:
+        return out
+    # GATE: only sweep a GENUINELY PLAIN band — a flat white field, or a uniform achromatic near-black
+    # surface. On textured / coloured / metallic / mixed bands this returns the input UNCHANGED, because
+    # glyph_clean already removed the mark there precisely and a band-wide whiten or re-darken would
+    # re-damage the product (the exact dark-band / white-wipe / splatter the gates now reject).
+    if float((bvals > 238).mean()) >= 0.55:                            # flat white field
+        solid = _solid_mask(g, band)
+        out[band & (~solid) & (g < 248)] = (255, 255, 255)             # whiten any surviving faint mark
     blk = bgr[(g < 70) & band]
-    if len(blk) > 40:                                                   # a real uniform-black surface is present
+    if len(blk) > 40 and float(bvals.std()) < 55:                      # uniform (low-variance) dark band
         cc = np.median(blk, axis=0)
-        darku = cv2.morphologyEx(((g < 160) & band).astype(np.uint8), cv2.MORPH_CLOSE,
-                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        out[band & (darku > 0) & (g > int(cc.mean()) + 22) & (g < 170)] = cc   # mark lightening black
+        if float(np.std(cc)) < 12:                                     # achromatic black, not a dark colour
+            darku = cv2.morphologyEx(((g < 160) & band).astype(np.uint8), cv2.MORPH_CLOSE,
+                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+            out[band & (darku > 0) & (g > int(cc.mean()) + 22) & (g < 170)] = cc   # mark lightening black
     return out
+
+
+_CANON_MATTE = None
+
+
+def _canon_matte():
+    """Tight (padding-trimmed) 'sunsky-online.com' glyph matte — the KNOWN mark shape."""
+    global _CANON_MATTE
+    if _CANON_MATTE is None:
+        m = cv2.imread(os.path.join(HERE, "assets", "watermark-canonical.png"), cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            _CANON_MATTE = False
+        else:
+            r = np.where((m > 40).any(axis=1))[0]
+            c = np.where((m > 40).any(axis=0))[0]
+            _CANON_MATTE = m[r.min():r.max() + 1, c.min():c.max() + 1].astype(np.float32)
+    return _CANON_MATTE
+
+
+def _toward180(roi):
+    """Per-pixel response that is HIGH on mark strokes regardless of mark direction: the mark pulls
+    every covered pixel toward logo grey (~180), so the signed deviation-from-local-background in
+    the direction of 180 isolates it (high-contrast strokes only; weak where bg≈180)."""
+    bg = cv2.medianBlur(roi, 9)
+    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bgg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return np.clip((g - bgg) * np.sign(180.0 - bgg), 0, None)
+
+
+def glyph_clean(bgr, box, pad=0.18, thr=7, mk=9, use_template=False):
+    """Structure-preserving removal by GLYPH-TIGHT inpaint — the texture-safe primary path.
+
+    The sunsky mark is thin, semi-transparent text that pulls covered pixels TOWARD logo grey (~180).
+    Default = DETECTION ONLY: mask the pixels deviating toward 180 from a local-median background and
+    inpaint just those thin strokes. Safe on ANY surface (the mask is the glyphs, never the box). The
+    detection ROI is widened to at least the canonical mark width so a too-narrow localisation still
+    covers the whole mark (fixes partial-clean ghosts).
+
+    ``use_template=True`` ALSO unions in the known 'sunsky-online.com' matte (scaled + correlation-
+    aligned) — this is a GUARDED ESCALATION for LOW-contrast surfaces (lavender / grey metallic ≈ 180)
+    where detection sees nothing. It is risky: the matte can misalign onto a product feature (lens,
+    hole) and inpaint there, so the caller must only use it when detection leaves a residual AND must
+    reject the result if it introduces damage (see owner_agent escalation)."""
+    H, W = bgr.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in box]
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 0 or bh <= 0:
+        return bgr.copy()
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    mask = np.zeros((H, W), np.uint8)
+
+    # detection strokes over a ROI widened to >= canonical mark width (fixes narrow localisation)
+    want_w = max(int(bw * (1 + 2 * pad)), 280)
+    X1, X2 = max(0, cx - want_w // 2), min(W, cx + want_w // 2)
+    Y1, Y2 = max(0, y1 - int(bh * pad)), min(H, y2 + int(bh * pad))
+    roi = bgr[Y1:Y2, X1:X2]
+    g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    bg = cv2.cvtColor(cv2.medianBlur(roi, mk), cv2.COLOR_BGR2GRAY).astype(np.int16)
+    L = 180
+    dev = g - bg
+    toward = np.sign(dev) == np.sign(L - bg)
+    stroke = ((np.abs(dev) > thr) & toward
+              & (g > np.minimum(bg, L) - 10) & (g < np.maximum(bg, L) + 10))
+    mask[Y1:Y2, X1:X2] = stroke.astype(np.uint8) * 255
+
+    if use_template:                                          # guarded escalation (low-contrast only)
+        matte = _canon_matte()
+        if matte is not False:
+            mh, mw = matte.shape
+            gw = max(int(bw * 1.05), 260)
+            gh = max(8, int(gw * mh / mw))
+            sw, sh = 50, 22                                   # tight alignment search (avoid drift onto product)
+            rX1, rY1 = max(0, cx - gw // 2 - sw), max(0, cy - gh // 2 - sh)
+            rX2, rY2 = min(W, cx + gw // 2 + sw), min(H, cy + gh // 2 + sh)
+            resp = _toward180(bgr[rY1:rY2, rX1:rX2])
+            templ = (cv2.resize(matte, (gw, gh)) / 255.0).astype(np.float32)
+            if resp.shape[0] >= gh and resp.shape[1] >= gw:
+                gx, gy = cv2.minMaxLoc(cv2.matchTemplate(resp.astype(np.float32), templ, cv2.TM_CCORR))[3]
+                gx, gy = rX1 + gx, rY1 + gy
+            else:
+                gx, gy = cx - gw // 2, cy - gh // 2
+            gm = (cv2.resize(matte, (gw, gh)) > 45).astype(np.uint8) * 255
+            ya, yb, xa, xb = max(0, gy), min(H, gy + gh), max(0, gx), min(W, gx + gw)
+            if yb > ya and xb > xa:
+                mask[ya:yb, xa:xb] = np.maximum(mask[ya:yb, xa:xb], gm[ya - gy:yb - gy, xa - gx:xb - gx])
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.dilate(cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3), k3)
+    return cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
 
 
 def _alpha_meta():

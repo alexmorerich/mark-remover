@@ -363,9 +363,20 @@ def _canonical_band(shape):
 
 def _sensitive_resid_ocr(final, reader):
     """Detection-grade residual OCR (the finder's multi-pass CLAHE + per-channel) on the canonical
-    centre band of the FINAL. Returns (max_sunsky_conf, hit). On textured/dark surfaces a real mark
-    can garble verify_clean's default pass to nothing while this still reads a SUNSKY fragment
-    (e.g. 'unskv Snlinecam'@0.13 on an earpiece mesh). 0.0 when nothing sunsky-like is read."""
+    centre band of the FINAL. Returns (max_sunsky_conf, hit) over SUNSKY-SIGNATURE fragments only.
+    On textured/dark surfaces a real mark can garble verify_clean's default pass to nothing while
+    this still reads a SUNSKY fragment (e.g. 'unskv Snlinecam'@0.13 on an earpiece mesh). 0.0 when
+    nothing sunsky-like is read.
+
+    SIGNATURE GATE (mirrors check_residual_watermark path (1)): detect_smart returns ANY legible band
+    text, INCLUDING product captions that happen to sit in the centre band ('through hole design' ->
+    'hole desicn'@0.98, 'gold sinking process'). Returning the bare max-conf hit graded EVERY such
+    caption as a residual -> a false residual_watermark on clean textured SKUs -> the orchestrator
+    emits a retry_hint -> the owner re-inpaints (method=repair_hint) a clean image and DAMAGES it
+    (the i2C-spec-sheet false positive). Grade each hit with the finder's STRONG/MED grader and keep
+    only signature-consistent reads (strength >= 0.55); this is what makes the "0.0 when nothing
+    sunsky-like" promise above actually true. Recall-safe: a genuine mark OCRs to a sunsky/online/.com
+    fragment (grade 1.0) and still scores its full conf, so the leak-fix this path exists for holds."""
     crop = _resid_band_crop(final, _canonical_band(final.shape))
     if crop.size == 0 or min(crop.shape[:2]) < 12:
         return 0.0, None
@@ -373,9 +384,11 @@ def _sensitive_resid_ocr(final, reader):
         hits = v28e.detect_smart(reader, crop)
     except Exception:
         return 0.0, None
-    if not hits:
+    import logo_finder as _lf
+    sig = [h for h in hits if _lf._text_grade(h[4] or "")[0] >= 0.55]
+    if not sig:
         return 0.0, None
-    best = max(hits, key=lambda h: h[5])
+    best = max(sig, key=lambda h: h[5])
     return float(best[5]), best
 
 
@@ -393,13 +406,25 @@ def check_residual_watermark(final, anchor_box, reader, high_risk=False, roi=Non
         except Exception as e:
             hits = []
             notes.append(f"ocr_check_err:{type(e).__name__}")
-        if hits:
+        # SIGNATURE GATE: verify_clean returns ANY text found in the band, but a residual SUNSKY mark
+        # is a sunsky/online/.com fragment — not a product caption ("gold sinking process") or a UI
+        # label ("Stocks"). Grade each hit with the finder's STRONG/MED grader and keep only
+        # signature-consistent hits (strength >= 0.55). Without this, non-watermark band text fires a
+        # false residual_watermark -> the orchestrator emits a retry hint -> the owner re-inpaints a
+        # clean image (method=repair_hint) and DAMAGES it. Recall-safe: a genuine faint mark OCRs to a
+        # sunsky fragment (grade >= 0.55) and still FAILs; the (1b) sensitive-OCR fallback below still
+        # runs on textured ROIs when nothing signature-like is found.
+        import logo_finder as _lf
+        sig_hits = [h for h in hits if _lf._text_grade(h[4] or "")[0] >= 0.55]
+        if sig_hits:
             ocr_hit = True
             state = FAIL
             reasons.append("residual_watermark")
-            sev = max(sev, 1.0 + 0.1 * len(hits))
-            txt = ",".join((h[4] or "")[:14] for h in hits[:3])
-            notes.append(f"ocr_resid={len(hits)}:{txt}")
+            sev = max(sev, 1.0 + 0.1 * len(sig_hits))
+            txt = ",".join((h[4] or "")[:14] for h in sig_hits[:3])
+            notes.append(f"ocr_resid={len(sig_hits)}:{txt}")
+        elif hits:
+            notes.append(f"ocr_band_text_nonsig({len(hits)}):{(hits[0][4] or '')[:14]}")
     else:
         notes.append("ocr_unavailable")
 
@@ -689,6 +714,38 @@ def check_product_damage(orig, final, foot_box, roi, high_risk):
             "sides_textured": n_textured, "notes": notes}
 
 
+# Additive-damage threshold. Calibrated on the job_50 labelled set: damaged finals (solid dark
+# band / re-darken splatter / white wipe) score >= 0.106; clean finals <= 0.051. 0.07 separates
+# with ~2x margin. This is the gap check_product_damage (smooth-hole model) and check_repair_artifact
+# (flat-bg only) both leave open.
+DARK_FILL_FRAC = 0.07
+
+
+def check_band_darkening(orig, final):
+    """The sunsky mark is a LIGHT semi-transparent overlay, so a faithful removal can only lighten
+    or leave the band. Substantial DARKENING of a mid/light surface (a solid dark fill or re-darken
+    splatter) or a WHITE WIPE of a mid-light surface is ADDED damage — the additive class that the
+    smooth-hole product-damage model misses and the flat-bg-only repair-artifact check skips.
+    Surface-agnostic; measured over the canonical band so it needs no edit footprint.
+    A genuine residual watermark (light grey) produces ~0 here, so this never relaxes the no-leak
+    path — it only adds a new FAIL on destructive lightness changes."""
+    H = orig.shape[0]
+    go = _gray(orig[int(0.40 * H):int(0.58 * H)]).astype(np.int16)
+    gf = _gray(final[int(0.40 * H):int(0.58 * H)]).astype(np.int16)
+    if go.size == 0:
+        return {"state": PASS, "severity": 0.0, "reasons": [], "notes": []}
+    d = go - gf
+    dark_fill = float(((d >= 25) & (go >= 70) & (gf < 100)).mean())      # mid/light pushed dark
+    white_wipe = float(((gf >= 248) & (go > 140) & (go < 240)).mean())   # mid-light wiped to white
+    score = max(dark_fill, white_wipe)
+    if score >= DARK_FILL_FRAC:
+        kind = "dark_fill" if dark_fill >= white_wipe else "white_wipe"
+        return {"state": FAIL, "severity": 1.0 + min(1.0, score), "reasons": [f"destructive_{kind}"],
+                "notes": [f"additive band damage: dark_fill={dark_fill:.3f} white_wipe={white_wipe:.3f}"]}
+    return {"state": PASS, "severity": 0.0, "reasons": [],
+            "notes": [f"band_darkening ok (dark={dark_fill:.3f} wipe={white_wipe:.3f})"]}
+
+
 def check_protected_text(orig, final, foot_box, reader, high_risk):
     """Product text (SKU, "Original", pin numbers, colour names) that the repair
     flattened. Two exclusions keep this from firing on the watermark itself:
@@ -933,6 +990,7 @@ def audit_pair(original_path, final_path, meta=None, mask_path=None, reader=None
         "residual_watermark": check_residual_watermark(final, resid_band, reader, high_risk, roi=roi),
         "repair_artifact":    check_repair_artifact(orig, final, foot_box, high_risk, roi=roi),
         "product_damage":     check_product_damage(orig, final, foot_box, roi, high_risk),
+        "band_darkening":     check_band_darkening(orig, final),
         "protected_text":     check_protected_text(orig, final, foot_box, reader, high_risk),
         "false_positive":     check_false_positive(orig, final, foot_box, diff_box, edit_frac, orig_marks, meta),
     }
@@ -953,6 +1011,7 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
     rw = results.get("residual_watermark", {})
     ra = results.get("repair_artifact", {})
     pd = results.get("product_damage", {})
+    bd = results.get("band_darkening", {})
     pt = results.get("protected_text", {})
     fp = results.get("false_positive", {})
     edge_state, pd_state = pd.get("edge_state", PASS), pd.get("pd_state", PASS)
@@ -962,7 +1021,8 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
         "dot_chain_score":            round(float(dot), 3),
         "ghost_text_score":           round(float(ghost), 3),
         "patch_visibility_score":     float(ra.get("patch_visibility_score", 0.0)),
-        "product_damage_score":       round(_clamp01(pd.get("severity", 0.0)) if pd_state == FAIL else 0.0, 3),
+        "product_damage_score":       round(max(_clamp01(pd.get("severity", 0.0)) if pd_state == FAIL else 0.0,
+                                                 _clamp01(bd.get("severity", 0.0)) if bd.get("state") == FAIL else 0.0), 3),
         "texture_mismatch_score":     float(ra.get("texture_mismatch_score", 0.0)),
         "color_delta_score":          float(ra.get("color_delta_score", 0.0)),
         "edge_damage_score":          round(1.0 if edge_state == FAIL else (0.6 if edge_state == WARN else 0.0), 3),
@@ -978,7 +1038,7 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
     dot_eff = dot if flat else 0.0
     ghost_eff = ghost if flat else 0.0
     residual_fail = (rw.get("state") == FAIL) or dot_eff >= DOT_HARD or ghost_eff >= GHOST_HARD
-    product_fail = (pd_state == FAIL) or (edge_state == FAIL)
+    product_fail = (pd_state == FAIL) or (edge_state == FAIL) or (bd.get("state") == FAIL)
     patch_fail = ra.get("state") == FAIL
     ptext_fail = pt.get("state") == FAIL
     unnatural_fail = fp.get("state") == FAIL
@@ -1031,7 +1091,7 @@ def _decide(results, roi, high_risk, dot=0.0, ghost=0.0, reader_available=True, 
         decision, action = "PASS", "publish"
 
     note_bits = []
-    for nm, blk in (("resid", rw), ("artifact", ra), ("product", pd), ("ptext", pt), ("fp", fp)):
+    for nm, blk in (("resid", rw), ("artifact", ra), ("product", pd), ("banddark", bd), ("ptext", pt), ("fp", fp)):
         if blk.get("notes"):
             note_bits.append(f"{nm}[" + ";".join(blk["notes"][:2]) + "]")
     notes = f"roi={roi} high_risk={high_risk} dot={dot:.2f} ghost={ghost:.2f}. " + " ".join(note_bits)
